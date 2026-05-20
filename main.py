@@ -121,6 +121,17 @@ def _storage_opts(uri: str, token: str) -> dict:
     return {"account_name": _account_name(uri), "bearer_token": token}
 
 
+def _fresh_opts(uri: str) -> dict:
+    """Acquire a fresh token immediately before each storage call.
+
+    DefaultAzureCredential caches tokens internally and only performs a network
+    refresh when the cached token is within ~5 minutes of expiry, so calling
+    this before every storage operation is cheap and prevents authentication
+    failures caused by token expiry during long-running anonymization steps.
+    """
+    return _storage_opts(uri, acquire_token(ONELAKE_TOKEN_SCOPE))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Microsoft Purview — optional sensitivity-label double-check
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,10 +318,13 @@ def anonymize_dataframe(
         new_values: list = []
 
         for val in df[col]:
-            if pd.isna(val):
+            # Only process genuine string values.  Non-string objects in an
+            # object-dtype column (dicts, lists, Decimal, mixed-type ids, …)
+            # pass through unchanged to avoid silent data corruption.
+            if not isinstance(val, str):
                 new_values.append(val)
                 continue
-            cleaned, findings = _process_value(str(val), analyzer, anonymizer, operators)
+            cleaned, findings = _process_value(val, analyzer, anonymizer, operators)
             new_values.append(cleaned)
             for f in findings:
                 col_detections += 1
@@ -425,15 +439,10 @@ def main() -> None:
     audit_storage_opts: dict = {}
 
     try:
-        # ── Auth ──────────────────────────────────────────────────────────────
-        onelake_token      = acquire_token(ONELAKE_TOKEN_SCOPE)
-        src_opts           = _storage_opts(source_uri, onelake_token)
-        tgt_opts           = _storage_opts(target_uri, onelake_token)
-        if audit_uri:
-            audit_storage_opts = _storage_opts(audit_uri, onelake_token)
-
         # ── Extract ───────────────────────────────────────────────────────────
-        df_raw = read_delta(source_uri, src_opts)
+        # Token is acquired fresh immediately before each storage call so that
+        # expiry during a long anonymization step cannot cause a write failure.
+        df_raw = read_delta(source_uri, _fresh_opts(source_uri))
         audit["total_rows_processed"]   = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
 
@@ -452,7 +461,7 @@ def main() -> None:
         audit["entity_counts"]           = stats["entity_counts"]
 
         # ── Load ──────────────────────────────────────────────────────────────
-        write_delta(df_clean, target_uri, tgt_opts)
+        write_delta(df_clean, target_uri, _fresh_opts(target_uri))
 
         # ── Mark success ──────────────────────────────────────────────────────
         pipeline_end           = datetime.now(timezone.utc)
@@ -489,6 +498,8 @@ def main() -> None:
         raise
 
     finally:
+        if audit_uri:
+            audit_storage_opts = _fresh_opts(audit_uri)
         write_audit_record(audit, audit_uri, audit_storage_opts)
 
 
