@@ -1,0 +1,21 @@
+# Azure authentication
+azure-identity>=1.17.0
+
+# Delta Lake (delta-rs, no PySpark required)
+deltalake>=0.18.0
+
+# Data manipulation
+pandas>=2.1.0
+pyarrow>=15.0.0
+
+# Microsoft Presidio — PII detection (anonymizer not needed; tokens applied inline)
+presidio-analyzer>=2.2.354
+
+# spaCy NLP runtime (model downloaded separately in Dockerfile)
+spacy>=3.7.4,<4.0.0
+
+# PostgreSQL audit persistence (binary wheel — no libpq-dev needed)
+psycopg2-binary>=2.9.9
+
+# HTTP client — Purview catalog API + webhook alerts
+requests>=2.31.0

@@ -1,0 +1,36 @@
+services:
+
+  # ── PostgreSQL audit database ────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD: pipeline
+      POSTGRES_DB: pii_audit
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline -d pii_audit"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── PII anonymization pipeline ───────────────────────────────────────────────
+  pipeline:
+    build: .
+    env_file:
+      - .env                          # Azure creds, source/target URIs, etc.
+    environment:
+      # Overrides any DATABASE_URL that might be present in .env so the
+      # pipeline always talks to the compose-managed Postgres instance.
+      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"                     # one-shot batch job — do not auto-restart
+
+volumes:
+  pg_data:
