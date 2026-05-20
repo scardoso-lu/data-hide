@@ -24,7 +24,7 @@ RUN python -m spacy download en_core_web_lg \
     && pip cache purge
 
 # ── Application code ──────────────────────────────────────────────────────────
-COPY main.py .
+COPY app ./app
 
 # ── Non-root user (uid/gid 1001) ──────────────────────────────────────────────
 # Created after pip/spaCy steps so package installation still runs as root and
@@ -41,4 +41,4 @@ RUN groupadd --gid 1001 appgroup \
 
 USER appuser
 
-CMD ["python", "main.py"]
+CMD ["python", "-m", "app.main"]

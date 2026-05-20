@@ -1,5 +1,6 @@
 # Azure authentication
 azure-identity>=1.17.0
+azure-storage-file-datalake>=12.15.0
 
 # Delta Lake (delta-rs, no PySpark required)
 deltalake>=0.18.0

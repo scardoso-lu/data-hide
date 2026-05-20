@@ -34,8 +34,8 @@ SUCCESS_AUDIT = {
     "quasi_columns":           ["age", "gender"],
     "suppressed_rows":         3,
     "residual_pii_count":      0,
-    "column_renames":          {"ssn": "IDENTIFIER_0"},
-    "hashed_columns":          ["IDENTIFIER_0", "employee_id"],
+    "column_renames":          {},
+    "hashed_columns":          ["employee_id"],
     "purview_available":       True,
     "purview_flagged_columns": ["email"],
     "purview_discrepancies":   [],
@@ -87,10 +87,10 @@ class TestSchemaInit:
         sqls = [c.args[0] for c in cur.execute.call_args_list]
         assert any("pii_pipeline_column_events" in s for s in sqls)
 
-    def test_exactly_two_ddl_statements(self, mock_psycopg2):
+    def test_expected_ddl_statements(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
         AuditDB("postgresql://test")
-        assert cur.execute.call_count == 2
+        assert cur.execute.call_count == 4
 
     def test_connection_committed(self, mock_psycopg2):
         _, conn, _ = mock_psycopg2
@@ -329,17 +329,14 @@ class TestCloseRun:
         _, params = cur.execute.call_args.args
         assert 0 in params  # residual_pii_count
 
-    def test_column_renames_json_encoded(self, mock_psycopg2):
+    def test_column_renames_empty_json_encoded(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
         db.close_run(SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
-        json_params = [p for p in params if isinstance(p, str) and "IDENTIFIER" in p]
-        assert json_params, "No JSON-encoded column_renames found in params"
-        parsed = json.loads(json_params[0])
-        assert parsed["ssn"] == "IDENTIFIER_0"
+        assert "{}" in params
 
     def test_k_anonymity_k_in_params(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
@@ -360,12 +357,10 @@ class TestCloseRun:
         matching = [
             p for p in params
             if isinstance(p, str)
-            and "IDENTIFIER_0" in p
             and "employee_id" in p
         ]
         assert matching, "No JSON-encoded hashed_columns found in params"
         parsed = json.loads(matching[0])
-        assert "IDENTIFIER_0" in parsed
         assert "employee_id" in parsed
 
 

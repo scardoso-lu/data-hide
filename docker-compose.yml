@@ -22,7 +22,7 @@ services:
   pipeline:
     build: .
     env_file:
-      - .env                          # Azure creds, source/target URIs, etc.
+      - .env                          # Azure creds, Purview, classifier settings, etc.
     environment:
       # Overrides any DATABASE_URL that might be present in .env so the
       # pipeline always talks to the compose-managed Postgres instance.

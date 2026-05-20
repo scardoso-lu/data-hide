@@ -10,6 +10,7 @@ Run `pytest -m "not requires_spacy"` to skip all model-dependent tests.
 """
 
 import pytest
+from unittest import mock
 
 
 def _spacy_available() -> bool:
@@ -38,3 +39,25 @@ def analyzer():
 
 # Backward-compatible alias kept for any tests still referencing presidio_engines.
 presidio_engines = analyzer
+
+
+@pytest.fixture()
+def mocker(request):
+    """Small pytest-mock compatible subset used by this repo's tests."""
+
+    class Mocker:
+        MagicMock = mock.MagicMock
+
+        def patch(self, target, *args, **kwargs):
+            patcher = mock.patch(target, *args, **kwargs)
+            mocked = patcher.start()
+            request.addfinalizer(patcher.stop)
+            return mocked
+
+        def patch_object(self, target, attribute, *args, **kwargs):
+            patcher = mock.patch.object(target, attribute, *args, **kwargs)
+            mocked = patcher.start()
+            request.addfinalizer(patcher.stop)
+            return mocked
+
+    return Mocker()

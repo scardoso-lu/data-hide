@@ -2,7 +2,7 @@
 Integration-style tests for the main() pipeline orchestration.
 
 All external I/O is mocked:
-  - delta-rs (DeltaTable / write_deltalake)
+  - delta-rs read (DeltaTable) / Parquet output adapter
   - Azure identity (DefaultAzureCredential)
   - PostgreSQL (AuditDB via connect_audit_db)
   - HTTP webhook (requests.post)
@@ -61,7 +61,7 @@ def env(monkeypatch):
     """Set the minimum required env vars; remove optional ones."""
     for k, v in REQUIRED_ENV.items():
         monkeypatch.setenv(k, v)
-    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "ALERT_WEBHOOK_URL",
+    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME",
                 "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
         monkeypatch.delenv(opt, raising=False)
 
@@ -70,7 +70,7 @@ def env(monkeypatch):
 def mock_delta(mocker):
     mock_read = mocker.patch("main.DeltaTable")
     mock_read.return_value.to_pandas.return_value = RAW_DF.copy()
-    mock_write = mocker.patch("main.write_deltalake")
+    mock_write = mocker.patch("main.write_delta")
     return mock_read, mock_write
 
 
@@ -169,7 +169,7 @@ class TestPipelineSuccess:
         _, mock_write = mock_delta
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        written_df: pd.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["name"])  == ["PERSON_0", "PERSON_1"]
         assert list(written_df["email"]) == ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]
 
@@ -181,7 +181,7 @@ class TestPipelineSuccess:
         _, mock_write = mock_delta
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        written_df: pd.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["score"]) == [10, 20]
 
     def test_write_target_uri_is_target(
@@ -192,7 +192,7 @@ class TestPipelineSuccess:
         _, mock_write = mock_delta
         main()
 
-        write_uri = mock_write.call_args.args[0]
+        write_uri = mock_write.call_args.args[1]
         assert write_uri == TARGET_URI
 
     def test_audit_open_run_called(
@@ -274,6 +274,28 @@ class TestPipelineSuccess:
 
 class TestPipelineFailure:
 
+    def test_refuses_same_source_and_target(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, monkeypatch,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+    ):
+        monkeypatch.setenv("TARGET_ABFSS_URI", SOURCE_URI)
+
+        from main import main
+        with pytest.raises(RuntimeError, match="Source and target table URIs are identical"):
+            main()
+
+    def test_allows_raw_named_target_when_writing_parquet_file(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, monkeypatch,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+    ):
+        monkeypatch.setenv(
+            "TARGET_ABFSS_URI",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/dbo/jaffle_raw_customers",
+        )
+
+        from main import main
+        main()
+
     def test_exception_propagates(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
@@ -326,11 +348,10 @@ class TestPipelineFailure:
         audit = mock_db.close_run.call_args.args[0]
         assert "disk full" in audit["error_message"]
 
-    def test_alert_sent_when_webhook_configured(
+    def test_alert_recorded_on_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker, monkeypatch,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
-        monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hook.example.com/abc")
         mock_alert = mocker.patch("main.send_alert")
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("timeout")
@@ -392,12 +413,12 @@ class TestOptionalFeatures:
         from main import main
         main()  # must not raise
 
-    def test_pipeline_runs_without_webhook(
+    def test_pipeline_runs_without_alert_webhook(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
-        main()  # no ALERT_WEBHOOK_URL set — must not raise
+        main()  # alert webhooks are not part of the runtime contract
 
     def test_audit_db_failure_does_not_abort_pipeline(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
@@ -458,7 +479,7 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        written_df: pd.DataFrame = mock_write.call_args.args[0]
         for val in written_df["email"]:
             assert "example.com" not in val, f"Email not anonymized: {val!r}"
             assert "@" not in val, f"Email not fully masked: {val!r}"
@@ -474,7 +495,7 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        written_df: pd.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["score"]) == [10, 20]
 
     def test_entity_tokens_in_output(
@@ -489,6 +510,6 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        written_df: pd.DataFrame = mock_write.call_args.args[0]
         for val in written_df["email"]:
             assert "EMAIL_ADDRESS_" in val, f"Expected EMAIL_ADDRESS token, got: {val!r}"

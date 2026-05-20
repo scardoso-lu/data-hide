@@ -5,9 +5,9 @@ A containerized, **stateless** Python pipeline that:
 1. **Reads** a Delta table from a Microsoft Fabric Lakehouse (OneLake).
 2. **Cross-checks** column sensitivity labels against Microsoft Purview (optional).
 3. **Anonymizes** PII, GDPR, and financial entities using Microsoft Presidio + spaCy.
-4. **Writes** the cleaned data as a Delta table to a different Microsoft Fabric Lakehouse.
+4. **Writes** the cleaned data as a Parquet file to OneLake for later Fabric processing.
 5. **Audits** every run in a PostgreSQL database (run-level + per-column granularity).
-6. **Alerts** on pipeline failures via a configurable Teams / Slack webhook.
+6. **Records** pipeline failures in the PostgreSQL alert table.
 
 No PySpark. No files written inside the container at runtime.
 
@@ -34,12 +34,12 @@ abfss://…/raw_customers                       abfss://…/anonymized_customers
 |---|---|
 | `PERSON` | John Smith |
 | `EMAIL_ADDRESS` | user@example.com |
-| `PHONE_NUMBER` | +1-800-555-0100 |
+| `PHONE_NUMBER` | +352 621 123 456 |
 | `CREDIT_CARD` | 4111 1111 1111 1111 |
-| `IBAN_CODE` | GB29 NWBK 6016 1331 9268 19 |
-| `US_BANK_NUMBER` | 123456789 |
+| `IBAN_CODE` | LU28 0019 4006 4475 0000 |
+| `LOCATION`, `DATE_TIME`, `NRP`, and recognizer-specific entities | EU addresses, dates, nationalities, and local identifiers |
 
-All detections are replaced with `***`.
+Presidio recognizers are not restricted to a US-only entity allow-list; the pipeline asks the analyzer for its available GDPR-relevant findings and replaces detections with stable pseudonym tokens such as `EMAIL_ADDRESS_0`.
 
 ---
 
@@ -76,21 +76,38 @@ cp .env.example .env
 | `AZURE_TENANT_ID` | Azure AD tenant ID |
 | `AZURE_CLIENT_ID` | Service principal application (client) ID |
 | `AZURE_CLIENT_SECRET` | Service principal secret value |
-| `SOURCE_ABFSS_URI` | Full `abfss://` path to the source Delta table |
-| `TARGET_ABFSS_URI` | Full `abfss://` path to the target Delta table |
+| `DATABASE_URL` | PostgreSQL DSN for audit records, table mappings, and alerts |
 
 ### Optional
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | *(disabled)* | PostgreSQL DSN for audit records |
 | `PURVIEW_ACCOUNT_NAME` | *(disabled)* | Purview account name for label cross-check |
-| `ALERT_WEBHOOK_URL` | *(disabled)* | Teams or Slack webhook URL for failure alerts |
+| `K_ANONYMITY_MIN` | `5` | Minimum group size for quasi-identifier combinations |
+| `HASH_SALT` | empty | Salt for deterministic identifier hashes |
+| `SOURCE_ABFSS_URI`, `TARGET_ABFSS_URI` | *(disabled)* | Local fallback only when `pii_pipeline_tables` is empty |
 
 ### OneLake ABFS URI format
 
+Production source addresses and Parquet output paths are read from PostgreSQL,
+not hardcoded in `.env`. Seed `pii_pipeline_tables` with one row per enabled
+source/output pair:
+
+```sql
+INSERT INTO pii_pipeline_tables (table_name, source_uri, target_uri, enabled)
+VALUES (
+  'customers',
+  'abfss://Workspace@onelake.dfs.fabric.microsoft.com/Source.Lakehouse/Tables/raw_customers',
+  'abfss://Workspace@onelake.dfs.fabric.microsoft.com/Target.Lakehouse/Files/anonymized/customers.parquet',
+  true
+);
 ```
-abfss://<WorkspaceName>@onelake.dfs.fabric.microsoft.com/<LakehouseName>.Lakehouse/Tables/<TableName>
+
+If `target_uri` does not end in `.parquet`, the pipeline writes
+`part-00000.parquet` under that path.
+
+```
+abfss://<WorkspaceName>@onelake.dfs.fabric.microsoft.com/<LakehouseName>.Lakehouse/Files/<Folder>/<File>.parquet
 ```
 
 Copy from Fabric portal: open the Lakehouse → right-click the table → **Properties** → **ABFS path**.
@@ -103,7 +120,7 @@ The compose file spins up a Postgres instance and the pipeline in one command.
 
 ```bash
 cp .env.example .env
-# Fill in AZURE_*, SOURCE_ABFSS_URI, TARGET_ABFSS_URI
+# Fill in AZURE_* and seed pii_pipeline_tables in PostgreSQL
 
 docker compose up --build
 ```
@@ -241,12 +258,16 @@ The service principal needs the **Purview Data Reader** role on the account.
 
 ---
 
-## Alert webhook
+## Alert records
 
-Set `ALERT_WEBHOOK_URL` to receive a `{"text": "..."}` POST on any failure.
+Pipeline failures are persisted in PostgreSQL instead of sent to webhooks.
+Read `pii_pipeline_alerts` for operational alerting:
 
-- **Teams** — create an Incoming Webhook connector in a channel.
-- **Slack** — add the Incoming Webhooks app and copy the URL.
+```sql
+SELECT run_id, table_name, subject, body, created_at
+FROM pii_pipeline_alerts
+ORDER BY created_at DESC;
+```
 
 ---
 

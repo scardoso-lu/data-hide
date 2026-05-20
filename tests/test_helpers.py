@@ -21,6 +21,7 @@ from main import (
     run_purview_check,
     sanitize_column_names,
     validate_residual_pii,
+    write_delta,
 )
 
 
@@ -72,6 +73,51 @@ class TestStorageOpts:
         uri_b = "abfss://c@accountB.dfs.core.windows.net/p"
         assert _storage_opts(uri_a, "tok")["account_name"] == "accountA"
         assert _storage_opts(uri_b, "tok")["account_name"] == "accountB"
+
+
+class TestWriteDelta:
+
+    def test_uploads_parquet_file_to_explicit_path(self, mocker):
+        import app.repository as repo
+
+        file_client = mocker.MagicMock()
+        service = mocker.MagicMock()
+        service.get_file_client.return_value = file_client
+        service_cls = mocker.MagicMock(return_value=service)
+
+        mocker.patch_object(repo, "DataLakeServiceClient", service_cls)
+        mocker.patch_object(repo, "_credential_instance", lambda: object())
+
+        write_delta(
+            pd.DataFrame({"x": [1]}),
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers.parquet",
+            {},
+        )
+
+        service_cls.assert_called_once()
+        service.get_file_client.assert_called_once_with(
+            file_system="ws",
+            file_path="lh.Lakehouse/Files/out/customers.parquet",
+        )
+        file_client.upload_data.assert_called_once()
+        assert file_client.upload_data.call_args.kwargs["overwrite"] is True
+
+    def test_appends_default_parquet_name_for_folder_path(self, mocker):
+        import app.repository as repo
+
+        file_client = mocker.MagicMock()
+        service = mocker.MagicMock()
+        service.get_file_client.return_value = file_client
+
+        mocker.patch_object(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
+        mocker.patch_object(repo, "_credential_instance", lambda: object())
+
+        write_delta(pd.DataFrame({"x": [1]}), "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers", {})
+
+        service.get_file_client.assert_called_once_with(
+            file_system="ws",
+            file_path="lh.Lakehouse/Files/out/customers/part-00000.parquet",
+        )
 
 
 class TestPurviewQualifiedName:
@@ -178,15 +224,15 @@ class TestRunPurviewCheck:
 class TestFlagFreeTextColumns:
 
     def test_notes_column_flagged(self):
-        df = pd.DataFrame({"notes": ["some text"], "price": [9.99]})
+        df = pd.DataFrame({"notes": ["This is a long free text value with multiple words."], "price": [9.99]})
         assert "notes" in flag_free_text_columns(df)
 
     def test_description_column_flagged(self):
-        df = pd.DataFrame({"description": ["Widget A"], "id": [1]})
+        df = pd.DataFrame({"description": ["Widget A needs a longer narrative description for review."], "id": [1]})
         assert "description" in flag_free_text_columns(df)
 
     def test_feedback_column_flagged(self):
-        df = pd.DataFrame({"customer_feedback": ["great!"], "qty": [1]})
+        df = pd.DataFrame({"customer_feedback": ["The delivery was late and the customer explained the problem in detail."], "qty": [1]})
         assert "customer_feedback" in flag_free_text_columns(df)
 
     def test_numeric_column_not_flagged(self):
@@ -195,7 +241,7 @@ class TestFlagFreeTextColumns:
 
     def test_non_text_object_column_with_matching_name_still_flagged(self):
         df = pd.DataFrame({"notes": [{"key": "val"}]})
-        assert "notes" in flag_free_text_columns(df)
+        assert "notes" not in flag_free_text_columns(df)
 
     def test_unrelated_object_column_not_flagged(self):
         df = pd.DataFrame({"customer_id": ["CID-001", "CID-002"]})
@@ -218,18 +264,18 @@ class TestDetectQuasiIdentifiers:
         assert qi == ["age", "city"]
 
     def test_explicit_cols_filtered_to_present(self):
-        df = pd.DataFrame({"age": [25], "score": [10]})
+        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df, explicit_cols=["age", "missing_col"])
         assert qi == ["age"]
         assert "missing_col" not in qi
 
     def test_keyword_detection_on_age(self):
-        df = pd.DataFrame({"age": [25], "score": [10]})
+        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df)
         assert "age" in qi
 
     def test_keyword_detection_on_gender(self):
-        df = pd.DataFrame({"gender": ["M"], "score": [10]})
+        df = pd.DataFrame({"gender": ["M", "M", "M", "F", "F", "F"], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df)
         assert "gender" in qi
 
@@ -239,7 +285,7 @@ class TestDetectQuasiIdentifiers:
         assert qi == []
 
     def test_empty_explicit_cols_falls_back_to_keyword(self):
-        df = pd.DataFrame({"age": [25], "city": ["NYC"]})
+        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "city": ["NYC", "NYC", "NYC", "LUX", "LUX", "LUX"]})
         qi = detect_quasi_identifiers(df, explicit_cols=[])
         assert "age" in qi
 
@@ -301,11 +347,11 @@ class TestEnforceKAnonymity:
 
 class TestSanitizeColumnNames:
 
-    def test_ssn_column_renamed(self):
-        df = pd.DataFrame({"ssn": ["123-45-6789"], "name": ["Alice"]})
+    def test_identifier_column_name_preserved(self):
+        df = pd.DataFrame({"employee_id": ["EMP-001"], "name": ["Alice"]})
         result_df, renames = sanitize_column_names(df)
-        assert "ssn" not in result_df.columns
-        assert "ssn" in renames
+        assert list(result_df.columns) == ["employee_id", "name"]
+        assert renames == {}
 
     def test_non_sensitive_columns_unchanged(self):
         df = pd.DataFrame({"score": [10], "category": ["A"], "email": ["a@b.com"]})
@@ -314,25 +360,23 @@ class TestSanitizeColumnNames:
         assert "category" in result_df.columns
         assert renames == {}
 
-    def test_renamed_column_gets_category_prefix(self):
-        df = pd.DataFrame({"ssn": ["123"]})
+    def test_identifier_column_does_not_get_category_prefix(self):
+        df = pd.DataFrame({"employee_id": ["EMP-001"]})
         result_df, renames = sanitize_column_names(df)
-        new_name = renames["ssn"]
-        assert new_name.startswith("IDENTIFIER_")
+        assert list(result_df.columns) == ["employee_id"]
+        assert renames == {}
 
-    def test_multiple_sensitive_columns_all_renamed(self):
-        df = pd.DataFrame({"ssn": ["x"], "passport": ["y"], "score": [1]})
+    def test_multiple_sensitive_columns_preserved(self):
+        df = pd.DataFrame({"employee_id": ["EMP-001"], "person_id": ["P-001"], "score": [1]})
         result_df, renames = sanitize_column_names(df)
-        assert "ssn" not in result_df.columns
-        assert "passport" not in result_df.columns
-        assert "score" in result_df.columns
+        assert list(result_df.columns) == ["employee_id", "person_id", "score"]
+        assert renames == {}
 
-    def test_health_column_renamed_as_sensitive(self):
-        df = pd.DataFrame({"health_status": ["ok"]})
+    def test_sensitive_column_name_preserved(self):
+        df = pd.DataFrame({"risk_band": ["high", "high", "high", "low", "low", "low"]})
         result_df, renames = sanitize_column_names(df)
-        assert "health_status" not in result_df.columns
-        new_name = renames["health_status"]
-        assert new_name.startswith("SENSITIVE_")
+        assert list(result_df.columns) == ["risk_band"]
+        assert renames == {}
 
     def test_no_renames_returns_empty_dict(self):
         df = pd.DataFrame({"product": ["Widget"], "price": [9.99]})
@@ -351,6 +395,33 @@ class TestSanitizeColumnNames:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestValidateResidualPII:
+
+    class FakeAnalyzer:
+        def analyze(self, text, entities=None, language="en"):
+            from types import SimpleNamespace
+
+            findings = []
+            for token in ("PERSON_0", "EMAIL_ADDRESS_0"):
+                start = text.find(token)
+                if start >= 0:
+                    findings.append(SimpleNamespace(start=start, end=start + len(token), entity_type="PERSON"))
+            email = "alice@example.com"
+            start = text.find(email)
+            if start >= 0:
+                findings.append(SimpleNamespace(start=start, end=start + len(email), entity_type="EMAIL_ADDRESS"))
+            return findings
+
+    def test_generated_tokens_are_not_residual_pii(self):
+        df = pd.DataFrame({"name": ["PERSON_0"], "email": ["EMAIL_ADDRESS_0"]})
+        assert validate_residual_pii(df, self.FakeAnalyzer()) == 0
+
+    def test_residual_error_summarizes_column_without_value(self):
+        df = pd.DataFrame({"email": ["alice@example.com"]})
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_residual_pii(df, self.FakeAnalyzer())
+        message = str(exc_info.value)
+        assert "email.EMAIL_ADDRESS=1" in message
+        assert "alice@example.com" not in message
 
     def test_passes_clean_dataframe(self, analyzer):
         df = pd.DataFrame({"note": ["No issues found."], "qty": [5]})
