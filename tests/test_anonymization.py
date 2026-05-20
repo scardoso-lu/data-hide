@@ -1,12 +1,13 @@
 """
 Tests for the PII anonymization core.
 
-Three sections
---------------
+Four sections
+-------------
 1. PII that MUST be detected and masked (most popular real-world patterns)
 2. Non-PII text that must pass through UNCHANGED (no false positives)
 3. Non-string Python objects that must pass through UNCHANGED (P1 regression)
 4. DataFrame-level behaviour and stats
+5. EntityRegistry — consistent pseudonym tokenisation
 """
 
 import math
@@ -15,15 +16,12 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 import pytest
-from presidio_anonymizer.entities import OperatorConfig
 
-from main import MASK_VALUE, _process_value, anonymize_dataframe
-
-MASK = MASK_VALUE
-
-
-def _ops():
-    return {"DEFAULT": OperatorConfig("replace", {"new_value": MASK})}
+from main import (
+    EntityRegistry,
+    _anonymize_text,
+    anonymize_dataframe,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +67,6 @@ PII_CASES = [
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Non-PII strings — Presidio must produce ZERO detections
 # ─────────────────────────────────────────────────────────────────────────────
-# Selected to avoid known Presidio false-positive patterns.
 
 NON_PII_STRINGS = [
     "The shipment arrived on schedule.",
@@ -91,9 +88,6 @@ NON_PII_STRINGS = [
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Non-string Python objects — must survive anonymize_dataframe UNCHANGED
 # ─────────────────────────────────────────────────────────────────────────────
-# Validates the P1 guard: only isinstance(val, str) values enter Presidio.
-# Types like Decimal("4111111111111111") look like a credit-card number when
-# coerced to str() but must NOT be modified because they are not strings.
 
 NON_STRING_VALUES = [
     ("none",          None),
@@ -123,28 +117,24 @@ class TestPIIDetection:
     must be absent from the output."""
 
     @pytest.mark.parametrize("case_id,text", PII_CASES)
-    def test_entity_detected(self, presidio_engines, case_id, text):
-        analyzer, anonymizer = presidio_engines
-        _result, findings = _process_value(text, analyzer, anonymizer, _ops())
-        assert findings, (
-            f"[{case_id}] No entity found in: {text!r}"
-        )
+    def test_entity_detected(self, analyzer, case_id, text):
+        _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
+        assert findings, f"[{case_id}] No entity found in: {text!r}"
 
     @pytest.mark.parametrize("case_id,text", PII_CASES)
-    def test_mask_in_output(self, presidio_engines, case_id, text):
-        analyzer, anonymizer = presidio_engines
-        result, findings = _process_value(text, analyzer, anonymizer, _ops())
+    def test_token_in_output(self, analyzer, case_id, text):
+        result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         if findings:
-            assert MASK in result, (
-                f"[{case_id}] Mask '{MASK}' not found in output: {result!r}"
+            entity_type = findings[0].entity_type
+            assert f"{entity_type}_0" in result, (
+                f"[{case_id}] Token '{entity_type}_0' not found in output: {result!r}"
             )
 
     @pytest.mark.parametrize("case_id,text", PII_CASES)
-    def test_original_pii_fragment_removed(self, presidio_engines, case_id, text):
-        analyzer, anonymizer = presidio_engines
-        result, findings = _process_value(text, analyzer, anonymizer, _ops())
+    def test_original_pii_fragment_removed(self, analyzer, case_id, text):
+        result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         for r in findings:
-            fragment = text[r.start : r.end]
+            fragment = text[r.start:r.end]
             assert fragment not in result, (
                 f"[{case_id}] Original fragment still present: {fragment!r} in {result!r}"
             )
@@ -154,17 +144,15 @@ class TestNoPIIPassthrough:
     """Strings with no PII must produce zero findings and be returned unchanged."""
 
     @pytest.mark.parametrize("text", NON_PII_STRINGS)
-    def test_no_detections(self, presidio_engines, text):
-        analyzer, anonymizer = presidio_engines
-        _result, findings = _process_value(text, analyzer, anonymizer, _ops())
+    def test_no_detections(self, analyzer, text):
+        _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         assert not findings, (
             f"Unexpected detection(s) {findings!r} in non-PII text: {text!r}"
         )
 
     @pytest.mark.parametrize("text", NON_PII_STRINGS)
-    def test_text_returned_unchanged(self, presidio_engines, text):
-        analyzer, anonymizer = presidio_engines
-        result, findings = _process_value(text, analyzer, anonymizer, _ops())
+    def test_text_returned_unchanged(self, analyzer, text):
+        result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         if not findings:
             assert result == text, (
                 f"Text mutated without detections: {result!r} != {text!r}"
@@ -175,10 +163,9 @@ class TestNonStringPassthrough:
     """Non-string values in object-dtype columns must pass through untouched."""
 
     @pytest.mark.parametrize("desc,value", NON_STRING_VALUES)
-    def test_value_unchanged_in_dataframe(self, presidio_engines, desc, value):
-        analyzer, anonymizer = presidio_engines
+    def test_value_unchanged_in_dataframe(self, analyzer, desc, value):
         df = pd.DataFrame({"col": [value]})
-        result_df, _stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, _stats = anonymize_dataframe(df, analyzer)
         actual = result_df["col"].iloc[0]
 
         if isinstance(value, float) and math.isnan(value):
@@ -190,9 +177,8 @@ class TestNonStringPassthrough:
                 f"[{desc}] Value changed: {value!r} → {actual!r}"
             )
 
-    def test_mixed_column_strings_masked_non_strings_intact(self, presidio_engines):
+    def test_mixed_column_strings_masked_non_strings_intact(self, analyzer):
         """Within one mixed-type column only string values enter Presidio."""
-        analyzer, anonymizer = presidio_engines
         df = pd.DataFrame({
             "data": [
                 "contact jane@example.com",  # str with PII  → must be masked
@@ -203,13 +189,13 @@ class TestNonStringPassthrough:
                 Decimal("4111111111111111"),  # Decimal CC    → unchanged
             ]
         })
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
-        assert MASK in str(result_df["data"].iloc[0])             # email masked
-        assert result_df["data"].iloc[1] == 42                    # int intact
-        assert result_df["data"].iloc[2] is None                  # None intact
-        assert result_df["data"].iloc[3] == "No PII here at all." # no-PII intact
-        assert result_df["data"].iloc[4] == {"key": "value"}      # dict intact
+        assert "EMAIL_ADDRESS_0" in str(result_df["data"].iloc[0])  # email masked
+        assert result_df["data"].iloc[1] == 42                       # int intact
+        assert result_df["data"].iloc[2] is None                     # None intact
+        assert result_df["data"].iloc[3] == "No PII here at all."    # no-PII intact
+        assert result_df["data"].iloc[4] == {"key": "value"}         # dict intact
         assert result_df["data"].iloc[5] == Decimal("4111111111111111")  # Decimal intact
 
 
@@ -219,101 +205,164 @@ class TestNonStringPassthrough:
 
 class TestDataFrameAnonymization:
 
-    def test_email_column_masked(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_email_column_masked(self, analyzer):
         df = pd.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert "alice@example.com" not in result_df["email"].values
-        assert "bob@company.org" not in result_df["email"].values
-        assert all(MASK in v for v in result_df["email"])
+        assert "bob@company.org"   not in result_df["email"].values
+        for val in result_df["email"]:
+            assert "@" not in val
+            assert "example.com" not in val
 
-    def test_multiple_pii_types_in_one_cell(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_multiple_pii_types_in_one_cell(self, analyzer):
         df = pd.DataFrame({
             "note": [
                 "Email alice@example.com, card 4111 1111 1111 1111."
             ]
         })
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert stats["total_entities_detected"] >= 2
         assert "alice@example.com" not in result_df["note"].iloc[0]
         assert "4111 1111 1111 1111" not in result_df["note"].iloc[0]
 
-    def test_non_object_dtype_columns_skipped_entirely(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_non_object_dtype_columns_skipped_entirely(self, analyzer):
         df = pd.DataFrame({
             "id":     pd.array([1, 2, 3], dtype="int64"),
             "score":  pd.array([0.1, 0.2, 0.3], dtype="float64"),
             "active": pd.array([True, False, True], dtype="bool"),
         })
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
         pd.testing.assert_frame_equal(result_df, df)
         assert stats["text_columns_scanned"] == []
         assert stats["total_entities_detected"] == 0
 
-    def test_pii_column_appears_in_stats(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_pii_column_appears_in_stats(self, analyzer):
         df = pd.DataFrame({
             "email":       ["a@example.com", "b@example.com"],
             "description": ["Widget A", "Widget B"],
             "qty":         [1, 2],
         })
-        _, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        _, stats = anonymize_dataframe(df, analyzer)
 
         assert "email" in stats["columns_with_detections"]
         assert "description" not in stats["columns_with_detections"]
         assert stats["entity_counts"]["EMAIL_ADDRESS"] >= 2
         assert stats["total_entities_detected"] >= 2
 
-    def test_no_pii_column_absent_from_detections(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_no_pii_column_absent_from_detections(self, analyzer):
         df = pd.DataFrame({
             "category": ["Electronics", "Home & Garden", "Sports"],
         })
-        _, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        _, stats = anonymize_dataframe(df, analyzer)
 
         assert stats["columns_with_detections"] == []
         assert stats["total_entities_detected"] == 0
 
-    def test_column_stats_list_length_matches_text_cols(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_column_stats_list_length_matches_text_cols(self, analyzer):
         df = pd.DataFrame({
             "name":  ["Alice Smith"],
-            "qty":   [5],                   # int — skipped
+            "qty":   [5],
             "notes": ["No issues found."],
         })
-        _, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        _, stats = anonymize_dataframe(df, analyzer)
 
-        # Only 'name' and 'notes' are object dtype
         assert len(stats["column_stats"]) == 2
         col_names = [s["column"] for s in stats["column_stats"]]
         assert "name" in col_names
         assert "notes" in col_names
 
-    def test_original_dataframe_not_mutated(self, presidio_engines):
+    def test_original_dataframe_not_mutated(self, analyzer):
         """anonymize_dataframe must operate on a copy, not the original."""
-        analyzer, anonymizer = presidio_engines
         df = pd.DataFrame({"email": ["alice@example.com"]})
         original = df["email"].iloc[0]
-        anonymize_dataframe(df, analyzer, anonymizer)
+        anonymize_dataframe(df, analyzer)
         assert df["email"].iloc[0] == original
 
-    def test_empty_dataframe_returns_zero_stats(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_empty_dataframe_returns_zero_stats(self, analyzer):
         df = pd.DataFrame({"email": pd.Series([], dtype=object)})
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert len(result_df) == 0
         assert stats["total_entities_detected"] == 0
         assert stats["columns_with_detections"] == []
 
-    def test_all_null_column_leaves_nulls_intact(self, presidio_engines):
-        analyzer, anonymizer = presidio_engines
+    def test_all_null_column_leaves_nulls_intact(self, analyzer):
         df = pd.DataFrame({"email": [None, None, None]})
-        result_df, stats = anonymize_dataframe(df, analyzer, anonymizer)
+        result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert result_df["email"].isna().all()
         assert stats["total_entities_detected"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  EntityRegistry — consistent pseudonym tokenisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEntityRegistry:
+
+    def test_token_format(self):
+        r = EntityRegistry()
+        assert r.token_for("EMAIL_ADDRESS", "alice@example.com") == "EMAIL_ADDRESS_0"
+
+    def test_same_value_same_token(self):
+        r = EntityRegistry()
+        t1 = r.token_for("PERSON", "Alice Smith")
+        t2 = r.token_for("PERSON", "Alice Smith")
+        assert t1 == t2
+
+    def test_different_values_different_tokens(self):
+        r = EntityRegistry()
+        t1 = r.token_for("PERSON", "Alice Smith")
+        t2 = r.token_for("PERSON", "Bob Jones")
+        assert t1 != t2
+
+    def test_counter_increments_per_entity_type(self):
+        r = EntityRegistry()
+        r.token_for("PERSON", "Alice")
+        t2 = r.token_for("PERSON", "Bob")
+        assert t2 == "PERSON_1"
+
+    def test_counters_independent_across_entity_types(self):
+        r = EntityRegistry()
+        r.token_for("PERSON", "Alice")
+        r.token_for("PERSON", "Bob")
+        t_email = r.token_for("EMAIL_ADDRESS", "alice@example.com")
+        assert t_email == "EMAIL_ADDRESS_0"
+
+    def test_case_insensitive_matching(self):
+        r = EntityRegistry()
+        t1 = r.token_for("PERSON", "ALICE SMITH")
+        t2 = r.token_for("PERSON", "alice smith")
+        assert t1 == t2
+
+    def test_whitespace_trimmed(self):
+        r = EntityRegistry()
+        t1 = r.token_for("PERSON", "  Alice  ")
+        t2 = r.token_for("PERSON", "Alice")
+        assert t1 == t2
+
+    def test_unique_counts_reflects_distinct_values(self):
+        r = EntityRegistry()
+        r.token_for("PERSON", "Alice")
+        r.token_for("PERSON", "Bob")
+        r.token_for("PERSON", "Alice")  # duplicate — no new counter increment
+        r.token_for("EMAIL_ADDRESS", "alice@example.com")
+        counts = r.unique_counts()
+        assert counts["PERSON"] == 2
+        assert counts["EMAIL_ADDRESS"] == 1
+
+    def test_consistent_across_rows_in_dataframe(self, analyzer):
+        """The same email address in two rows maps to the same token."""
+        registry = EntityRegistry()
+        df = pd.DataFrame({"email": ["alice@example.com", "alice@example.com"]})
+        result_df, _ = anonymize_dataframe(df, analyzer, registry)
+        assert result_df["email"].iloc[0] == result_df["email"].iloc[1]
+
+    def test_different_emails_get_different_tokens(self, analyzer):
+        registry = EntityRegistry()
+        df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
+        result_df, _ = anonymize_dataframe(df, analyzer, registry)
+        assert result_df["email"].iloc[0] != result_df["email"].iloc[1]

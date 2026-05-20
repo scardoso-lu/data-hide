@@ -15,10 +15,10 @@ from main import AuditDB, PIPELINE_VERSION, connect_audit_db
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-STARTED_AT = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+STARTED_AT  = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
 FINISHED_AT = datetime(2024, 1, 15, 10, 5, 30, tzinfo=timezone.utc)
-SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
-TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
+SOURCE_URI  = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
+TARGET_URI  = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
 
 SUCCESS_AUDIT = {
     "pipeline_end_ts":         FINISHED_AT.isoformat(),
@@ -28,6 +28,13 @@ SUCCESS_AUDIT = {
     "columns_anonymized":      ["email", "full_name"],
     "total_entities_detected": 312,
     "entity_counts":           {"EMAIL_ADDRESS": 200, "PERSON": 112},
+    "unique_entities":         {"EMAIL_ADDRESS": 150, "PERSON": 80},
+    "free_text_columns":       ["notes", "description"],
+    "k_anonymity_k":           5,
+    "quasi_columns":           ["age", "gender"],
+    "suppressed_rows":         3,
+    "residual_pii_count":      0,
+    "column_renames":          {"ssn": "IDENTIFIER_0"},
     "purview_available":       True,
     "purview_flagged_columns": ["email"],
     "purview_discrepancies":   [],
@@ -50,10 +57,9 @@ def mock_psycopg2(mocker):
     """
     mock_cursor = mocker.MagicMock()
 
-    # conn.cursor() returns a context manager whose __enter__ yields mock_cursor
     mock_cursor_cm = mocker.MagicMock()
     mock_cursor_cm.__enter__ = mocker.MagicMock(return_value=mock_cursor)
-    mock_cursor_cm.__exit__ = mocker.MagicMock(return_value=False)
+    mock_cursor_cm.__exit__  = mocker.MagicMock(return_value=False)
 
     mock_conn = mocker.MagicMock()
     mock_conn.cursor.return_value = mock_cursor_cm
@@ -89,6 +95,14 @@ class TestSchemaInit:
         _, conn, _ = mock_psycopg2
         AuditDB("postgresql://test")
         conn.commit.assert_called()
+
+    def test_runs_table_has_new_columns(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        AuditDB("postgresql://test")
+        sqls = " ".join(c.args[0] for c in cur.execute.call_args_list)
+        for col in ("unique_entities", "free_text_cols", "k_anonymity_k",
+                    "quasi_columns", "suppressed_rows", "residual_pii", "column_renames"):
+            assert col in sqls, f"Expected column '{col}' in DDL"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,11 +288,65 @@ class TestCloseRun:
 
         db.close_run(SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
-        # columns_anonymized is JSON-encoded in the params tuple
         json_params = [p for p in params if isinstance(p, str) and "email" in p]
         assert json_params, "No JSON-encoded columns_anonymized found in params"
         parsed = json.loads(json_params[0])
         assert "email" in parsed
+
+    def test_unique_entities_json_encoded(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        # unique_entities has EMAIL_ADDRESS: 150 (entity_counts has 200 — must find the right one)
+        matching = [
+            p for p in params
+            if isinstance(p, str)
+            and "EMAIL_ADDRESS" in p
+            and json.loads(p).get("EMAIL_ADDRESS") == 150
+        ]
+        assert matching, "No JSON-encoded unique_entities with EMAIL_ADDRESS: 150 found in params"
+
+    def test_suppressed_rows_in_params(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        assert 3 in params  # suppressed_rows
+
+    def test_residual_pii_count_in_params(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        assert 0 in params  # residual_pii_count
+
+    def test_column_renames_json_encoded(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        json_params = [p for p in params if isinstance(p, str) and "IDENTIFIER" in p]
+        assert json_params, "No JSON-encoded column_renames found in params"
+        parsed = json.loads(json_params[0])
+        assert parsed["ssn"] == "IDENTIFIER_0"
+
+    def test_k_anonymity_k_in_params(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        assert 5 in params  # k_anonymity_k
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +369,5 @@ class TestConnectAuditDB:
 
     def test_connection_failure_is_non_fatal(self, mocker):
         mocker.patch("main.psycopg2.connect", side_effect=OSError("host not found"))
-        # Must not raise — pipeline should continue without audit
         result = connect_audit_db("postgresql://unreachable/db")
         assert result is None

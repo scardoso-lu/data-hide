@@ -7,9 +7,11 @@ All external I/O is mocked:
   - PostgreSQL (AuditDB via connect_audit_db)
   - HTTP webhook (requests.post)
 
-anonymize_dataframe is also mocked in most tests so the spaCy model is not
-loaded on every orchestration test; test_anonymization.py covers correctness.
-One integration test re-uses the session-scoped Presidio fixture to verify
+anonymize_dataframe, build_engines, validate_residual_pii, sanitize_column_names,
+flag_free_text_columns, and detect_quasi_identifiers are also mocked in most
+tests so the spaCy model is not loaded on every orchestration test.
+test_anonymization.py covers correctness.
+One integration test re-uses the session-scoped analyzer fixture to verify
 the full chain end-to-end.
 """
 
@@ -35,8 +37,8 @@ RAW_DF = pd.DataFrame({
 })
 
 ANON_DF = RAW_DF.copy()
-ANON_DF["name"]  = ["***", "***"]
-ANON_DF["email"] = ["***", "***"]
+ANON_DF["name"]  = ["PERSON_0", "PERSON_1"]
+ANON_DF["email"] = ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]
 
 MOCK_STATS = {
     "text_columns_scanned":    ["name", "email"],
@@ -59,7 +61,8 @@ def env(monkeypatch):
     """Set the minimum required env vars; remove optional ones."""
     for k, v in REQUIRED_ENV.items():
         monkeypatch.setenv(k, v)
-    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "ALERT_WEBHOOK_URL"):
+    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "ALERT_WEBHOOK_URL",
+                "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
         monkeypatch.delenv(opt, raising=False)
 
 
@@ -93,6 +96,36 @@ def mock_db(mocker):
     return db
 
 
+@pytest.fixture()
+def mock_engines(mocker):
+    """Prevent spaCy model load in unit tests."""
+    return mocker.patch("main.build_engines", return_value=mocker.MagicMock())
+
+
+@pytest.fixture()
+def mock_validate(mocker):
+    """Residual PII validation — always clean in orchestration unit tests."""
+    return mocker.patch("main.validate_residual_pii", return_value=0)
+
+
+@pytest.fixture()
+def mock_sanitize(mocker):
+    """Column name sanitization — identity transform, no renames."""
+    m = mocker.patch("main.sanitize_column_names")
+    m.side_effect = lambda df: (df.copy(), {})
+    return m
+
+
+@pytest.fixture()
+def mock_free_text(mocker):
+    return mocker.patch("main.flag_free_text_columns", return_value=[])
+
+
+@pytest.fixture()
+def mock_quasi(mocker):
+    return mocker.patch("main.detect_quasi_identifiers", return_value=[])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Happy path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,13 +133,15 @@ def mock_db(mocker):
 class TestPipelineSuccess:
 
     def test_runs_without_exception(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()  # must not raise
 
     def test_write_is_called(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -114,18 +149,20 @@ class TestPipelineSuccess:
         assert mock_write.called
 
     def test_write_receives_anonymized_dataframe(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         _, mock_write = mock_delta
         main()
 
         written_df: pd.DataFrame = mock_write.call_args.args[1]
-        assert list(written_df["name"])  == ["***", "***"]
-        assert list(written_df["email"]) == ["***", "***"]
+        assert list(written_df["name"])  == ["PERSON_0", "PERSON_1"]
+        assert list(written_df["email"]) == ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]
 
     def test_numeric_column_unchanged_after_write(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -135,7 +172,8 @@ class TestPipelineSuccess:
         assert list(written_df["score"]) == [10, 20]
 
     def test_write_target_uri_is_target(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -145,14 +183,16 @@ class TestPipelineSuccess:
         assert write_uri == TARGET_URI
 
     def test_audit_open_run_called(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()
         mock_db.open_run.assert_called_once()
 
     def test_audit_close_run_called_with_success(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()
@@ -163,7 +203,8 @@ class TestPipelineSuccess:
         assert audit["error_message"] is None
 
     def test_audit_records_entity_counts(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()
@@ -173,7 +214,8 @@ class TestPipelineSuccess:
         assert audit["entity_counts"]["EMAIL_ADDRESS"] == 2
 
     def test_no_alert_sent_on_success(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         mock_alert = mocker.patch("main.send_alert")
         from main import main
@@ -181,11 +223,36 @@ class TestPipelineSuccess:
         mock_alert.assert_not_called()
 
     def test_column_events_recorded_in_db(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()
         mock_db.record_columns.assert_called_once_with(MOCK_STATS["column_stats"])
+
+    def test_residual_validation_called(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+    ):
+        from main import main
+        main()
+        mock_validate.assert_called_once()
+
+    def test_sanitize_column_names_called(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+    ):
+        from main import main
+        main()
+        mock_sanitize.assert_called_once()
+
+    def test_flag_free_text_called(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+    ):
+        from main import main
+        main()
+        mock_free_text.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +262,8 @@ class TestPipelineSuccess:
 class TestPipelineFailure:
 
     def test_exception_propagates(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -205,7 +273,8 @@ class TestPipelineFailure:
             main()
 
     def test_close_run_still_called_on_failure(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -217,7 +286,8 @@ class TestPipelineFailure:
         mock_db.close_run.assert_called_once()
 
     def test_close_run_status_is_failure(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -230,7 +300,8 @@ class TestPipelineFailure:
         assert audit["status"] == "failure"
 
     def test_error_message_captured_in_audit(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -243,7 +314,8 @@ class TestPipelineFailure:
         assert "disk full" in audit["error_message"]
 
     def test_alert_sent_when_webhook_configured(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker, monkeypatch
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker, monkeypatch,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hook.example.com/abc")
         mock_alert = mocker.patch("main.send_alert")
@@ -259,7 +331,8 @@ class TestPipelineFailure:
         assert "FAILED" in subject
 
     def test_audit_close_run_called_even_when_db_write_fails(
-        self, env, mock_delta, mock_auth, mock_anonymize, mocker
+        self, env, mock_delta, mock_auth, mock_anonymize, mocker,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         """If the delta write fails mid-pipeline, close_run must still fire."""
         db = mocker.MagicMock()
@@ -273,6 +346,23 @@ class TestPipelineFailure:
 
         db.close_run.assert_called_once()
 
+    def test_residual_pii_aborts_pipeline(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_sanitize, mock_free_text, mock_quasi, mocker,
+    ):
+        """validate_residual_pii raising RuntimeError must abort before write."""
+        mocker.patch(
+            "main.validate_residual_pii",
+            side_effect=RuntimeError("Residual PII detected after anonymization: 2 finding(s)"),
+        )
+        _, mock_write = mock_delta
+
+        from main import main
+        with pytest.raises(RuntimeError, match="Residual PII"):
+            main()
+
+        mock_write.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional features disabled
@@ -281,7 +371,8 @@ class TestPipelineFailure:
 class TestOptionalFeatures:
 
     def test_pipeline_runs_without_database_url(
-        self, env, mock_delta, mock_auth, mock_anonymize, mocker
+        self, env, mock_delta, mock_auth, mock_anonymize, mocker,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         """No DATABASE_URL → connect_audit_db returns None → pipeline continues."""
         mocker.patch("main.connect_audit_db", return_value=None)
@@ -289,13 +380,15 @@ class TestOptionalFeatures:
         main()  # must not raise
 
     def test_pipeline_runs_without_webhook(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         from main import main
         main()  # no ALERT_WEBHOOK_URL set — must not raise
 
     def test_audit_db_failure_does_not_abort_pipeline(
-        self, env, mock_delta, mock_auth, mock_anonymize, mocker
+        self, env, mock_delta, mock_auth, mock_anonymize, mocker,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         db = mocker.MagicMock()
         db.open_run.side_effect = Exception("DB down")
@@ -305,15 +398,33 @@ class TestOptionalFeatures:
         main()  # pipeline must complete even if audit DB is down
 
     def test_purview_check_skipped_when_not_configured(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
     ):
         mock_purview = mocker.patch("main.run_purview_check")
+        mock_purview.return_value = {
+            "available": False, "flagged_columns": [],
+            "column_labels": {}, "discrepancies": [],
+        }
         from main import main
         main()
         # PURVIEW_ACCOUNT_NAME not set → run_purview_check is still called
         # but with purview_account=None (the function handles the skip internally)
         mock_purview.assert_called_once()
         assert mock_purview.call_args.args[2] is None
+
+    def test_k_anonymity_skipped_when_no_quasi_cols(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mocker,
+    ):
+        """detect_quasi_identifiers returning [] means enforce_k_anonymity is never called."""
+        mocker.patch("main.detect_quasi_identifiers", return_value=[])
+        mock_k = mocker.patch("main.enforce_k_anonymity")
+
+        from main import main
+        main()
+
+        mock_k.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,10 +434,12 @@ class TestOptionalFeatures:
 class TestEndToEndAnonymization:
 
     def test_emails_anonymized_in_written_dataframe(
-        self, env, mock_delta, mock_auth, mock_db, presidio_engines, mocker
+        self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
+        mock_sanitize, mock_free_text, mock_quasi,
     ):
-        """Full chain: real Presidio engines, mocked storage + DB."""
-        mocker.patch("main.build_engines", return_value=presidio_engines)
+        """Full chain: real Presidio engine, mocked storage + DB."""
+        mocker.patch("main.build_engines", return_value=analyzer)
+        mocker.patch("main.validate_residual_pii", return_value=0)
         _, mock_write = mock_delta
 
         from main import main
@@ -338,9 +451,11 @@ class TestEndToEndAnonymization:
             assert "@" not in val, f"Email not fully masked: {val!r}"
 
     def test_score_column_untouched_in_written_dataframe(
-        self, env, mock_delta, mock_auth, mock_db, presidio_engines, mocker
+        self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
+        mock_sanitize, mock_free_text, mock_quasi,
     ):
-        mocker.patch("main.build_engines", return_value=presidio_engines)
+        mocker.patch("main.build_engines", return_value=analyzer)
+        mocker.patch("main.validate_residual_pii", return_value=0)
         _, mock_write = mock_delta
 
         from main import main
@@ -348,3 +463,19 @@ class TestEndToEndAnonymization:
 
         written_df: pd.DataFrame = mock_write.call_args.args[1]
         assert list(written_df["score"]) == [10, 20]
+
+    def test_entity_tokens_in_output(
+        self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
+        mock_sanitize, mock_free_text, mock_quasi,
+    ):
+        """After anonymization, columns should contain ENTITY_TYPE_N tokens."""
+        mocker.patch("main.build_engines", return_value=analyzer)
+        mocker.patch("main.validate_residual_pii", return_value=0)
+        _, mock_write = mock_delta
+
+        from main import main
+        main()
+
+        written_df: pd.DataFrame = mock_write.call_args.args[1]
+        for val in written_df["email"]:
+            assert "EMAIL_ADDRESS_" in val, f"Expected EMAIL_ADDRESS token, got: {val!r}"
