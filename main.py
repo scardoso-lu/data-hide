@@ -4,8 +4,9 @@ Fabric PII Anonymization Pipeline
 Reads a Delta table from Microsoft Fabric OneLake, anonymizes PII / GDPR /
 financial data with Microsoft Presidio, optionally cross-checks sensitivity
 labels from Microsoft Purview, writes the result to a target Lakehouse, and
-persists structured audit records both as local JSONL files and as a central
-Delta audit table.
+records structured audit data to a PostgreSQL database.
+
+The container is fully stateless — no files are written at runtime.
 """
 
 import json
@@ -14,11 +15,13 @@ import os
 import re
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from typing import Generator, Optional
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import requests
 from azure.identity import DefaultAzureCredential
 from deltalake import DeltaTable, write_deltalake
@@ -34,7 +37,7 @@ ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
 PURVIEW_TOKEN_SCOPE = "https://purview.azure.net/.default"
 SPACY_MODEL         = "en_core_web_lg"
 MASK_VALUE          = "***"
-PIPELINE_VERSION    = "1.1.0"
+PIPELINE_VERSION    = "1.2.0"
 
 ENTITIES = [
     "PERSON",
@@ -46,31 +49,16 @@ ENTITIES = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging — stdout + persistent rolling file + per-run JSONL audit stream
+# Logging — stdout only; the container runtime captures and forwards these
 # ─────────────────────────────────────────────────────────────────────────────
-LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-run_id     = str(uuid.uuid4())
-jsonl_path = LOG_DIR / f"audit_{run_id}.jsonl"
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / "pipeline.log"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-
-def _emit(event: dict) -> None:
-    """Append one structured event to the run-scoped JSONL audit file."""
-    record = {"run_id": run_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
-    with open(jsonl_path, "a") as fh:
-        fh.write(json.dumps(record, default=str) + "\n")
-
+run_id = str(uuid.uuid4())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Authentication
@@ -79,12 +67,11 @@ _credential: Optional[DefaultAzureCredential] = None
 
 
 def _credential_instance() -> DefaultAzureCredential:
-    """Return a singleton DefaultAzureCredential.
+    """Singleton DefaultAzureCredential.
 
     When AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET are present
-    DefaultAzureCredential automatically uses the ClientSecretCredential flow
-    (service principal).  On Azure-managed compute it falls back to Managed
-    Identity with no extra configuration.
+    DefaultAzureCredential automatically uses the ClientSecretCredential flow.
+    On Azure-managed compute it falls back to Managed Identity.
     """
     global _credential
     if _credential is None:
@@ -103,16 +90,12 @@ def acquire_token(scope: str) -> str:
 # OneLake / storage helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _account_name(abfss_uri: str) -> str:
-    """Extract the storage-account name from an abfss:// URI.
-
-    Format:  abfss://<container>@<account>.dfs.fabric.microsoft.com/<path>
-    For OneLake the account is always 'onelake'.
-    """
+    """Extract account name from abfss://container@account.dfs…/path."""
     m = re.search(r"@([^.@/]+)\.", abfss_uri)
     if not m:
         raise ValueError(
             f"Cannot parse account name from URI: '{abfss_uri}'.  "
-            "Expected format: abfss://container@account.dfs.fabric.microsoft.com/..."
+            "Expected: abfss://container@account.dfs.fabric.microsoft.com/..."
         )
     return m.group(1)
 
@@ -124,10 +107,9 @@ def _storage_opts(uri: str, token: str) -> dict:
 def _fresh_opts(uri: str) -> dict:
     """Acquire a fresh token immediately before each storage call.
 
-    DefaultAzureCredential caches tokens internally and only performs a network
-    refresh when the cached token is within ~5 minutes of expiry, so calling
-    this before every storage operation is cheap and prevents authentication
-    failures caused by token expiry during long-running anonymization steps.
+    DefaultAzureCredential caches tokens and only hits the auth endpoint when
+    the cached token is within ~5 minutes of expiry, so this is cheap and
+    prevents auth failures when anonymization outlasts the original token TTL.
     """
     return _storage_opts(uri, acquire_token(ONELAKE_TOKEN_SCOPE))
 
@@ -148,9 +130,9 @@ class PurviewClient:
         return resp.json()
 
     def column_classifications(self, qualified_name: str) -> dict[str, list[str]]:
-        """Return {column_name: [sensitivity_label, ...]} for an ADLS Gen2 path entity.
+        """Return {column_name: [label, ...]} for an ADLS Gen2 path entity.
 
-        Returns an empty dict when the asset is not yet catalogued or on any error.
+        Returns {} when the asset is not yet catalogued or on any error.
         """
         try:
             data = self._get(
@@ -159,10 +141,7 @@ class PurviewClient:
             )
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else "?"
-            if code == 404:
-                logger.warning("Purview: asset not catalogued  qn='%s'", qualified_name)
-            else:
-                logger.warning("Purview HTTP %s: %s", code, exc)
+            logger.warning("Purview HTTP %s: %s", code, exc)
             return {}
         except Exception as exc:
             logger.warning("Purview request failed: %s", exc)
@@ -180,10 +159,8 @@ class PurviewClient:
 
     @staticmethod
     def qualified_name(abfss_uri: str) -> str:
-        """Convert an abfss:// OneLake URI to a Purview Atlas qualified name.
-
-        abfss://workspace@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/tbl
-        →  https://onelake.dfs.fabric.microsoft.com/workspace/lh.Lakehouse/Tables/tbl
+        """abfss://workspace@onelake.dfs.…/lh.Lakehouse/Tables/t
+        →  https://onelake.dfs.…/workspace/lh.Lakehouse/Tables/t
         """
         without_scheme = abfss_uri.replace("abfss://", "")
         container, rest = without_scheme.split("@", 1)
@@ -196,16 +173,7 @@ def run_purview_check(
     df_columns: list[str],
     purview_account: str | None,
 ) -> dict:
-    """Optional Purview sensitivity-label cross-check.  Never raises.
-
-    Returns
-    -------
-    dict with keys:
-        available         bool
-        flagged_columns   list[str]   columns Purview classified as sensitive
-        column_labels     dict        {col: [label, ...]}
-        discrepancies     list[str]   Purview-flagged columns absent from DataFrame
-    """
+    """Optional Purview sensitivity-label cross-check. Never raises."""
     empty = {"available": False, "flagged_columns": [], "column_labels": {}, "discrepancies": []}
 
     if not purview_account:
@@ -222,23 +190,15 @@ def run_purview_check(
         discrepancies = [c for c in flagged if c not in df_columns]
 
         if discrepancies:
-            logger.warning(
-                "Purview flagged column(s) not in DataFrame (schema drift?): %s",
-                discrepancies,
-            )
+            logger.warning("Purview flagged columns absent from DataFrame: %s", discrepancies)
 
-        logger.info(
-            "Purview: %d sensitive column(s) identified: %s", len(flagged), flagged
-        )
-        result = {
+        logger.info("Purview: %d sensitive column(s): %s", len(flagged), flagged)
+        return {
             "available":       True,
             "flagged_columns": flagged,
             "column_labels":   col_labels,
             "discrepancies":   discrepancies,
         }
-        _emit({"event": "purview_check", "qualified_name": qn, **result})
-        return result
-
     except Exception as exc:
         logger.warning("Purview check failed (non-fatal): %s", exc)
         return empty
@@ -254,9 +214,9 @@ def read_delta(uri: str, storage_options: dict) -> pd.DataFrame:
     return df
 
 
-def write_delta(df: pd.DataFrame, uri: str, storage_options: dict, mode: str = "overwrite") -> None:
-    logger.info("Writing Delta table  mode=%s  uri='%s'", mode, uri)
-    write_deltalake(uri, df, storage_options=storage_options, mode=mode, overwrite_schema=True)
+def write_delta(df: pd.DataFrame, uri: str, storage_options: dict) -> None:
+    logger.info("Writing Delta table  uri='%s'", uri)
+    write_deltalake(uri, df, storage_options=storage_options, mode="overwrite", overwrite_schema=True)
     logger.info("Write complete — %d row(s).", len(df))
 
 
@@ -293,29 +253,31 @@ def anonymize_dataframe(
     analyzer: AnalyzerEngine,
     anonymizer: AnonymizerEngine,
 ) -> tuple[pd.DataFrame, dict]:
-    """Anonymize every object-dtype column.
+    """Anonymize every object-dtype column that contains genuine string values.
 
     Returns
     -------
     (anonymized_df, stats)  where stats = {
-        "text_columns_scanned":  list[str],
+        "text_columns_scanned":    list[str],
         "columns_with_detections": list[str],
-        "entity_counts":         {entity_type: int},
+        "entity_counts":           {entity_type: int},
         "total_entities_detected": int,
+        "column_stats":            [{column, detections, entity_counts}, ...],
     }
     """
-    operators     = {"DEFAULT": OperatorConfig("replace", {"new_value": MASK_VALUE})}
-    df            = df.copy()
-    text_cols     = [c for c in df.columns if df[c].dtype == object]
-    entity_counts = {e: 0 for e in ENTITIES}
-    cols_hit: list[str] = []
+    operators      = {"DEFAULT": OperatorConfig("replace", {"new_value": MASK_VALUE})}
+    df             = df.copy()
+    text_cols      = [c for c in df.columns if df[c].dtype == object]
+    entity_counts  = {e: 0 for e in ENTITIES}
+    cols_hit: list[str]  = []
+    column_stats: list[dict] = []
 
     logger.info("Scanning %d text column(s): %s", len(text_cols), text_cols)
 
     for col in text_cols:
-        col_detections   = 0
+        col_detections    = 0
         col_entity_counts = {e: 0 for e in ENTITIES}
-        new_values: list = []
+        new_values: list  = []
 
         for val in df[col]:
             # Only process genuine string values.  Non-string objects in an
@@ -335,13 +297,10 @@ def anonymize_dataframe(
         df[col] = new_values
         if col_detections:
             cols_hit.append(col)
-
-        # Persistent per-column audit event
-        _emit({
-            "event":          "column_processed",
-            "column":         col,
-            "total_detections": col_detections,
-            "entity_counts":  col_entity_counts,
+        column_stats.append({
+            "column":        col,
+            "detections":    col_detections,
+            "entity_counts": col_entity_counts,
         })
         logger.info("  %-30s  detections=%d", f"column='{col}'", col_detections)
 
@@ -350,46 +309,163 @@ def anonymize_dataframe(
         "columns_with_detections": cols_hit,
         "entity_counts":           entity_counts,
         "total_entities_detected": sum(entity_counts.values()),
+        "column_stats":            column_stats,
     }
     return df, stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Central audit table
+# PostgreSQL audit persistence
 # ─────────────────────────────────────────────────────────────────────────────
-def write_audit_record(record: dict, audit_uri: str | None, storage_opts: dict) -> None:
-    """Append one row to the central anonymization audit Delta table.
+_DDL_RUNS = """
+CREATE TABLE IF NOT EXISTS pii_pipeline_runs (
+    run_id           UUID        PRIMARY KEY,
+    pipeline_version TEXT        NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL,
+    finished_at      TIMESTAMPTZ,
+    source_uri       TEXT        NOT NULL,
+    target_uri       TEXT        NOT NULL,
+    total_rows       INTEGER,
+    total_columns    INTEGER,
+    columns_scanned  INTEGER,
+    columns_hit      JSONB,
+    entities_total   INTEGER,
+    entity_counts    JSONB,
+    purview_ok       BOOLEAN     NOT NULL DEFAULT FALSE,
+    purview_flagged  JSONB,
+    purview_diffs    JSONB,
+    status           TEXT        NOT NULL DEFAULT 'running',
+    error_msg        TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
 
-    Schema (all list/dict values are JSON-encoded strings for portability):
-        run_id, pipeline_version, pipeline_start_ts, pipeline_end_ts,
-        source_uri, target_uri, total_rows_processed, total_columns_in_table,
-        total_columns_scanned, columns_anonymized (JSON), total_entities_detected,
-        entity_counts (JSON), purview_available, purview_flagged_columns (JSON),
-        purview_discrepancies (JSON), status, error_message
+_DDL_COLUMN_EVENTS = """
+CREATE TABLE IF NOT EXISTS pii_pipeline_column_events (
+    id            BIGSERIAL   PRIMARY KEY,
+    run_id        UUID        NOT NULL REFERENCES pii_pipeline_runs(run_id),
+    column_name   TEXT        NOT NULL,
+    detections    INTEGER     NOT NULL DEFAULT 0,
+    entity_counts JSONB,
+    processed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+
+class AuditDB:
+    """PostgreSQL-backed audit persistence.
+
+    Two tables are managed:
+      pii_pipeline_runs         — one row per pipeline execution
+      pii_pipeline_column_events — one row per text column scanned per run
+
+    All public methods are safe to call from a finally block: callers should
+    wrap each call in try/except so a DB hiccup never aborts the pipeline.
     """
-    if not audit_uri:
-        logger.info("AUDIT_ABFSS_URI not set — central audit table write skipped.")
-        return
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._init_schema()
+
+    @contextmanager
+    def _cursor(self) -> Generator:
+        """Open a short-lived connection, commit on success, rollback on error."""
+        conn = psycopg2.connect(self._dsn)
+        try:
+            with conn.cursor() as cur:
+                yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _init_schema(self) -> None:
+        with self._cursor() as cur:
+            cur.execute(_DDL_RUNS)
+            cur.execute(_DDL_COLUMN_EVENTS)
+
+    def open_run(self, started_at: datetime, source_uri: str, target_uri: str) -> None:
+        """Insert a 'running' row so in-progress pipelines are visible in the DB."""
+        sql = """
+            INSERT INTO pii_pipeline_runs
+                (run_id, pipeline_version, started_at, source_uri, target_uri, status)
+            VALUES (%s, %s, %s, %s, %s, 'running')
+        """
+        with self._cursor() as cur:
+            cur.execute(sql, (run_id, PIPELINE_VERSION, started_at, source_uri, target_uri))
+
+    def record_columns(self, column_stats: list[dict]) -> None:
+        """Bulk-insert per-column processing events."""
+        rows = [
+            (run_id, s["column"], s["detections"], json.dumps(s["entity_counts"]))
+            for s in column_stats
+        ]
+        sql = """
+            INSERT INTO pii_pipeline_column_events
+                (run_id, column_name, detections, entity_counts)
+            VALUES %s
+        """
+        with self._cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, rows)
+
+    def close_run(self, audit: dict) -> None:
+        """Update the run row with final counters and terminal status."""
+        sql = """
+            UPDATE pii_pipeline_runs SET
+                finished_at     = %s,
+                total_rows      = %s,
+                total_columns   = %s,
+                columns_scanned = %s,
+                columns_hit     = %s,
+                entities_total  = %s,
+                entity_counts   = %s,
+                purview_ok      = %s,
+                purview_flagged = %s,
+                purview_diffs   = %s,
+                status          = %s,
+                error_msg       = %s
+            WHERE run_id = %s
+        """
+        with self._cursor() as cur:
+            cur.execute(sql, (
+                audit.get("pipeline_end_ts"),
+                audit.get("total_rows_processed"),
+                audit.get("total_columns_in_table"),
+                audit.get("total_columns_scanned"),
+                json.dumps(audit.get("columns_anonymized", [])),
+                audit.get("total_entities_detected"),
+                json.dumps(audit.get("entity_counts", {})),
+                audit.get("purview_available", False),
+                json.dumps(audit.get("purview_flagged_columns", [])),
+                json.dumps(audit.get("purview_discrepancies", [])),
+                audit.get("status"),
+                audit.get("error_message"),
+                run_id,
+            ))
+
+
+def connect_audit_db(database_url: str | None) -> Optional[AuditDB]:
+    """Attempt to connect. Returns None (non-fatal) when DATABASE_URL is unset
+    or the connection fails."""
+    if not database_url:
+        logger.info("DATABASE_URL not set — audit DB disabled.")
+        return None
     try:
-        flat = {
-            k: json.dumps(v, default=str) if isinstance(v, (list, dict)) else v
-            for k, v in record.items()
-        }
-        write_delta(pd.DataFrame([flat]), audit_uri, storage_opts, mode="append")
+        db = AuditDB(database_url)
+        logger.info("Audit DB connected and schema verified.")
+        return db
     except Exception as exc:
-        logger.warning("Audit table write failed (non-fatal): %s", exc)
+        logger.warning("Audit DB connection failed (non-fatal): %s", exc)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Alerting
 # ─────────────────────────────────────────────────────────────────────────────
 def send_alert(subject: str, body: str, webhook_url: str | None) -> None:
-    """POST a JSON alert to a generic / Teams / Slack incoming webhook.
-
-    Both Microsoft Teams (Incoming Webhook connector) and Slack accept the
-    simple  {"text": "..."}  payload shape used here.
-    Set ALERT_WEBHOOK_URL to enable; leave unset to suppress.
-    """
+    """POST a JSON payload to a Teams / Slack / generic incoming webhook."""
     if not webhook_url:
         logger.warning("ALERT_WEBHOOK_URL not configured — alert suppressed: %s", subject)
         return
@@ -406,24 +482,18 @@ def send_alert(subject: str, body: str, webhook_url: str | None) -> None:
 # Pipeline orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    source_uri    = os.environ["SOURCE_ABFSS_URI"]
-    target_uri    = os.environ["TARGET_ABFSS_URI"]
-    audit_uri     = os.environ.get("AUDIT_ABFSS_URI")
-    purview_acct  = os.environ.get("PURVIEW_ACCOUNT_NAME")
-    webhook_url   = os.environ.get("ALERT_WEBHOOK_URL")
+    source_uri   = os.environ["SOURCE_ABFSS_URI"]
+    target_uri   = os.environ["TARGET_ABFSS_URI"]
+    database_url = os.environ.get("DATABASE_URL")
+    purview_acct = os.environ.get("PURVIEW_ACCOUNT_NAME")
+    webhook_url  = os.environ.get("ALERT_WEBHOOK_URL")
 
     pipeline_start = datetime.now(timezone.utc)
     logger.info("Pipeline started  run_id=%s  ts=%s", run_id, pipeline_start.isoformat())
-    _emit({"event": "pipeline_start", "source_uri": source_uri, "target_uri": target_uri})
 
-    # Audit record template — filled in progressively; always written in finally
+    # Audit dict accumulated as the pipeline progresses; persisted in finally
     audit: dict = {
-        "run_id":                  run_id,
-        "pipeline_version":        PIPELINE_VERSION,
-        "pipeline_start_ts":       pipeline_start.isoformat(),
         "pipeline_end_ts":         None,
-        "source_uri":              source_uri,
-        "target_uri":              target_uri,
         "total_rows_processed":    0,
         "total_columns_in_table":  0,
         "total_columns_scanned":   0,
@@ -436,12 +506,16 @@ def main() -> None:
         "status":                  "failure",
         "error_message":           None,
     }
-    audit_storage_opts: dict = {}
+
+    db = connect_audit_db(database_url)
+    if db:
+        try:
+            db.open_run(pipeline_start, source_uri, target_uri)
+        except Exception as exc:
+            logger.warning("Audit open_run failed (non-fatal): %s", exc)
 
     try:
         # ── Extract ───────────────────────────────────────────────────────────
-        # Token is acquired fresh immediately before each storage call so that
-        # expiry during a long anonymization step cannot cause a write failure.
         df_raw = read_delta(source_uri, _fresh_opts(source_uri))
         audit["total_rows_processed"]   = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
@@ -460,36 +534,33 @@ def main() -> None:
         audit["total_entities_detected"] = stats["total_entities_detected"]
         audit["entity_counts"]           = stats["entity_counts"]
 
+        if db and stats["column_stats"]:
+            try:
+                db.record_columns(stats["column_stats"])
+            except Exception as exc:
+                logger.warning("Audit record_columns failed (non-fatal): %s", exc)
+
         # ── Load ──────────────────────────────────────────────────────────────
         write_delta(df_clean, target_uri, _fresh_opts(target_uri))
 
         # ── Mark success ──────────────────────────────────────────────────────
-        pipeline_end           = datetime.now(timezone.utc)
+        pipeline_end             = datetime.now(timezone.utc)
         audit["pipeline_end_ts"] = pipeline_end.isoformat()
         audit["status"]          = "success"
-
         logger.info(
-            "Pipeline SUCCESS  run_id=%s  rows=%d  entities=%d  cols_anonymized=%d",
+            "Pipeline SUCCESS  run_id=%s  rows=%d  entities=%d  cols_anonymized=%d  duration=%.1fs",
             run_id,
             audit["total_rows_processed"],
             audit["total_entities_detected"],
             len(audit["columns_anonymized"]),
+            (pipeline_end - pipeline_start).total_seconds(),
         )
-        _emit({
-            "event":           "pipeline_success",
-            "rows":            audit["total_rows_processed"],
-            "entities":        audit["total_entities_detected"],
-            "cols_anonymized": audit["columns_anonymized"],
-            "duration_s":      (pipeline_end - pipeline_start).total_seconds(),
-        })
 
     except Exception as exc:
         pipeline_end             = datetime.now(timezone.utc)
         audit["pipeline_end_ts"] = pipeline_end.isoformat()
         audit["error_message"]   = str(exc)
-
         logger.exception("Pipeline FAILED  run_id=%s  error=%s", run_id, exc)
-        _emit({"event": "pipeline_failure", "error": str(exc)})
         send_alert(
             "Pipeline FAILED",
             f"run_id : {run_id}\nsource  : {source_uri}\nerror   : {exc}",
@@ -498,9 +569,11 @@ def main() -> None:
         raise
 
     finally:
-        if audit_uri:
-            audit_storage_opts = _fresh_opts(audit_uri)
-        write_audit_record(audit, audit_uri, audit_storage_opts)
+        if db:
+            try:
+                db.close_run(audit)
+            except Exception as exc:
+                logger.warning("Audit close_run failed (non-fatal): %s", exc)
 
 
 if __name__ == "__main__":

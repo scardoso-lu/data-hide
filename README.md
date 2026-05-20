@@ -1,15 +1,15 @@
 # Fabric PII Anonymization Pipeline
 
-A containerized Python pipeline that:
+A containerized, **stateless** Python pipeline that:
 
 1. **Reads** a Delta table from a Microsoft Fabric Lakehouse (OneLake).
 2. **Cross-checks** column sensitivity labels against Microsoft Purview (optional).
 3. **Anonymizes** PII, GDPR, and financial entities using Microsoft Presidio + spaCy.
 4. **Writes** the cleaned data as a Delta table to a different Microsoft Fabric Lakehouse.
-5. **Audits** every run in a central Delta audit table and local JSONL files.
+5. **Audits** every run in a PostgreSQL database (run-level + per-column granularity).
 6. **Alerts** on pipeline failures via a configurable Teams / Slack webhook.
 
-No PySpark — everything runs on lightweight `delta-rs` + Pandas.
+No PySpark. No files written inside the container at runtime.
 
 ---
 
@@ -23,12 +23,14 @@ abfss://…/raw_customers                       abfss://…/anonymized_customers
         ▼                                               ▲
    Pandas DataFrame ──► Purview check ──► Presidio ──► Anonymized DataFrame
                                                 │
-                                        Audit Delta table + JSONL logs
+                                         PostgreSQL audit DB
+                                   pii_pipeline_runs  (1 row / run)
+                             pii_pipeline_column_events  (1 row / column)
 ```
 
 ### Entities detected and masked
 
-| Entity | Examples masked |
+| Entity | Examples |
 |---|---|
 | `PERSON` | John Smith |
 | `EMAIL_ADDRESS` | user@example.com |
@@ -45,8 +47,9 @@ All detections are replaced with `***`.
 
 | Tool | Version |
 |---|---|
-| Docker | 20.10+ |
+| Docker + Docker Compose | 24+ |
 | Azure Service Principal | — |
+| PostgreSQL | 14+ (provided by compose for local runs) |
 
 The Service Principal (or Managed Identity) needs:
 
@@ -54,7 +57,6 @@ The Service Principal (or Managed Identity) needs:
 |---|---|
 | Source OneLake | Storage Blob Data Reader |
 | Target OneLake | Storage Blob Data Contributor |
-| Audit OneLake | Storage Blob Data Contributor |
 | Purview account (optional) | Purview Data Reader |
 
 ---
@@ -81,10 +83,9 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `AUDIT_ABFSS_URI` | *(disabled)* | Delta table for the central run-history audit log |
-| `PURVIEW_ACCOUNT_NAME` | *(disabled)* | Purview account name for sensitivity-label cross-check |
+| `DATABASE_URL` | *(disabled)* | PostgreSQL DSN for audit records |
+| `PURVIEW_ACCOUNT_NAME` | *(disabled)* | Purview account name for label cross-check |
 | `ALERT_WEBHOOK_URL` | *(disabled)* | Teams or Slack webhook URL for failure alerts |
-| `LOG_DIR` | `/app/logs` | Directory for `pipeline.log` and per-run `audit_<id>.jsonl` |
 
 ### OneLake ABFS URI format
 
@@ -92,100 +93,128 @@ cp .env.example .env
 abfss://<WorkspaceName>@onelake.dfs.fabric.microsoft.com/<LakehouseName>.Lakehouse/Tables/<TableName>
 ```
 
-You can copy the exact URI from the Fabric portal: open the Lakehouse → right-click the table → **Properties** → **ABFS path**.
+Copy from Fabric portal: open the Lakehouse → right-click the table → **Properties** → **ABFS path**.
 
 ---
 
-## Audit and observability
+## Running locally with Docker Compose
 
-### Local log files (always written)
+The compose file spins up a Postgres instance and the pipeline in one command.
 
-| File | Content |
-|---|---|
-| `$LOG_DIR/pipeline.log` | Human-readable rolling log (all runs) |
-| `$LOG_DIR/audit_<run_id>.jsonl` | Structured JSONL event stream for this run |
+```bash
+cp .env.example .env
+# Fill in AZURE_*, SOURCE_ABFSS_URI, TARGET_ABFSS_URI
 
-Each JSONL file contains events:
+docker compose up --build
+```
 
-| Event | When |
-|---|---|
-| `pipeline_start` | Pipeline begins |
-| `purview_check` | Purview result (if enabled) |
-| `column_processed` | After each text column is scanned |
-| `pipeline_success` | Final summary on success |
-| `pipeline_failure` | Error detail on failure |
+`DATABASE_URL` is automatically wired to the compose-managed Postgres — no
+manual configuration needed for the audit database when running locally.
 
-### Central audit Delta table (`AUDIT_ABFSS_URI`)
+To inspect audit records after the run:
 
-One row per run.  Schema:
+```bash
+docker compose exec db psql -U pipeline -d pii_audit
 
-| Column | Type | Description |
-|---|---|---|
-| `run_id` | STRING | UUID for this execution |
-| `pipeline_version` | STRING | Code version |
-| `pipeline_start_ts` | STRING | ISO 8601 start time |
-| `pipeline_end_ts` | STRING | ISO 8601 end time |
-| `source_uri` | STRING | Source ABFS path |
-| `target_uri` | STRING | Target ABFS path |
-| `total_rows_processed` | INT64 | Rows read |
-| `total_columns_in_table` | INT64 | Total columns |
-| `total_columns_scanned` | INT64 | String columns scanned |
-| `columns_anonymized` | STRING (JSON) | Names of columns that had detections |
-| `total_entities_detected` | INT64 | Sum of all entity hits |
-| `entity_counts` | STRING (JSON) | `{"PERSON": 4, "EMAIL_ADDRESS": 2, …}` |
-| `purview_available` | BOOL | Whether Purview was reachable |
-| `purview_flagged_columns` | STRING (JSON) | Columns Purview marked sensitive |
-| `purview_discrepancies` | STRING (JSON) | Purview-flagged cols absent from DataFrame |
-| `status` | STRING | `"success"` or `"failure"` |
-| `error_message` | STRING | Error detail if status=failure |
+pii_audit=# SELECT run_id, status, total_rows, entities_total, finished_at FROM pii_pipeline_runs;
+pii_audit=# SELECT column_name, detections, entity_counts FROM pii_pipeline_column_events WHERE run_id = '<run_id>';
+```
+
+To stop and remove containers (Postgres data is kept in the `pg_data` volume):
+
+```bash
+docker compose down
+```
 
 ---
 
-## Build & run with Docker
+## Running standalone (without compose)
 
-### Build the image
+Build the image:
 
 ```bash
 docker build -t fabric-pii-pipeline:latest .
 ```
 
-> The `en_core_web_lg` spaCy model (~800 MB) is baked into the image at build time — no network required at runtime.
-
-### Verify the image runs as a non-root user
+Verify it runs as a non-root user:
 
 ```bash
 docker run --rm --entrypoint whoami fabric-pii-pipeline:latest
-# expected output: appuser
+# → appuser
 ```
 
-### Run — mount a log volume for persistence
+Run against an external Postgres:
 
 ```bash
 docker run --rm \
   --env-file .env \
-  -v "$(pwd)/logs:/app/logs" \
-  fabric-pii-pipeline:latest
-```
-
-Passing variables individually:
-
-```bash
-docker run --rm \
-  -e AZURE_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
-  -e AZURE_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
-  -e AZURE_CLIENT_SECRET=your-secret \
-  -e SOURCE_ABFSS_URI="abfss://..." \
-  -e TARGET_ABFSS_URI="abfss://..." \
-  -e AUDIT_ABFSS_URI="abfss://..." \
-  -e PURVIEW_ACCOUNT_NAME="my-purview-account" \
-  -e ALERT_WEBHOOK_URL="https://outlook.office.com/webhook/..." \
-  -v "$(pwd)/logs:/app/logs" \
+  -e DATABASE_URL="postgresql://user:pass@your-pg-host:5432/pii_audit" \
   fabric-pii-pipeline:latest
 ```
 
 ---
 
-## Run locally (without Docker)
+## PostgreSQL audit schema
+
+Tables are created automatically on first run (`CREATE TABLE IF NOT EXISTS`).
+
+### `pii_pipeline_runs`  — one row per execution
+
+| Column | Type | Description |
+|---|---|---|
+| `run_id` | UUID PK | Unique execution identifier |
+| `pipeline_version` | TEXT | Code version |
+| `started_at` | TIMESTAMPTZ | Pipeline start time |
+| `finished_at` | TIMESTAMPTZ | Pipeline end time (NULL while running) |
+| `source_uri` | TEXT | Source ABFS path |
+| `target_uri` | TEXT | Target ABFS path |
+| `total_rows` | INTEGER | Rows read from source |
+| `total_columns` | INTEGER | Total columns in source table |
+| `columns_scanned` | INTEGER | String columns passed to Presidio |
+| `columns_hit` | JSONB | Column names where entities were found |
+| `entities_total` | INTEGER | Total entity detections across all columns |
+| `entity_counts` | JSONB | `{"PERSON": 4, "EMAIL_ADDRESS": 2, …}` |
+| `purview_ok` | BOOLEAN | Whether Purview was reachable |
+| `purview_flagged` | JSONB | Columns Purview marked sensitive |
+| `purview_diffs` | JSONB | Purview-flagged columns absent from DataFrame |
+| `status` | TEXT | `running` → `success` or `failure` |
+| `error_msg` | TEXT | Exception detail when status = failure |
+| `created_at` | TIMESTAMPTZ | Row insert time |
+
+### `pii_pipeline_column_events`  — one row per column per execution
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGSERIAL PK | — |
+| `run_id` | UUID FK | References `pii_pipeline_runs.run_id` |
+| `column_name` | TEXT | Column that was scanned |
+| `detections` | INTEGER | Entity hits found in this column |
+| `entity_counts` | JSONB | Per-entity breakdown for this column |
+| `processed_at` | TIMESTAMPTZ | When the column was scanned |
+
+---
+
+## Pushing to Docker Hub
+
+```bash
+# One-time login
+docker login
+
+export DOCKER_HUB_USERNAME=myusername
+
+# Push as :latest
+./push_to_dockerhub.sh
+
+# Push a versioned tag (also updates :latest)
+./push_to_dockerhub.sh 1.2.0
+```
+
+The script always builds for `linux/amd64` so the image works on both local
+Apple Silicon machines and cloud-hosted amd64 runners.
+
+---
+
+## Run locally without Docker
 
 ```bash
 python -m venv .venv
@@ -194,7 +223,6 @@ source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg
 
-# Export env vars
 export $(grep -v '^#' .env | xargs)
 
 python main.py
@@ -204,44 +232,41 @@ python main.py
 
 ## Microsoft Purview setup
 
-When `PURVIEW_ACCOUNT_NAME` is set, the pipeline:
+When `PURVIEW_ACCOUNT_NAME` is set the pipeline queries the Purview Atlas API
+for column-level sensitivity classifications on the source table and logs any
+columns Purview flagged that Presidio didn't detect. The check is
+**non-blocking** — a 404 or network error logs a warning and continues.
 
-1. Translates the source ABFS URI to a Purview Atlas qualified name.
-2. Queries the Purview Catalog API for column-level sensitivity classifications.
-3. Logs any columns Purview flagged that are not also detected by Presidio (discrepancies).
-4. Records results in the JSONL audit file and the central audit table.
-
-The check is **non-blocking** — if Purview is unreachable or the asset is not yet catalogued the pipeline continues and logs a warning.
-
-The service principal requires the **Purview Data Reader** (or **Collection Admin**) role on the Purview account.
+The service principal needs the **Purview Data Reader** role on the account.
 
 ---
 
 ## Alert webhook
 
-Set `ALERT_WEBHOOK_URL` to receive a JSON `POST` on every pipeline failure.
+Set `ALERT_WEBHOOK_URL` to receive a `{"text": "..."}` POST on any failure.
 
-**Microsoft Teams** — create an Incoming Webhook connector in a channel and paste the URL.
-
-**Slack** — add the **Incoming Webhooks** app to your workspace and paste the webhook URL.
-
-The payload shape `{"text": "..."}` is accepted by both platforms.
+- **Teams** — create an Incoming Webhook connector in a channel.
+- **Slack** — add the Incoming Webhooks app and copy the URL.
 
 ---
 
 ## Running on Azure-managed compute
 
-When the container runs on Azure Container Instances, AKS, or Azure ML with an assigned **Managed Identity**, omit all three `AZURE_*` variables. `DefaultAzureCredential` automatically acquires tokens via the IMDS endpoint.
+On ACI / AKS / Azure ML with an assigned Managed Identity, omit the three
+`AZURE_*` variables. `DefaultAzureCredential` acquires tokens automatically
+via the IMDS endpoint.
 
 ---
 
 ## Security notes
 
-* The Docker container runs as **non-root** (uid/gid 1001, `appuser`).
-* Credentials arrive at runtime via environment variables — never baked into the image.
+* The container runs as **non-root** (uid/gid 1001, `appuser`).
+* **No files are written at runtime** — the container is fully stateless.
+* Credentials arrive via environment variables, never baked into the image.
 * `.env` is git-ignored; never commit it.
-* The OAuth2 scope is `https://storage.azure.com/.default` (OneLake only) and `https://purview.azure.net/.default` (Purview only) — minimal privilege.
-* The `en_core_web_lg` model is embedded in the image; no outbound NLP API calls are made at runtime.
+* Token scope is minimal: `https://storage.azure.com/.default` for OneLake,
+  `https://purview.azure.net/.default` for Purview.
+* The `en_core_web_lg` model is embedded at build time; no outbound NLP calls at runtime.
 
 ---
 
@@ -249,9 +274,11 @@ When the container runs on Azure Container Instances, AKS, or Azure ML with an a
 
 ```
 .
-├── main.py            # Pipeline orchestration
-├── requirements.txt   # Python dependencies
-├── Dockerfile         # Container definition (non-root, self-contained)
-├── .env.example       # Environment variable template
+├── main.py                # Pipeline orchestration
+├── requirements.txt       # Python dependencies
+├── Dockerfile             # Stateless container (non-root, no volumes)
+├── docker-compose.yml     # Local dev: pipeline + Postgres
+├── push_to_dockerhub.sh   # Build & push to Docker Hub
+├── .env.example           # Environment variable template
 └── README.md
 ```
