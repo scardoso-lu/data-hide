@@ -11,10 +11,13 @@ import pytest
 from main import (
     PurviewClient,
     _account_name,
+    _scan_json_for_pii,
     _storage_opts,
+    detect_identifier_columns,
     detect_quasi_identifiers,
     enforce_k_anonymity,
     flag_free_text_columns,
+    hash_identifier_columns,
     run_purview_check,
     sanitize_column_names,
     validate_residual_pii,
@@ -391,3 +394,142 @@ class TestValidateResidualPII:
         })
         count = validate_residual_pii(df, analyzer)
         assert count == 0
+
+    def test_raises_on_pii_inside_json_string(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"email": "alice@example.com"}']})
+        with pytest.raises(RuntimeError, match="Residual PII"):
+            validate_residual_pii(df, analyzer)
+
+    def test_raises_on_pii_inside_native_dict(self, analyzer):
+        df = pd.DataFrame({"data": [{"email": "alice@example.com"}]})
+        with pytest.raises(RuntimeError, match="Residual PII"):
+            validate_residual_pii(df, analyzer)
+
+    def test_hash_passes_validation(self, analyzer):
+        """SHA-256 hex digest must not be detected as PII."""
+        import hashlib
+        h = hashlib.sha256(b"EMP001").hexdigest()[:24]
+        df = pd.DataFrame({"employee_id": [h]})
+        count = validate_residual_pii(df, analyzer)
+        assert count == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identifier column detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDetectIdentifierColumns:
+
+    def test_employee_id_detected(self):
+        df = pd.DataFrame({"employee_id": [1], "name": ["Alice"]})
+        assert "employee_id" in detect_identifier_columns(df)
+
+    def test_microsoft_id_detected(self):
+        df = pd.DataFrame({"microsoft_id": ["abc123"], "score": [10]})
+        assert "microsoft_id" in detect_identifier_columns(df)
+
+    def test_matricule_detected(self):
+        df = pd.DataFrame({"matricule": ["M001"], "score": [10]})
+        assert "matricule" in detect_identifier_columns(df)
+
+    def test_person_id_detected(self):
+        df = pd.DataFrame({"person_id": ["P001"]})
+        assert "person_id" in detect_identifier_columns(df)
+
+    def test_user_id_detected(self):
+        df = pd.DataFrame({"user_id": [42]})
+        assert "user_id" in detect_identifier_columns(df)
+
+    def test_column_with_space_normalised(self):
+        df = pd.DataFrame({"employee id": ["E001"]})
+        assert "employee id" in detect_identifier_columns(df)
+
+    def test_non_identifier_column_not_detected(self):
+        df = pd.DataFrame({"product_name": ["Widget"], "price": [9.99]})
+        assert detect_identifier_columns(df) == []
+
+    def test_explicit_cols_override(self):
+        df = pd.DataFrame({"emp_id": [1], "score": [10]})
+        assert detect_identifier_columns(df, explicit_cols=["emp_id"]) == ["emp_id"]
+
+    def test_explicit_cols_filtered_to_present(self):
+        df = pd.DataFrame({"emp_id": [1]})
+        result = detect_identifier_columns(df, explicit_cols=["emp_id", "missing_col"])
+        assert result == ["emp_id"]
+        assert "missing_col" not in result
+
+    def test_sanitized_identifier_column_detected(self):
+        """Columns renamed to IDENTIFIER_N by sanitize_column_names are also detected."""
+        df = pd.DataFrame({"IDENTIFIER_0": ["x"]})
+        assert "IDENTIFIER_0" in detect_identifier_columns(df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identifier column hashing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHashIdentifierColumns:
+
+    def test_string_value_hashed(self):
+        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        result_df, hashed = hash_identifier_columns(df, ["employee_id"])
+        assert "EMP001" not in result_df["employee_id"].values
+        assert "EMP002" not in result_df["employee_id"].values
+        assert "employee_id" in hashed
+
+    def test_hash_is_deterministic(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        r1, _ = hash_identifier_columns(df.copy(), ["employee_id"])
+        r2, _ = hash_identifier_columns(df.copy(), ["employee_id"])
+        assert r1["employee_id"].iloc[0] == r2["employee_id"].iloc[0]
+
+    def test_same_value_same_hash_across_rows(self):
+        df = pd.DataFrame({"employee_id": ["EMP001", "EMP001"]})
+        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        assert result_df["employee_id"].iloc[0] == result_df["employee_id"].iloc[1]
+
+    def test_different_values_different_hashes(self):
+        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        assert result_df["employee_id"].iloc[0] != result_df["employee_id"].iloc[1]
+
+    def test_null_preserved(self):
+        df = pd.DataFrame({"employee_id": [None, "EMP001"]})
+        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        assert pd.isna(result_df["employee_id"].iloc[0])
+
+    def test_integer_id_hashed(self):
+        df = pd.DataFrame({"employee_id": pd.array([12345, 67890], dtype="int64")})
+        result_df, hashed = hash_identifier_columns(df, ["employee_id"])
+        assert 12345 not in result_df["employee_id"].values
+        assert "employee_id" in hashed
+
+    def test_salt_changes_hash(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        r1, _ = hash_identifier_columns(df.copy(), ["employee_id"], salt="salt_a")
+        r2, _ = hash_identifier_columns(df.copy(), ["employee_id"], salt="salt_b")
+        assert r1["employee_id"].iloc[0] != r2["employee_id"].iloc[0]
+
+    def test_empty_id_cols_returns_unchanged(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        result_df, hashed = hash_identifier_columns(df, [])
+        assert result_df["employee_id"].iloc[0] == "EMP001"
+        assert hashed == []
+
+    def test_hash_has_fixed_length(self):
+        df = pd.DataFrame({"employee_id": ["short", "a_much_longer_employee_id_string"]})
+        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        assert len(result_df["employee_id"].iloc[0]) == 24
+        assert len(result_df["employee_id"].iloc[1]) == 24
+
+    def test_original_dataframe_not_mutated(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        original = df["employee_id"].iloc[0]
+        hash_identifier_columns(df, ["employee_id"])
+        assert df["employee_id"].iloc[0] == original
+
+    def test_missing_column_silently_skipped(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        result_df, hashed = hash_identifier_columns(df, ["employee_id", "nonexistent"])
+        assert "employee_id" in hashed
+        assert "nonexistent" not in hashed

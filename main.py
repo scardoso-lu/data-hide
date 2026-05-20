@@ -10,8 +10,10 @@ Lakehouse, and records structured audit data to a PostgreSQL database.
 The container is fully stateless — no files are written at runtime.
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -35,7 +37,7 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
 PURVIEW_TOKEN_SCOPE = "https://purview.azure.net/.default"
 SPACY_MODEL         = "en_core_web_lg"
-PIPELINE_VERSION    = "2.0.0"
+PIPELINE_VERSION    = "2.1.0"
 
 ENTITIES = [
     "PERSON",
@@ -71,6 +73,30 @@ QI_KEYWORDS = frozenset({
     "postalcode", "postal_code", "city", "country", "region", "state",
     "race", "ethnicity", "nationality", "dob", "birth", "birthday",
     "marital", "occupation",
+})
+
+IDENTIFIER_COL_KEYWORDS = frozenset({
+    # Employee / staff identifiers
+    "employee_id", "emp_id", "employeeid", "empid",
+    "staff_id", "staffid",
+    "worker_id", "workerid",
+    "contractor_id",
+    # Personal identifiers
+    "person_id", "personid",
+    "personal_number", "personnumber", "person_number",
+    "national_id", "nationalid",
+    "badge_id", "badgeid",
+    # Platform / system identifiers
+    "microsoft_id", "microsoftid", "ms_id", "msid",
+    "user_id", "userid",
+    "account_id", "accountid",
+    "member_id", "memberid",
+    # Academic / institutional
+    "matricule", "matricula",
+    "student_id", "studentid",
+    "enrollment_id", "enrollmentid",
+    # Catch columns renamed by sanitize_column_names (IDENTIFIER_0, IDENTIFIER_1, …)
+    "identifier_",
 })
 
 SENSITIVE_COL_PATTERNS = {
@@ -363,15 +389,34 @@ def anonymize_dataframe(
         new_values: list  = []
 
         for val in df[col]:
-            # Only process genuine string values.  Non-string objects in an
-            # object-dtype column (dicts, lists, Decimal, mixed-type ids, …)
-            # pass through unchanged to avoid silent data corruption.
-            if not isinstance(val, str):
+            all_findings: list = []
+
+            if isinstance(val, (dict, list)):
+                # Native Python dict/list (Delta nested struct or mixed column)
+                anon_val, all_findings = _anonymize_json(val, analyzer, registry)
+                new_values.append(anon_val)
+
+            elif isinstance(val, str):
+                if _looks_like_json(val):
+                    try:
+                        parsed = json.loads(val)
+                        if isinstance(parsed, (dict, list)):
+                            anon_obj, all_findings = _anonymize_json(parsed, analyzer, registry)
+                            new_values.append(json.dumps(anon_obj, ensure_ascii=False))
+                        else:
+                            raise ValueError("JSON primitive — treat as plain text")
+                    except (json.JSONDecodeError, ValueError):
+                        anon_val, all_findings = _anonymize_text(val, analyzer, registry)
+                        new_values.append(anon_val)
+                else:
+                    anon_val, all_findings = _anonymize_text(val, analyzer, registry)
+                    new_values.append(anon_val)
+
+            else:
+                # Decimal, bool, int, float, None, pd.NA, tuple, … — pass through
                 new_values.append(val)
-                continue
-            cleaned, findings = _anonymize_text(val, analyzer, registry)
-            new_values.append(cleaned)
-            for f in findings:
+
+            for f in all_findings:
                 col_detections += 1
                 entity_counts[f.entity_type] = entity_counts.get(f.entity_type, 0) + 1
                 col_entity_counts[f.entity_type] = col_entity_counts.get(f.entity_type, 0) + 1
@@ -470,6 +515,69 @@ def enforce_k_anonymity(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Identifier column detection and deterministic hashing
+# ─────────────────────────────────────────────────────────────────────────────
+def detect_identifier_columns(
+    df: pd.DataFrame,
+    explicit_cols: list[str] | None = None,
+) -> list[str]:
+    """Return columns that carry person identifiers (employee IDs, matricules, etc.).
+
+    Explicit_cols (from IDENTIFIER_COLS env var) takes priority when provided.
+    Falls back to keyword matching against IDENTIFIER_COL_KEYWORDS.
+    Column names are normalised (lower-cased, spaces → underscores) before matching.
+    """
+    if explicit_cols:
+        return [c for c in explicit_cols if c in df.columns]
+    return [
+        col for col in df.columns
+        if any(kw in col.lower().replace(" ", "_") for kw in IDENTIFIER_COL_KEYWORDS)
+    ]
+
+
+def _hash_value(val: object, salt_bytes: bytes) -> object:
+    """SHA-256 hash a single identifier value; pass through nulls unchanged."""
+    try:
+        if pd.isna(val):
+            return val
+    except (TypeError, ValueError):
+        pass
+    raw = val if isinstance(val, str) else str(val)
+    return hashlib.sha256(salt_bytes + raw.encode("utf-8")).hexdigest()[:24]
+
+
+def hash_identifier_columns(
+    df: pd.DataFrame,
+    id_cols: list[str],
+    salt: str = "",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Replace identifier column values with truncated SHA-256 hashes.
+
+    Hashing is deterministic for the same salt, so join keys are preserved
+    across tables processed with the same deployment secret.
+    Non-null integers and floats are coerced to str before hashing so that
+    numeric employee IDs are handled transparently.
+
+    Returns (hashed_df, list_of_columns_that_were_hashed).
+    """
+    if not id_cols:
+        return df, []
+
+    salt_bytes = salt.encode("utf-8")
+    df         = df.copy()
+    hashed: list[str] = []
+
+    for col in id_cols:
+        if col not in df.columns:
+            continue
+        df[col] = df[col].map(lambda v, _sb=salt_bytes: _hash_value(v, _sb))
+        hashed.append(col)
+        logger.info("Hashed identifier column '%s'.", col)
+
+    return df, hashed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Column name sanitization
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize_column_names(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -499,6 +607,56 @@ def sanitize_column_names(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# JSON / nested-document anonymization
+# ─────────────────────────────────────────────────────────────────────────────
+def _anonymize_json(
+    obj: object,
+    analyzer: AnalyzerEngine,
+    registry: EntityRegistry,
+) -> tuple[object, list]:
+    """Recursively anonymize string leaves in a JSON-compatible structure.
+
+    Returns (anonymized_obj, flat_list_of_RecognizerResult).
+    dicts and lists are reconstructed; all other types pass through unchanged.
+    """
+    if isinstance(obj, dict):
+        result: dict = {}
+        all_findings: list = []
+        for k, v in obj.items():
+            anon_v, f = _anonymize_json(v, analyzer, registry)
+            result[k] = anon_v
+            all_findings.extend(f)
+        return result, all_findings
+    if isinstance(obj, list):
+        result_list: list = []
+        all_findings = []
+        for item in obj:
+            anon_item, f = _anonymize_json(item, analyzer, registry)
+            result_list.append(anon_item)
+            all_findings.extend(f)
+        return result_list, all_findings
+    if isinstance(obj, str):
+        return _anonymize_text(obj, analyzer, registry)
+    return obj, []
+
+
+def _scan_json_for_pii(obj: object, analyzer: AnalyzerEngine) -> int:
+    """Recursively count PII findings in a JSON-like structure (scan only, no mutation)."""
+    if isinstance(obj, dict):
+        return sum(_scan_json_for_pii(v, analyzer) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_scan_json_for_pii(item, analyzer) for item in obj)
+    if isinstance(obj, str):
+        return len(analyzer.analyze(text=obj, entities=ENTITIES, language="en"))
+    return 0
+
+
+def _looks_like_json(s: str) -> bool:
+    ch = s.lstrip()
+    return bool(ch) and ch[0] in ("{", "[")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Residual PII validation
 # ─────────────────────────────────────────────────────────────────────────────
 def validate_residual_pii(df: pd.DataFrame, analyzer: AnalyzerEngine) -> int:
@@ -513,10 +671,18 @@ def validate_residual_pii(df: pd.DataFrame, analyzer: AnalyzerEngine) -> int:
         if not _is_text_column(df[col].dtype):
             continue
         for val in df[col]:
-            if not isinstance(val, str):
-                continue
-            findings = analyzer.analyze(text=val, entities=ENTITIES, language="en")
-            total += len(findings)
+            if isinstance(val, (dict, list)):
+                total += _scan_json_for_pii(val, analyzer)
+            elif isinstance(val, str):
+                if _looks_like_json(val):
+                    try:
+                        parsed = json.loads(val)
+                        if isinstance(parsed, (dict, list)):
+                            total += _scan_json_for_pii(parsed, analyzer)
+                            continue
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                total += len(analyzer.analyze(text=val, entities=ENTITIES, language="en"))
 
     if total:
         raise RuntimeError(
@@ -551,6 +717,7 @@ CREATE TABLE IF NOT EXISTS pii_pipeline_runs (
     suppressed_rows  INTEGER     NOT NULL DEFAULT 0,
     residual_pii     INTEGER     NOT NULL DEFAULT 0,
     column_renames   JSONB,
+    hashed_columns   JSONB,
     purview_ok       BOOLEAN     NOT NULL DEFAULT FALSE,
     purview_flagged  JSONB,
     purview_diffs    JSONB,
@@ -648,6 +815,7 @@ class AuditDB:
                 suppressed_rows = %s,
                 residual_pii    = %s,
                 column_renames  = %s,
+                hashed_columns  = %s,
                 purview_ok      = %s,
                 purview_flagged = %s,
                 purview_diffs   = %s,
@@ -671,6 +839,7 @@ class AuditDB:
                 audit.get("suppressed_rows", 0),
                 audit.get("residual_pii_count", 0),
                 json.dumps(audit.get("column_renames", {})),
+                json.dumps(audit.get("hashed_columns", [])),
                 audit.get("purview_available", False),
                 json.dumps(audit.get("purview_flagged_columns", [])),
                 json.dumps(audit.get("purview_discrepancies", [])),
@@ -724,6 +893,11 @@ def main() -> None:
     k_min        = int(os.environ.get("K_ANONYMITY_MIN", "5"))
     qi_env       = os.environ.get("QUASI_IDENTIFIER_COLS", "")
     qi_cols_cfg  = [c.strip() for c in qi_env.split(",") if c.strip()]
+    hash_salt    = os.environ.get("HASH_SALT", "")
+    id_cols_env  = os.environ.get("IDENTIFIER_COLS", "")
+    id_cols_cfg  = [c.strip() for c in id_cols_env.split(",") if c.strip()]
+    if not hash_salt:
+        logger.warning("HASH_SALT is not set — identifier hashes are unsalted and reversible.")
 
     pipeline_start = datetime.now(timezone.utc)
     logger.info("Pipeline started  run_id=%s  ts=%s", run_id, pipeline_start.isoformat())
@@ -743,6 +917,7 @@ def main() -> None:
         "suppressed_rows":         0,
         "residual_pii_count":      0,
         "column_renames":          {},
+        "hashed_columns":          [],
         "purview_available":       False,
         "purview_flagged_columns": [],
         "purview_discrepancies":   [],
@@ -766,6 +941,16 @@ def main() -> None:
         # ── Column name sanitization ──────────────────────────────────────────
         df_raw, col_renames = sanitize_column_names(df_raw)
         audit["column_renames"] = col_renames
+
+        # ── Identifier hashing ────────────────────────────────────────────────
+        # Detect by keyword + any columns renamed because they revealed
+        # sensitive categories (ssn → IDENTIFIER_0, etc.).
+        id_cols = detect_identifier_columns(df_raw, id_cols_cfg)
+        for renamed in col_renames.values():
+            if renamed not in id_cols and renamed in df_raw.columns:
+                id_cols.append(renamed)
+        df_raw, hashed = hash_identifier_columns(df_raw, id_cols, hash_salt)
+        audit["hashed_columns"] = hashed
 
         # ── Free-text column detection ────────────────────────────────────────
         free_text_cols = flag_free_text_columns(df_raw)

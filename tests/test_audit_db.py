@@ -35,6 +35,7 @@ SUCCESS_AUDIT = {
     "suppressed_rows":         3,
     "residual_pii_count":      0,
     "column_renames":          {"ssn": "IDENTIFIER_0"},
+    "hashed_columns":          ["IDENTIFIER_0", "employee_id"],
     "purview_available":       True,
     "purview_flagged_columns": ["email"],
     "purview_discrepancies":   [],
@@ -101,7 +102,8 @@ class TestSchemaInit:
         AuditDB("postgresql://test")
         sqls = " ".join(c.args[0] for c in cur.execute.call_args_list)
         for col in ("unique_entities", "free_text_cols", "k_anonymity_k",
-                    "quasi_columns", "suppressed_rows", "residual_pii", "column_renames"):
+                    "quasi_columns", "suppressed_rows", "residual_pii",
+                    "column_renames", "hashed_columns"):
             assert col in sqls, f"Expected column '{col}' in DDL"
 
 
@@ -347,6 +349,24 @@ class TestCloseRun:
         db.close_run(SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert 5 in params  # k_anonymity_k
+
+    def test_hashed_columns_json_encoded(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        matching = [
+            p for p in params
+            if isinstance(p, str)
+            and "IDENTIFIER_0" in p
+            and "employee_id" in p
+        ]
+        assert matching, "No JSON-encoded hashed_columns found in params"
+        parsed = json.loads(matching[0])
+        assert "IDENTIFIER_0" in parsed
+        assert "employee_id" in parsed
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -126,6 +126,19 @@ def mock_quasi(mocker):
     return mocker.patch("main.detect_quasi_identifiers", return_value=[])
 
 
+@pytest.fixture()
+def mock_detect_ids(mocker):
+    return mocker.patch("main.detect_identifier_columns", return_value=[])
+
+
+@pytest.fixture()
+def mock_hash(mocker):
+    """Mock hash_identifier_columns — identity transform, no columns hashed."""
+    m = mocker.patch("main.hash_identifier_columns")
+    m.side_effect = lambda df, cols, salt="": (df.copy(), [])
+    return m
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Happy path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,14 +147,14 @@ class TestPipelineSuccess:
 
     def test_runs_without_exception(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()  # must not raise
 
     def test_write_is_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -150,7 +163,7 @@ class TestPipelineSuccess:
 
     def test_write_receives_anonymized_dataframe(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -162,7 +175,7 @@ class TestPipelineSuccess:
 
     def test_numeric_column_unchanged_after_write(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -173,7 +186,7 @@ class TestPipelineSuccess:
 
     def test_write_target_uri_is_target(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -184,7 +197,7 @@ class TestPipelineSuccess:
 
     def test_audit_open_run_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -192,7 +205,7 @@ class TestPipelineSuccess:
 
     def test_audit_close_run_called_with_success(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -204,7 +217,7 @@ class TestPipelineSuccess:
 
     def test_audit_records_entity_counts(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -215,7 +228,7 @@ class TestPipelineSuccess:
 
     def test_no_alert_sent_on_success(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         mock_alert = mocker.patch("main.send_alert")
         from main import main
@@ -224,7 +237,7 @@ class TestPipelineSuccess:
 
     def test_column_events_recorded_in_db(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -232,7 +245,7 @@ class TestPipelineSuccess:
 
     def test_residual_validation_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -240,7 +253,7 @@ class TestPipelineSuccess:
 
     def test_sanitize_column_names_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -248,7 +261,7 @@ class TestPipelineSuccess:
 
     def test_flag_free_text_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()
@@ -263,7 +276,7 @@ class TestPipelineFailure:
 
     def test_exception_propagates(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -274,7 +287,7 @@ class TestPipelineFailure:
 
     def test_close_run_still_called_on_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -287,7 +300,7 @@ class TestPipelineFailure:
 
     def test_close_run_status_is_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -301,7 +314,7 @@ class TestPipelineFailure:
 
     def test_error_message_captured_in_audit(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -315,7 +328,7 @@ class TestPipelineFailure:
 
     def test_alert_sent_when_webhook_configured(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker, monkeypatch,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hook.example.com/abc")
         mock_alert = mocker.patch("main.send_alert")
@@ -332,7 +345,7 @@ class TestPipelineFailure:
 
     def test_audit_close_run_called_even_when_db_write_fails(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         """If the delta write fails mid-pipeline, close_run must still fire."""
         db = mocker.MagicMock()
@@ -348,7 +361,7 @@ class TestPipelineFailure:
 
     def test_residual_pii_aborts_pipeline(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_sanitize, mock_free_text, mock_quasi, mocker,
+        mock_engines, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
     ):
         """validate_residual_pii raising RuntimeError must abort before write."""
         mocker.patch(
@@ -372,7 +385,7 @@ class TestOptionalFeatures:
 
     def test_pipeline_runs_without_database_url(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         """No DATABASE_URL → connect_audit_db returns None → pipeline continues."""
         mocker.patch("main.connect_audit_db", return_value=None)
@@ -381,14 +394,14 @@ class TestOptionalFeatures:
 
     def test_pipeline_runs_without_webhook(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         from main import main
         main()  # no ALERT_WEBHOOK_URL set — must not raise
 
     def test_audit_db_failure_does_not_abort_pipeline(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         db = mocker.MagicMock()
         db.open_run.side_effect = Exception("DB down")
@@ -399,7 +412,7 @@ class TestOptionalFeatures:
 
     def test_purview_check_skipped_when_not_configured(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi,
+        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
         mock_purview = mocker.patch("main.run_purview_check")
         mock_purview.return_value = {

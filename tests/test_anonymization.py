@@ -1,15 +1,17 @@
 """
 Tests for the PII anonymization core.
 
-Four sections
+Five sections
 -------------
 1. PII that MUST be detected and masked (most popular real-world patterns)
 2. Non-PII text that must pass through UNCHANGED (no false positives)
 3. Non-string Python objects that must pass through UNCHANGED (P1 regression)
 4. DataFrame-level behaviour and stats
 5. EntityRegistry — consistent pseudonym tokenisation
+6. JSON and nested-document anonymization
 """
 
+import json
 import math
 from decimal import Decimal
 
@@ -19,6 +21,7 @@ import pytest
 
 from main import (
     EntityRegistry,
+    _anonymize_json,
     _anonymize_text,
     anonymize_dataframe,
 )
@@ -101,11 +104,10 @@ NON_STRING_VALUES = [
     # Decimal looks like a credit-card number when str()-coerced; must be untouched
     ("decimal_cc",    Decimal("4111111111111111")),
     ("decimal_iban",  Decimal("29060161331926819")),
-    # Containers with PII-like content — must not be processed
-    ("dict_with_pii", {"email": "user@example.com"}),
-    ("list_of_emails",["alice@example.com", "bob@example.com"]),
+    # Tuples are not dict/list — pass through unchanged
     ("tuple_mixed",   (1, "alice@example.com")),
 ]
+# Note: dict and list values ARE now anonymized recursively (see TestJSONAndDictAnonymization).
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,15 +180,16 @@ class TestNonStringPassthrough:
             )
 
     def test_mixed_column_strings_masked_non_strings_intact(self, analyzer):
-        """Within one mixed-type column only string values enter Presidio."""
+        """Strings with PII are masked; non-string scalars pass through unchanged;
+        dict without PII is returned structurally identical."""
         df = pd.DataFrame({
             "data": [
-                "contact jane@example.com",  # str with PII  → must be masked
-                42,                           # int           → unchanged
-                None,                         # None          → unchanged
-                "No PII here at all.",        # str no PII    → unchanged
-                {"key": "value"},             # dict          → unchanged
-                Decimal("4111111111111111"),  # Decimal CC    → unchanged
+                "contact jane@example.com",  # str with PII       → masked
+                42,                           # int                → unchanged
+                None,                         # None               → unchanged
+                "No PII here at all.",        # str no PII         → unchanged
+                {"key": "value"},             # dict without PII   → unchanged content
+                Decimal("4111111111111111"),  # Decimal CC         → unchanged
             ]
         })
         result_df, stats = anonymize_dataframe(df, analyzer)
@@ -195,7 +198,7 @@ class TestNonStringPassthrough:
         assert result_df["data"].iloc[1] == 42                       # int intact
         assert result_df["data"].iloc[2] is None                     # None intact
         assert result_df["data"].iloc[3] == "No PII here at all."    # no-PII intact
-        assert result_df["data"].iloc[4] == {"key": "value"}         # dict intact
+        assert result_df["data"].iloc[4] == {"key": "value"}         # dict intact (no PII)
         assert result_df["data"].iloc[5] == Decimal("4111111111111111")  # Decimal intact
 
 
@@ -366,3 +369,93 @@ class TestEntityRegistry:
         df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
         result_df, _ = anonymize_dataframe(df, analyzer, registry)
         assert result_df["email"].iloc[0] != result_df["email"].iloc[1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  JSON and nested-document anonymization
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestJSONAndDictAnonymization:
+    """anonymize_dataframe must recurse into JSON strings and native dicts/lists."""
+
+    def test_json_string_email_anonymized(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"name": "Alice", "email": "alice@example.com"}']})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["payload"].iloc[0])
+        assert "alice@example.com" not in parsed["email"]
+        assert "@" not in parsed["email"]
+
+    def test_json_output_is_valid_json(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"score": 100, "note": "Contact bob@company.com"}']})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["payload"].iloc[0])
+        assert isinstance(parsed, dict)
+        assert parsed["score"] == 100
+
+    def test_nested_json_pii_anonymized(self, analyzer):
+        payload = '{"contact": {"name": "John Smith", "email": "john@example.com"}}'
+        df = pd.DataFrame({"payload": [payload]})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["payload"].iloc[0])
+        assert "john@example.com" not in parsed["contact"]["email"]
+
+    def test_json_array_pii_anonymized(self, analyzer):
+        df = pd.DataFrame({"contacts": ['["alice@example.com", "bob@example.com"]']})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["contacts"].iloc[0])
+        for item in parsed:
+            assert "example.com" not in item
+
+    def test_native_dict_pii_anonymized(self, analyzer):
+        df = pd.DataFrame({"data": [{"email": "alice@example.com", "score": 10}]})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        result = result_df["data"].iloc[0]
+        assert isinstance(result, dict)
+        assert "alice@example.com" not in result["email"]
+        assert result["score"] == 10  # numeric value preserved
+
+    def test_native_list_pii_anonymized(self, analyzer):
+        df = pd.DataFrame({"emails": [["alice@example.com", "bob@example.com"]]})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        result = result_df["emails"].iloc[0]
+        assert isinstance(result, list)
+        for item in result:
+            assert "example.com" not in item
+
+    def test_json_stats_counted(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"email": "alice@example.com"}']})
+        _, stats = anonymize_dataframe(df, analyzer)
+        assert stats["total_entities_detected"] >= 1
+        assert "payload" in stats["columns_with_detections"]
+
+    def test_non_pii_json_structure_preserved(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"status": "completed", "score": 42}']})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["payload"].iloc[0])
+        assert parsed["status"] == "completed"
+        assert parsed["score"] == 42
+
+    def test_numeric_json_values_preserved(self, analyzer):
+        df = pd.DataFrame({"payload": ['{"id": 123, "ratio": 9.5, "active": true}']})
+        result_df, _ = anonymize_dataframe(df, analyzer)
+        parsed = json.loads(result_df["payload"].iloc[0])
+        assert parsed["id"] == 123
+        assert abs(parsed["ratio"] - 9.5) < 1e-9
+
+    def test_anonymize_json_function_directly(self, analyzer):
+        """Unit test for _anonymize_json helper."""
+        registry = EntityRegistry()
+        obj = {"email": "alice@example.com", "score": 10}
+        result, findings = _anonymize_json(obj, analyzer, registry)
+        assert isinstance(result, dict)
+        assert "alice@example.com" not in result["email"]
+        assert result["score"] == 10
+        assert findings  # at least one finding
+
+    def test_anonymize_json_nested_list(self, analyzer):
+        registry = EntityRegistry()
+        obj = [{"email": "alice@example.com"}, {"email": "bob@example.com"}]
+        result, findings = _anonymize_json(obj, analyzer, registry)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert len(findings) == 2
