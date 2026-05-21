@@ -597,3 +597,86 @@ class TestDynamicDiscovery:
         from main import main
         with pytest.raises(RuntimeError, match="No Delta table directories found"):
             main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# discover_table_mappings — _delta_log filtering (unit-level, mocks ADLS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDiscoverTableMappingsFiltering:
+    """Verify that only directories containing _delta_log are returned."""
+
+    def _make_path_item(self, mocker, name: str, is_directory: bool):
+        item = mocker.MagicMock()
+        item.name = name
+        item.is_directory = is_directory
+        return item
+
+    def _make_fs_client(self, mocker, path_items, delta_log_dirs):
+        """Return a mock FileSystemClient whose get_paths yields path_items
+        and whose get_directory_client().exists() returns True only for paths
+        listed in delta_log_dirs."""
+        fs_client = mocker.MagicMock()
+        fs_client.get_paths.return_value = path_items
+
+        def _dir_client(path):
+            dc = mocker.MagicMock()
+            dc.exists.return_value = path in delta_log_dirs
+            return dc
+
+        fs_client.get_directory_client.side_effect = _dir_client
+        return fs_client
+
+    def test_delta_tables_included(self, mocker):
+        from app.repository import discover_table_mappings, DataLakeServiceClient as _orig
+        items = [self._make_path_item(mocker, "Tables/customers", True)]
+        fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+        )
+        assert len(result) == 1
+        assert result[0].table_name == "customers"
+
+    def test_non_delta_directories_excluded(self, mocker):
+        from app.repository import discover_table_mappings
+        items = [
+            self._make_path_item(mocker, "Tables/customers", True),
+            self._make_path_item(mocker, "Tables/_schemas", True),   # schema folder
+            self._make_path_item(mocker, "Tables/tmp_import", True), # helper folder
+        ]
+        fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+        )
+        assert len(result) == 1
+        assert result[0].table_name == "customers"
+
+    def test_files_excluded(self, mocker):
+        from app.repository import discover_table_mappings
+        items = [
+            self._make_path_item(mocker, "Tables/customers", True),
+            self._make_path_item(mocker, "Tables/readme.md", False),  # file, not dir
+        ]
+        fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+        )
+        assert len(result) == 1

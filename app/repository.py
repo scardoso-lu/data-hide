@@ -161,6 +161,10 @@ def discover_table_mappings(source_base_uri: str, target_base_uri: str) -> list[
     for item in fs_client.get_paths(path=base_path, recursive=False):
         if not item.is_directory:
             continue
+        delta_log_path = f"{item.name.rstrip('/')}/_delta_log"
+        if not fs_client.get_directory_client(delta_log_path).exists():
+            logger.debug("Skipping %s — no _delta_log found", item.name)
+            continue
         table_name = item.name.rstrip("/").rsplit("/", 1)[-1]
         source_uri = f"abfss://{filesystem}@{host}/{item.name.rstrip('/')}"
         target_uri = f"{target_base}/{table_name}"
