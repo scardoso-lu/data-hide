@@ -217,7 +217,7 @@ class TestPipelineSuccess:
         main()
 
         mock_db.close_run.assert_called_once()
-        audit = mock_db.close_run.call_args.args[0]
+        audit = mock_db.close_run.call_args.args[1]
         assert audit["status"] == "success"
         assert audit["error_message"] is None
 
@@ -228,7 +228,7 @@ class TestPipelineSuccess:
         from main import main
         main()
 
-        audit = mock_db.close_run.call_args.args[0]
+        audit = mock_db.close_run.call_args.args[1]
         assert audit["total_entities_detected"] == 4
         assert audit["entity_counts"]["EMAIL_ADDRESS"] == 2
 
@@ -246,7 +246,8 @@ class TestPipelineSuccess:
     ):
         from main import main
         main()
-        mock_db.record_columns.assert_called_once_with(MOCK_STATS["column_stats"])
+        mock_db.record_columns.assert_called_once()
+        assert mock_db.record_columns.call_args.args[1] == MOCK_STATS["column_stats"]
 
     def test_residual_validation_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
@@ -337,7 +338,7 @@ class TestPipelineFailure:
         with pytest.raises(RuntimeError):
             main()
 
-        audit = mock_db.close_run.call_args.args[0]
+        audit = mock_db.close_run.call_args.args[1]
         assert audit["status"] == "failure"
 
     def test_error_message_captured_in_audit(
@@ -351,7 +352,7 @@ class TestPipelineFailure:
         with pytest.raises(RuntimeError):
             main()
 
-        audit = mock_db.close_run.call_args.args[0]
+        audit = mock_db.close_run.call_args.args[1]
         assert "disk full" in audit["error_message"]
 
     def test_alert_recorded_on_failure(
@@ -562,7 +563,7 @@ class TestDynamicDiscovery:
 
         from main import main
         main()
-        mock_discover.assert_called_once_with(BASE_SOURCE_URI, BASE_TARGET_URI)
+        mock_discover.assert_called_once_with(BASE_SOURCE_URI, BASE_TARGET_URI, sql_endpoint=None, sql_database=None)
 
     def test_write_called_once_per_table(
         self, base_env, mock_auth, mock_engines, mock_validate,
@@ -595,7 +596,7 @@ class TestDynamicDiscovery:
         mocker.patch("main.connect_audit_db", return_value=None)
 
         from main import main
-        with pytest.raises(RuntimeError, match="No Delta table directories found"):
+        with pytest.raises(RuntimeError, match="No tables found"):
             main()
 
 
@@ -680,3 +681,130 @@ class TestDiscoverTableMappingsFiltering:
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
         )
         assert len(result) == 1
+
+    def _adls_setup(self, mocker, delta_names):
+        """Shared ADLS mock: given list of Delta table names, wire up the ADLS mocks."""
+        items = [self._make_path_item(mocker, f"Tables/{n}", True) for n in delta_names]
+        delta_log_dirs = {f"Tables/{n}/_delta_log" for n in delta_names}
+        fs_client = self._make_fs_client(mocker, items, delta_log_dirs)
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+    def test_sql_shortcuts_included(self, mocker):
+        """SQL tables not present in ADLS get read_mode='sql' mappings."""
+        from app.repository import discover_table_mappings
+        self._adls_setup(mocker, ["customers"])
+        mocker.patch(
+            "app.repository._discover_sql_table_names",
+            return_value=["customers", "customer_view"],
+        )
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
+            sql_database="SourceLakehouse",
+        )
+
+        assert len(result) == 2
+        delta_m = next(m for m in result if m.table_name == "customers")
+        sql_m = next(m for m in result if m.table_name == "customer_view")
+        assert delta_m.read_mode == "delta"
+        assert sql_m.read_mode == "sql"
+        assert sql_m.source_uri.startswith("sql://")
+
+    def test_delta_table_not_duplicated_by_sql(self, mocker):
+        """A table present in both ADLS and SQL appears exactly once as delta."""
+        from app.repository import discover_table_mappings
+        self._adls_setup(mocker, ["customers", "orders"])
+        mocker.patch(
+            "app.repository._discover_sql_table_names",
+            return_value=["customers", "orders"],
+        )
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
+            sql_database="SourceLakehouse",
+        )
+
+        assert len(result) == 2
+        assert all(m.read_mode == "delta" for m in result)
+
+    def test_sql_discovery_failure_is_non_fatal(self, mocker):
+        """A SQL endpoint error is logged and does not abort ADLS discovery."""
+        from app.repository import discover_table_mappings
+        self._adls_setup(mocker, ["customers"])
+        mocker.patch(
+            "app.repository._discover_sql_table_names",
+            side_effect=Exception("connection refused"),
+        )
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
+            sql_database="SourceLakehouse",
+        )
+
+        assert len(result) == 1
+        assert result[0].table_name == "customers"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL shortcut read routing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSQLShortcutRouting:
+    """Verify that run_table reads SQL mappings via read_sql_table, not DeltaTable."""
+
+    @pytest.fixture()
+    def sql_env(self, monkeypatch, mocker):
+        """Env fixture with SQL_ENDPOINT_URL and SQL_DATABASE set."""
+        for k, v in REQUIRED_ENV.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("SQL_ENDPOINT_URL", "ws.datawarehouse.fabric.microsoft.com")
+        monkeypatch.setenv("SQL_DATABASE", "SourceLakehouse")
+        for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
+            monkeypatch.delenv(opt, raising=False)
+        from main import TableMapping
+        mocker.patch(
+            "main.discover_table_mappings",
+            return_value=[TableMapping(
+                source_uri="sql://ws.datawarehouse.fabric.microsoft.com/SourceLakehouse/shortcuts",
+                target_uri=TARGET_URI,
+                table_name="shortcuts",
+                read_mode="sql",
+            )],
+        )
+
+    def test_read_sql_table_called_for_sql_mapping(
+        self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        mock_sql_read = mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
+        mocker.patch("main.write_delta")
+        mocker.patch("main.connect_audit_db", return_value=None)
+
+        from main import main
+        main()
+
+        mock_sql_read.assert_called_once()
+        assert mock_sql_read.call_args.args[0] == "shortcuts"
+
+    def test_delta_table_not_called_for_sql_mapping(
+        self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
+        mocker.patch("main.write_delta")
+        mocker.patch("main.connect_audit_db", return_value=None)
+        mock_delta_read = mocker.patch("main.DeltaTable")
+
+        from main import main
+        main()
+
+        mock_delta_read.assert_not_called()

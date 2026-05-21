@@ -29,6 +29,7 @@ from .repository import (
     connect_audit_db,
     discover_table_mappings,
     read_delta,
+    read_sql_table,
     run_purview_check,
     write_delta,
 )
@@ -46,6 +47,8 @@ class PipelineConfig:
     identifier_cols: tuple[str, ...] = ()
     source_base_uri: str | None = None
     target_base_uri: str | None = None
+    sql_endpoint: str | None = None
+    sql_database: str | None = None
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -58,6 +61,8 @@ class PipelineConfig:
             identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
+            sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
+            sql_database=os.environ.get("SQL_DATABASE"),
         )
 
 
@@ -74,11 +79,17 @@ def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
         raise RuntimeError(
             "SOURCE_BASE_ABFSS_URI and TARGET_BASE_ABFSS_URI must both be set."
         )
-    mappings = discover_table_mappings(config.source_base_uri, config.target_base_uri)
+    mappings = discover_table_mappings(
+        config.source_base_uri,
+        config.target_base_uri,
+        sql_endpoint=config.sql_endpoint,
+        sql_database=config.sql_database,
+    )
     if not mappings:
         raise RuntimeError(
-            f"No Delta table directories found under {config.source_base_uri!r}. "
-            "Ensure the path exists and contains at least one table subdirectory."
+            f"No tables found under {config.source_base_uri!r}. "
+            "Ensure the path exists and contains at least one table subdirectory, "
+            "or configure SQL_ENDPOINT_URL and SQL_DATABASE for shortcut discovery."
         )
     return mappings
 
@@ -138,7 +149,10 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             logger.warning("Audit open_run failed (non-fatal): %s", exc)
 
     try:
-        df_raw = read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
+        if mapping.read_mode == "sql":
+            df_raw = read_sql_table(mapping.table_name, config.sql_endpoint, config.sql_database)
+        else:
+            df_raw = read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
         audit["total_rows_processed"] = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
 

@@ -37,6 +37,7 @@ from .repository import (
     connect_audit_db,
     discover_table_mappings,
     read_delta,
+    read_sql_table,
     write_delta,
     write_deltalake,
 )
@@ -61,6 +62,7 @@ def main() -> None:
     _service.connect_audit_db = connect_audit_db
     _service.discover_table_mappings = discover_table_mappings
     _service.read_delta = read_delta
+    _service.read_sql_table = read_sql_table
     _service.write_delta = write_delta
     _service.run_purview_check = run_purview_check
     _service.build_engines = build_engines

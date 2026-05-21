@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import logging
 import re
+import struct
 from datetime import datetime
 from typing import Generator, Optional
 
@@ -32,6 +33,7 @@ except ModuleNotFoundError:
 
 ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
 PURVIEW_TOKEN_SCOPE = "https://purview.azure.net/.default"
+SQL_TOKEN_SCOPE = "https://database.windows.net/.default"
 PIPELINE_VERSION = "2.2.0"
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ DefaultAzureCredential = None
 DeltaTable = None
 write_deltalake = None
 DataLakeServiceClient = None
+_pyodbc = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,7 @@ class TableMapping:
     source_uri: str
     target_uri: str
     table_name: str | None = None
+    read_mode: str = "delta"  # "delta" | "sql"
 
 
 def _credential_instance() -> object:
@@ -136,11 +140,56 @@ def write_delta(df: pd.DataFrame, uri: str, storage_options: dict) -> None:
     file_client.upload_data(buffer.getvalue(), overwrite=True)
 
 
-def discover_table_mappings(source_base_uri: str, target_base_uri: str) -> list[TableMapping]:
-    """Return one TableMapping per Delta table directory found directly under source_base_uri.
+def _sql_connection(sql_endpoint: str, database: str):
+    global _pyodbc
+    if _pyodbc is None:
+        import pyodbc as _mod
+        _pyodbc = _mod
 
-    Each target URI is built as target_base_uri/<table_name>, giving a strict
-    1-to-1 source→target pairing without any manual configuration.
+    token = acquire_token(SQL_TOKEN_SCOPE)
+    token_bytes = token.encode("utf-8")
+    exptoken = b"".join(bytes([b, 0]) for b in token_bytes)
+    token_struct = struct.pack("=i", len(exptoken)) + exptoken
+
+    conn_str = (
+        f"Driver={{ODBC Driver 18 for SQL Server}};"
+        f"Server={sql_endpoint},1433;"
+        f"Database={database};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=no;"
+    )
+    return _pyodbc.connect(conn_str, attrs_before={1256: token_struct})
+
+
+def _discover_sql_table_names(sql_endpoint: str, database: str) -> list[str]:
+    logger.info("Querying INFORMATION_SCHEMA for shortcut tables at '%s'", sql_endpoint)
+    conn = _sql_connection(sql_endpoint, database)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE'"
+        )
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def read_sql_table(table_name: str, sql_endpoint: str, database: str) -> pd.DataFrame:
+    logger.info("Reading SQL table '%s' from endpoint '%s'", table_name, sql_endpoint)
+    conn = _sql_connection(sql_endpoint, database)
+    try:
+        return pd.read_sql_query(f"SELECT * FROM [dbo].[{table_name}]", conn)
+    finally:
+        conn.close()
+
+
+def discover_table_mappings(source_base_uri: str, target_base_uri: str, *, sql_endpoint: str | None = None, sql_database: str | None = None) -> list[TableMapping]:
+    """Return TableMappings for every Delta table under source_base_uri plus any
+    SQL-only shortcuts discovered via the Fabric SQL Analytics Endpoint.
+
+    Delta tables discovered via ADLS always take precedence; a table that appears
+    in both ADLS and SQL is included exactly once as read_mode="delta".
     """
     global DataLakeServiceClient
     if DataLakeServiceClient is None:
@@ -158,6 +207,7 @@ def discover_table_mappings(source_base_uri: str, target_base_uri: str) -> list[
     fs_client = service_client.get_file_system_client(file_system=filesystem)
 
     mappings: list[TableMapping] = []
+    delta_table_names: set[str] = set()
     for item in fs_client.get_paths(path=base_path, recursive=False):
         if not item.is_directory:
             continue
@@ -169,8 +219,30 @@ def discover_table_mappings(source_base_uri: str, target_base_uri: str) -> list[
         source_uri = f"abfss://{filesystem}@{host}/{item.name.rstrip('/')}"
         target_uri = f"{target_base}/{table_name}"
         mappings.append(TableMapping(source_uri=source_uri, target_uri=target_uri, table_name=table_name))
+        delta_table_names.add(table_name)
 
-    logger.info("Discovered %d table(s) under %s", len(mappings), source_base_uri)
+    logger.info("Discovered %d Delta table(s) under %s", len(mappings), source_base_uri)
+
+    if sql_endpoint and sql_database:
+        try:
+            sql_names = _discover_sql_table_names(sql_endpoint, sql_database)
+            shortcuts = [n for n in sql_names if n not in delta_table_names]
+            for name in shortcuts:
+                source_uri = f"sql://{sql_endpoint}/{sql_database}/{name}"
+                target_uri = f"{target_base}/{name}"
+                mappings.append(TableMapping(
+                    source_uri=source_uri,
+                    target_uri=target_uri,
+                    table_name=name,
+                    read_mode="sql",
+                ))
+            logger.info(
+                "Discovered %d SQL shortcut(s) via '%s' (%d already covered by Delta)",
+                len(shortcuts), sql_endpoint, len(sql_names) - len(shortcuts),
+            )
+        except Exception as exc:
+            logger.warning("SQL shortcut discovery failed (non-fatal): %s", exc)
+
     return mappings
 
 

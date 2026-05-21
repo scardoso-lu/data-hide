@@ -11,6 +11,7 @@ No PySpark. No files written inside the container at runtime.
 ```mermaid
 flowchart TD
     A["OneLake — Delta tables\n(SOURCE_BASE_ABFSS_URI)"]
+    A2["SQL Analytics Endpoint\n(SQL_ENDPOINT_URL · optional)"]
     B["Pandas DataFrame\nper discovered table"]
     C["Dynamic Column Classification\ndetect_identifier_columns\ndetect_quasi_identifiers\nflag_free_text_columns"]
     D["Hash & k-Anonymity\nhash_identifier_columns\nenforce_k_anonymity"]
@@ -21,7 +22,8 @@ flowchart TD
     I["Pipeline aborts\ntarget not written"]
     J["PostgreSQL Audit DB\nAuditDB · open_run / close_run"]
 
-    A -->|"discover_table_mappings"| B
+    A -->|"discover_table_mappings\nread_mode=delta"| B
+    A2 -.->|"shortcuts not in ADLS\nread_mode=sql"| B
     B --> C
     C --> D
     D --> E
@@ -88,6 +90,21 @@ All detected spans are replaced with stable pseudonym tokens (`ENTITY_TYPE_N`) t
 
 ---
 
+## Table discovery: Delta + SQL shortcuts
+
+`discover_table_mappings` uses two complementary strategies so every table — whether a native Delta table or a Fabric **shortcut** — is included.
+
+| Strategy | Trigger | `read_mode` | How it reads |
+|---|---|---|---|
+| ADLS Delta scan | Always | `delta` | Scans `SOURCE_BASE_ABFSS_URI` via `DataLakeServiceClient`; only directories with a `_delta_log` subdirectory are included (`delta-rs`) |
+| SQL Analytics Endpoint | `SQL_ENDPOINT_URL` + `SQL_DATABASE` set | `sql` | Queries `INFORMATION_SCHEMA.TABLES` on the Fabric SQL endpoint; tables already found by the ADLS scan are skipped to avoid duplicates |
+
+Shortcuts in Fabric OneLake are exposed via the SQL Analytics Endpoint but have no `_delta_log` directory, so ADLS discovery misses them. Setting `SQL_ENDPOINT_URL` and `SQL_DATABASE` fills that gap automatically.
+
+Authentication reuses `DefaultAzureCredential` with the `https://database.windows.net/.default` scope and passes the bearer token to **ODBC Driver 18 for SQL Server** via `SQL_COPT_SS_ACCESS_TOKEN` — no username/password required.
+
+---
+
 ## Installation with Docker
 
 ### Prerequisites
@@ -125,6 +142,8 @@ Edit `.env` with your values:
 | `PURVIEW_ACCOUNT_NAME` | No | Purview account name for sensitivity-label cross-check |
 | `K_ANONYMITY_MIN` | No (default `5`) | Minimum group size for quasi-identifier combinations |
 | `HASH_SALT` | No | Salt mixed into SHA-256 identifier hashes |
+| `SQL_ENDPOINT_URL` | No | Fabric SQL Analytics Endpoint hostname — enables shortcut discovery |
+| `SQL_DATABASE` | No | Database name on the SQL endpoint (typically the Lakehouse name) |
 
 OneLake URI format:
 ```

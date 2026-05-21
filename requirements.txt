@@ -21,5 +21,8 @@ langdetect>=1.0.9
 # PostgreSQL audit persistence (binary wheel — no libpq-dev needed)
 psycopg2-binary>=2.9.9
 
+# SQL Analytics Endpoint reads (Fabric shortcuts via T-SQL)
+pyodbc>=5.0.0
+
 # HTTP client — Purview catalog API + webhook alerts
 requests>=2.31.0
