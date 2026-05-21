@@ -335,6 +335,8 @@ CREATE TABLE IF NOT EXISTS pii_pipeline_runs (
     purview_ok BOOLEAN NOT NULL DEFAULT FALSE,
     purview_flagged JSONB,
     purview_diffs JSONB,
+    output_type TEXT NOT NULL DEFAULT 'anonymized_rows',
+    aggregate_cells INTEGER,
     status TEXT NOT NULL DEFAULT 'running',
     error_msg TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -439,6 +441,8 @@ class AuditDB:
                 purview_ok = %s,
                 purview_flagged = %s,
                 purview_diffs = %s,
+                output_type = %s,
+                aggregate_cells = %s,
                 status = %s,
                 error_msg = %s
             WHERE run_id = %s
@@ -465,6 +469,8 @@ class AuditDB:
                 audit.get("purview_available", False),
                 json.dumps(audit.get("purview_flagged_columns", [])),
                 json.dumps(audit.get("purview_discrepancies", [])),
+                audit.get("output_type", "anonymized_rows"),
+                audit.get("aggregate_cells"),
                 audit.get("status"),
                 audit.get("error_message"),
                 run_id,

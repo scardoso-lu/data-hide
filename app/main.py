@@ -45,6 +45,7 @@ from .repository import (
     write_delta,
     write_deltalake,
 )
+from .aggregation import aggregate_gps_table, detect_speed_column
 from . import repository as _repository
 from . import service as _service
 from .service import PipelineConfig, record_alert, resolve_table_mappings, run_pipeline, run_table
@@ -75,6 +76,8 @@ def main() -> None:
     _service.sanitize_column_names = sanitize_column_names
     _service.flag_free_text_columns = flag_free_text_columns
     _service.detect_quasi_identifiers = detect_quasi_identifiers
+    _service.detect_speed_column = detect_speed_column
+    _service.aggregate_gps_table = aggregate_gps_table
     _service.detect_gps_columns = detect_gps_columns
     _service.anonymize_gps_columns = anonymize_gps_columns
     _service.detect_timestamp_columns = detect_timestamp_columns
