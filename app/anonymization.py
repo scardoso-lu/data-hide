@@ -329,6 +329,44 @@ def bin_timestamp_columns(df: pd.DataFrame, ts_cols: list[str]) -> tuple[pd.Data
     return df, binned
 
 
+def _bin_label(lo: float, hi: float) -> str:
+    def fmt(v: float) -> str:
+        return str(int(v)) if v == int(v) else f"{v:.4g}"
+    return f"{fmt(lo)}–{fmt(hi)}"
+
+
+def bin_numeric_columns(df: pd.DataFrame, cols: list[str], n_bins: int = 5) -> tuple[pd.DataFrame, list[str]]:
+    """Replace numeric quasi-identifier columns with quantile-range labels.
+
+    Converts e.g. hours_worked=38.5 → "35–40" so k-anonymity groups more rows
+    together and suppresses fewer records.  Columns with fewer than two unique
+    values are left untouched.  Nulls are preserved as NaN.
+    """
+    if not cols:
+        return df, []
+    df = df.copy()
+    binned: list[str] = []
+    for col in cols:
+        if col not in df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        non_null = df[col].dropna()
+        if non_null.nunique() < 2:
+            continue
+        try:
+            _, edges = pd.qcut(non_null, q=n_bins, retbins=True, duplicates="drop")
+        except ValueError:
+            continue
+        if len(edges) < 2:
+            continue
+        labels = [_bin_label(lo, hi) for lo, hi in zip(edges[:-1], edges[1:])]
+        df[col] = pd.cut(df[col], bins=edges, labels=labels, include_lowest=True).astype(object)
+        binned.append(col)
+        logger.info("Binned numeric column %r into %d quantile ranges", col, len(labels))
+    return df, binned
+
+
 def validate_residual_pii(df: pd.DataFrame, analyzer: Any) -> int:
     residuals = _merge_residual_summaries(residual_pii_findings(df, analyzer))
     total = sum(item["count"] for item in residuals)
