@@ -8,11 +8,14 @@ import logging
 import os
 import uuid
 
+import pandas as pd
+
 from .aggregation import aggregate_gps_table, detect_speed_column
 from .anonymization import (
     EntityRegistry,
     anonymize_dataframe,
     anonymize_gps_columns,
+    bin_numeric_columns,
     bin_timestamp_columns,
     build_engines,
     enforce_k_anonymity,
@@ -119,6 +122,7 @@ def _new_audit(config: PipelineConfig) -> dict:
         "column_renames": {},
         "gps_columns_anonymized": [],
         "timestamp_columns_binned": [],
+        "numeric_columns_binned": [],
         "output_type": "anonymized_rows",
         "aggregate_cells": 0,
         "hashed_columns": [],
@@ -206,6 +210,10 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             qi_cols = detect_quasi_identifiers(df_raw, list(config.quasi_identifier_cols))
             qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
             audit["quasi_columns"] = qi_cols
+            numeric_qi = [c for c in qi_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
+            if numeric_qi:
+                df_raw, num_binned = bin_numeric_columns(df_raw, numeric_qi)
+                audit["numeric_columns_binned"] = num_binned
             if qi_cols:
                 df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
                 audit["suppressed_rows"] = k_info["suppressed_rows"]

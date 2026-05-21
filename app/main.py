@@ -12,6 +12,7 @@ from .anonymization import (
     _scan_json_for_pii,
     anonymize_dataframe,
     anonymize_gps_columns,
+    bin_numeric_columns,
     bin_timestamp_columns,
     build_engines,
     enforce_k_anonymity,
@@ -81,6 +82,7 @@ def main() -> None:
     _service.detect_gps_columns = detect_gps_columns
     _service.anonymize_gps_columns = anonymize_gps_columns
     _service.detect_timestamp_columns = detect_timestamp_columns
+    _service.bin_numeric_columns = bin_numeric_columns
     _service.bin_timestamp_columns = bin_timestamp_columns
     _service.detect_identifier_columns = detect_identifier_columns
     _service.hash_identifier_columns = hash_identifier_columns
