@@ -9,18 +9,36 @@ WORKDIR /app
 # ── System dependencies ───────────────────────────────────────────────────────
 # libgomp1        – OpenMP runtime required by numpy / spaCy vectorised ops
 # ca-certificates – TLS trust store for azure-identity, Purview, and webhook calls
+# msodbcsql18     – Microsoft ODBC Driver 18 for SQL Server (Fabric SQL endpoint)
+# unixodbc-dev    – headers needed by pyodbc at install time
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgomp1 \
         ca-certificates \
+        curl \
+        gnupg \
+    && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] \
+https://packages.microsoft.com/debian/12/prod bookworm main" \
+        > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
+        msodbcsql18 \
+        unixodbc-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies (own layer — cached unless requirements.txt changes) ──
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── spaCy model (baked in at build time; no network needed at runtime) ─────────
+# ── spaCy models (baked in at build time; no network needed at runtime) ────────
+# en_core_web_lg — English
+# fr_core_news_lg — French
+# de_core_news_lg — German and Luxembourgish (no dedicated lb model exists)
 RUN python -m spacy download en_core_web_lg \
+    && python -m spacy download fr_core_news_lg \
+    && python -m spacy download de_core_news_lg \
     && pip cache purge
 
 # ── Application code ──────────────────────────────────────────────────────────

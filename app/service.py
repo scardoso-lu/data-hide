@@ -27,7 +27,9 @@ from .repository import (
     TableMapping,
     _fresh_opts,
     connect_audit_db,
+    discover_table_mappings,
     read_delta,
+    read_sql_table,
     run_purview_check,
     write_delta,
 )
@@ -43,8 +45,10 @@ class PipelineConfig:
     hash_salt: str
     quasi_identifier_cols: tuple[str, ...] = ()
     identifier_cols: tuple[str, ...] = ()
-    fallback_source_uri: str | None = None
-    fallback_target_uri: str | None = None
+    source_base_uri: str | None = None
+    target_base_uri: str | None = None
+    sql_endpoint: str | None = None
+    sql_database: str | None = None
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -55,8 +59,10 @@ class PipelineConfig:
             hash_salt=os.environ.get("HASH_SALT", ""),
             quasi_identifier_cols=_csv(os.environ.get("QUASI_IDENTIFIER_COLS", "")),
             identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
-            fallback_source_uri=os.environ.get("SOURCE_ABFSS_URI"),
-            fallback_target_uri=os.environ.get("TARGET_ABFSS_URI"),
+            source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
+            target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
+            sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
+            sql_database=os.environ.get("SQL_DATABASE"),
         )
 
 
@@ -68,17 +74,24 @@ def _normalize_uri(uri: str) -> str:
     return uri.rstrip("/").lower()
 
 
-def resolve_table_mappings(config: PipelineConfig, db: AuditDB | None) -> list[TableMapping]:
-    if db is not None:
-        try:
-            mappings = db.list_table_mappings()
-            if isinstance(mappings, list) and mappings:
-                return mappings
-        except Exception as exc:
-            logger.warning("Table mapping lookup failed; falling back to env table: %s", exc)
-    if config.fallback_source_uri and config.fallback_target_uri:
-        return [TableMapping(config.fallback_source_uri, config.fallback_target_uri, "env_fallback")]
-    raise RuntimeError("No enabled table mappings found in pii_pipeline_tables and no fallback table URI env vars are set.")
+def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
+    if not config.source_base_uri or not config.target_base_uri:
+        raise RuntimeError(
+            "SOURCE_BASE_ABFSS_URI and TARGET_BASE_ABFSS_URI must both be set."
+        )
+    mappings = discover_table_mappings(
+        config.source_base_uri,
+        config.target_base_uri,
+        sql_endpoint=config.sql_endpoint,
+        sql_database=config.sql_database,
+    )
+    if not mappings:
+        raise RuntimeError(
+            f"No tables found under {config.source_base_uri!r}. "
+            "Ensure the path exists and contains at least one table subdirectory, "
+            "or configure SQL_ENDPOINT_URL and SQL_DATABASE for shortcut discovery."
+        )
+    return mappings
 
 
 def _new_audit(config: PipelineConfig) -> dict:
@@ -131,15 +144,15 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
     if db:
         try:
-            if isinstance(db, AuditDB):
-                db.open_run(run_id, started_at, mapping)
-            else:
-                db.open_run(started_at, mapping.source_uri, mapping.target_uri)
+            db.open_run(run_id, started_at, mapping)
         except Exception as exc:
             logger.warning("Audit open_run failed (non-fatal): %s", exc)
 
     try:
-        df_raw = read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
+        if mapping.read_mode == "sql":
+            df_raw = read_sql_table(mapping.table_name, config.sql_endpoint, config.sql_database)
+        else:
+            df_raw = read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
         audit["total_rows_processed"] = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
 
@@ -175,10 +188,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
         if db and stats["column_stats"]:
             try:
-                if isinstance(db, AuditDB):
-                    db.record_columns(run_id, stats["column_stats"])
-                else:
-                    db.record_columns(stats["column_stats"])
+                db.record_columns(run_id, stats["column_stats"])
             except Exception as exc:
                 logger.warning("Audit record_columns failed (non-fatal): %s", exc)
 
@@ -196,10 +206,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
     finally:
         if db:
             try:
-                if isinstance(db, AuditDB):
-                    db.close_run(run_id, audit)
-                else:
-                    db.close_run(audit)
+                db.close_run(run_id, audit)
             except Exception as exc:
                 logger.warning("Audit close_run failed (non-fatal): %s", exc)
 
@@ -207,5 +214,5 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
     config = config or PipelineConfig.from_env()
     db = connect_audit_db(config.database_url)
-    mappings = resolve_table_mappings(config, db)
+    mappings = resolve_table_mappings(config)
     return [run_table(config, mapping, db) for mapping in mappings]

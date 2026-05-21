@@ -12,14 +12,33 @@ import pandas as pd
 
 from .classification import _is_text_column
 
-SPACY_MODEL = "en_core_web_lg"
+# spaCy models for each supported language.
+# Luxembourgish (lb) has no dedicated spaCy model; the German model is the
+# closest approximation given the linguistic relationship between the two.
+SPACY_MODELS: dict[str, str] = {
+    "en": "en_core_web_lg",
+    "fr": "fr_core_news_lg",
+    "de": "de_core_news_lg",
+    "lb": "de_core_news_lg",
+}
+SUPPORTED_LANGUAGES: list[str] = list(SPACY_MODELS.keys())
 GDPR_ENTITIES: list[str] | None = None
 logger = logging.getLogger(__name__)
 PSEUDONYM_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]*_\d+\b")
 
 
+def _detect_language(text: str) -> str:
+    """Return a language code from SUPPORTED_LANGUAGES; defaults to 'en' on failure."""
+    try:
+        from langdetect import detect
+        detected = detect(text)
+        return detected if detected in SUPPORTED_LANGUAGES else "en"
+    except Exception:
+        return "en"
+
+
 def _analyze(text: str, analyzer: Any):
-    return analyzer.analyze(text=text, entities=GDPR_ENTITIES, language="en")
+    return analyzer.analyze(text=text, entities=GDPR_ENTITIES, language=_detect_language(text))
 
 
 def build_engines() -> Any:
@@ -28,9 +47,9 @@ def build_engines() -> Any:
 
     provider = NlpEngineProvider(nlp_configuration={
         "nlp_engine_name": "spacy",
-        "models": [{"lang_code": "en", "model_name": SPACY_MODEL}],
+        "models": [{"lang_code": lang, "model_name": model} for lang, model in SPACY_MODELS.items()],
     })
-    return AnalyzerEngine(nlp_engine=provider.create_engine(), supported_languages=["en"])
+    return AnalyzerEngine(nlp_engine=provider.create_engine(), supported_languages=SUPPORTED_LANGUAGES)
 
 
 class EntityRegistry:

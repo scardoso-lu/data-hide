@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Release Status
+
+The project has not been released. Do not add backward-compatibility shims, overloaded method signatures, fallback code paths, or migration helpers unless explicitly instructed.
+
 ## Project Structure & Module Organization
 
 This repository contains a stateless Python pipeline for anonymizing Microsoft Fabric OneLake Delta tables. The main application lives in `main.py`, which handles Azure authentication, Delta reads/writes, Presidio anonymization, Purview checks, audit logging, and alerts. Tests live in `tests/` and are split by behavior: orchestration, anonymization, audit database, alerts, and helpers. Runtime packaging is defined by `Dockerfile`, local orchestration by `docker-compose.yml`, and dependencies by `requirements.txt` plus `requirements-dev.txt`.

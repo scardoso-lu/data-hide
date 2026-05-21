@@ -29,12 +29,15 @@ from .repository import (
     PIPELINE_VERSION,
     AuditDB,
     PurviewClient,
+    TableMapping,
     _account_name,
     _fresh_opts,
     _storage_opts,
     acquire_token,
     connect_audit_db,
+    discover_table_mappings,
     read_delta,
+    read_sql_table,
     write_delta,
     write_deltalake,
 )
@@ -57,7 +60,9 @@ def main() -> None:
     _repository.DeltaTable = DeltaTable
     _repository.write_deltalake = write_deltalake
     _service.connect_audit_db = connect_audit_db
+    _service.discover_table_mappings = discover_table_mappings
     _service.read_delta = read_delta
+    _service.read_sql_table = read_sql_table
     _service.write_delta = write_delta
     _service.run_purview_check = run_purview_check
     _service.build_engines = build_engines
@@ -69,18 +74,8 @@ def main() -> None:
     _service.detect_identifier_columns = detect_identifier_columns
     _service.hash_identifier_columns = hash_identifier_columns
     _service.enforce_k_anonymity = enforce_k_anonymity
-    _service.record_alert = _record_alert_bridge if __name__ != "__main__" else record_alert
+    _service.record_alert = record_alert
     run_pipeline(PipelineConfig.from_env())
-
-
-def send_alert(subject: str, body: str, webhook_url: str | None = None) -> None:
-    """Backward-compatible no-op; alerts are now persisted in PostgreSQL."""
-    logging.getLogger(__name__).warning("Webhook alerts are disabled; use pii_pipeline_alerts: %s", subject)
-
-
-def _record_alert_bridge(db, run_id, mapping, subject: str, body: str) -> None:
-    record_alert(db, run_id, mapping, subject, body)
-    send_alert(subject, body, None)
 
 
 def run_purview_check(source_uri: str, df_columns: list[str], purview_account: str | None) -> dict:
