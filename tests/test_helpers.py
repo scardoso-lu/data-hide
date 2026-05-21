@@ -397,7 +397,7 @@ class TestSanitizeColumnNames:
 class TestValidateResidualPII:
 
     class FakeAnalyzer:
-        def analyze(self, text, entities=None, language="en"):
+        def analyze(self, text, entities=None, language=None):
             from types import SimpleNamespace
 
             findings = []

@@ -239,6 +239,8 @@ source .venv/bin/activate           # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg
+python -m spacy download fr_core_news_lg
+python -m spacy download de_core_news_lg
 
 export $(grep -v '^#' .env | xargs)
 
@@ -287,7 +289,7 @@ via the IMDS endpoint.
 * `.env` is git-ignored; never commit it.
 * Token scope is minimal: `https://storage.azure.com/.default` for OneLake,
   `https://purview.azure.net/.default` for Purview.
-* The `en_core_web_lg` model is embedded at build time; no outbound NLP calls at runtime.
+* The `en_core_web_lg`, `fr_core_news_lg`, and `de_core_news_lg` models are embedded at build time; no outbound NLP calls at runtime. Luxembourgish (lb) text is handled by the German model, as no dedicated spaCy model exists for that language.
 
 ---
 

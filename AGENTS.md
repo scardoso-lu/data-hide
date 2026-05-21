@@ -10,7 +10,7 @@ Prefix shell commands with `rtk`; use `rtk proxy powershell -Command "..."` for 
 
 - `rtk proxy powershell -Command "python -m venv .venv"`: create a local virtual environment.
 - `rtk proxy powershell -Command "pip install -r requirements-dev.txt"`: install runtime and test dependencies.
-- `rtk proxy powershell -Command "python -m spacy download en_core_web_lg"`: install the required NLP model for full anonymization tests and local runs.
+- `rtk proxy powershell -Command "python -m spacy download en_core_web_lg && python -m spacy download fr_core_news_lg && python -m spacy download de_core_news_lg"`: install the required NLP models (English, French, German/Luxembourgish) for full anonymization tests and local runs.
 - `rtk proxy powershell -Command "pytest"`: run the test suite configured by `pytest.ini`.
 - `rtk docker compose up --build`: build and run the pipeline with local PostgreSQL.
 - `rtk docker build -t fabric-pii-pipeline:latest .`: build the standalone container image.

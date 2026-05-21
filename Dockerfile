@@ -19,8 +19,13 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── spaCy model (baked in at build time; no network needed at runtime) ─────────
+# ── spaCy models (baked in at build time; no network needed at runtime) ────────
+# en_core_web_lg — English
+# fr_core_news_lg — French
+# de_core_news_lg — German and Luxembourgish (no dedicated lb model exists)
 RUN python -m spacy download en_core_web_lg \
+    && python -m spacy download fr_core_news_lg \
+    && python -m spacy download de_core_news_lg \
     && pip cache purge
 
 # ── Application code ──────────────────────────────────────────────────────────
