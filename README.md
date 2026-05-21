@@ -76,7 +76,26 @@ cp .env.example .env
 | `AZURE_TENANT_ID` | Azure AD tenant ID |
 | `AZURE_CLIENT_ID` | Service principal application (client) ID |
 | `AZURE_CLIENT_SECRET` | Service principal secret value |
-| `DATABASE_URL` | PostgreSQL DSN for audit records, table mappings, and alerts |
+| `DATABASE_URL` | PostgreSQL DSN for audit records and alerts (table mappings no longer required here) |
+
+### Table mapping — pick one
+
+The pipeline resolves which tables to process in this priority order:
+
+| Priority | Variables | Behaviour |
+|---|---|---|
+| 1 | `SOURCE_BASE_ABFSS_URI` + `TARGET_BASE_ABFSS_URI` | **Dynamic discovery** — lists every Delta table directory directly under the source base and maps it 1-to-1 to the same name under the target base. Scales to any number of tables without configuration. |
+| 2 | `pii_pipeline_tables` (PostgreSQL) | DB-driven list — used when base URIs are not set and the table has enabled rows. |
+| 3 | `SOURCE_ABFSS_URI` + `TARGET_ABFSS_URI` | Single-table fallback for smoke tests and local runs. |
+
+**Dynamic discovery example** — every table under `Tables/raw/` gets an anonymized copy under `Files/anonymized/`:
+
+```
+SOURCE_BASE_ABFSS_URI=abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/Source.Lakehouse/Tables/raw
+TARGET_BASE_ABFSS_URI=abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/Target.Lakehouse/Files/anonymized
+```
+
+The pipeline discovers `Tables/raw/customers`, `Tables/raw/orders`, … at runtime and writes to `Files/anonymized/customers`, `Files/anonymized/orders`, … automatically.
 
 ### Optional
 
@@ -85,29 +104,12 @@ cp .env.example .env
 | `PURVIEW_ACCOUNT_NAME` | *(disabled)* | Purview account name for label cross-check |
 | `K_ANONYMITY_MIN` | `5` | Minimum group size for quasi-identifier combinations |
 | `HASH_SALT` | empty | Salt for deterministic identifier hashes |
-| `SOURCE_ABFSS_URI`, `TARGET_ABFSS_URI` | *(disabled)* | Local fallback only when `pii_pipeline_tables` is empty |
+| `SOURCE_ABFSS_URI`, `TARGET_ABFSS_URI` | *(disabled)* | Single-table fallback (priority 3) |
 
 ### OneLake ABFS URI format
 
-Production source addresses and Parquet output paths are read from PostgreSQL,
-not hardcoded in `.env`. Seed `pii_pipeline_tables` with one row per enabled
-source/output pair:
-
-```sql
-INSERT INTO pii_pipeline_tables (table_name, source_uri, target_uri, enabled)
-VALUES (
-  'customers',
-  'abfss://Workspace@onelake.dfs.fabric.microsoft.com/Source.Lakehouse/Tables/raw_customers',
-  'abfss://Workspace@onelake.dfs.fabric.microsoft.com/Target.Lakehouse/Files/anonymized/customers.parquet',
-  true
-);
 ```
-
-If `target_uri` does not end in `.parquet`, the pipeline writes
-`part-00000.parquet` under that path.
-
-```
-abfss://<WorkspaceName>@onelake.dfs.fabric.microsoft.com/<LakehouseName>.Lakehouse/Files/<Folder>/<File>.parquet
+abfss://<WorkspaceName>@onelake.dfs.fabric.microsoft.com/<LakehouseName>.Lakehouse/<Tables|Files>/<path>
 ```
 
 Copy from Fabric portal: open the Lakehouse → right-click the table → **Properties** → **ABFS path**.

@@ -25,6 +25,9 @@ import pytest
 SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
 TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
 
+BASE_SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables"
+BASE_TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized"
+
 REQUIRED_ENV = {
     "SOURCE_ABFSS_URI": SOURCE_URI,
     "TARGET_ABFSS_URI": TARGET_URI,
@@ -61,8 +64,8 @@ def env(monkeypatch):
     """Set the minimum required env vars; remove optional ones."""
     for k, v in REQUIRED_ENV.items():
         monkeypatch.setenv(k, v)
-    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME",
-                "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
+    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN",
+                "QUASI_IDENTIFIER_COLS", "SOURCE_BASE_ABFSS_URI", "TARGET_BASE_ABFSS_URI"):
         monkeypatch.delenv(opt, raising=False)
 
 
@@ -513,3 +516,90 @@ class TestEndToEndAnonymization:
         written_df: pd.DataFrame = mock_write.call_args.args[0]
         for val in written_df["email"]:
             assert "EMAIL_ADDRESS_" in val, f"Expected EMAIL_ADDRESS token, got: {val!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic 1-to-1 table discovery via SOURCE_BASE_ABFSS_URI
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDynamicDiscovery:
+
+    @pytest.fixture()
+    def base_env(self, monkeypatch):
+        monkeypatch.setenv("SOURCE_BASE_ABFSS_URI", BASE_SOURCE_URI)
+        monkeypatch.setenv("TARGET_BASE_ABFSS_URI", BASE_TARGET_URI)
+        for opt in ("SOURCE_ABFSS_URI", "TARGET_ABFSS_URI", "DATABASE_URL",
+                    "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
+            monkeypatch.delenv(opt, raising=False)
+
+    def _two_mappings(self):
+        from main import TableMapping
+        return [
+            TableMapping(f"{BASE_SOURCE_URI}/customers", f"{BASE_TARGET_URI}/customers", "customers"),
+            TableMapping(f"{BASE_SOURCE_URI}/orders",    f"{BASE_TARGET_URI}/orders",    "orders"),
+        ]
+
+    def _std_mocks(self, mocker, mappings):
+        mocker.patch("main.discover_table_mappings", return_value=mappings)
+        mock_read = mocker.patch("main.DeltaTable")
+        mock_read.return_value.to_pandas.return_value = RAW_DF.copy()
+        mock_write = mocker.patch("main.write_delta")
+        mocker.patch("main.connect_audit_db", return_value=None)
+        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
+        return mock_write
+
+    def test_discover_is_called(
+        self, base_env, mock_auth, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        mock_discover = mocker.patch("main.discover_table_mappings", return_value=self._two_mappings())
+        mocker.patch("main.DeltaTable").return_value.to_pandas.return_value = RAW_DF.copy()
+        mocker.patch("main.write_delta")
+        mocker.patch("main.connect_audit_db", return_value=None)
+        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
+
+        from main import main
+        main()
+        mock_discover.assert_called_once_with(BASE_SOURCE_URI, BASE_TARGET_URI)
+
+    def test_write_called_once_per_table(
+        self, base_env, mock_auth, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        mock_write = self._std_mocks(mocker, self._two_mappings())
+
+        from main import main
+        main()
+        assert mock_write.call_count == 2
+
+    def test_target_uris_match_source_table_names(
+        self, base_env, mock_auth, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        mock_write = self._std_mocks(mocker, self._two_mappings())
+
+        from main import main
+        main()
+
+        written_uris = {call.args[1] for call in mock_write.call_args_list}
+        assert f"{BASE_TARGET_URI}/customers" in written_uris
+        assert f"{BASE_TARGET_URI}/orders" in written_uris
+
+    def test_empty_discovery_falls_back_to_env_single_table(
+        self, monkeypatch, mock_auth, mock_engines, mock_validate,
+        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+    ):
+        monkeypatch.setenv("SOURCE_BASE_ABFSS_URI", BASE_SOURCE_URI)
+        monkeypatch.setenv("TARGET_BASE_ABFSS_URI", BASE_TARGET_URI)
+        monkeypatch.setenv("SOURCE_ABFSS_URI", SOURCE_URI)
+        monkeypatch.setenv("TARGET_ABFSS_URI", TARGET_URI)
+        for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
+            monkeypatch.delenv(opt, raising=False)
+
+        mock_write = self._std_mocks(mocker, [])
+        mocker.patch("main.connect_audit_db", return_value=None)
+
+        from main import main
+        main()
+        assert mock_write.call_count == 1
+        assert mock_write.call_args.args[1] == TARGET_URI

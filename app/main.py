@@ -29,11 +29,13 @@ from .repository import (
     PIPELINE_VERSION,
     AuditDB,
     PurviewClient,
+    TableMapping,
     _account_name,
     _fresh_opts,
     _storage_opts,
     acquire_token,
     connect_audit_db,
+    discover_table_mappings,
     read_delta,
     write_delta,
     write_deltalake,
@@ -57,6 +59,7 @@ def main() -> None:
     _repository.DeltaTable = DeltaTable
     _repository.write_deltalake = write_deltalake
     _service.connect_audit_db = connect_audit_db
+    _service.discover_table_mappings = discover_table_mappings
     _service.read_delta = read_delta
     _service.write_delta = write_delta
     _service.run_purview_check = run_purview_check

@@ -136,6 +136,40 @@ def write_delta(df: pd.DataFrame, uri: str, storage_options: dict) -> None:
     file_client.upload_data(buffer.getvalue(), overwrite=True)
 
 
+def discover_table_mappings(source_base_uri: str, target_base_uri: str) -> list[TableMapping]:
+    """Return one TableMapping per Delta table directory found directly under source_base_uri.
+
+    Each target URI is built as target_base_uri/<table_name>, giving a strict
+    1-to-1 source→target pairing without any manual configuration.
+    """
+    global DataLakeServiceClient
+    if DataLakeServiceClient is None:
+        from azure.storage.filedatalake import DataLakeServiceClient as _DataLakeServiceClient
+        DataLakeServiceClient = _DataLakeServiceClient
+
+    filesystem, host, base_path = _parse_abfss_uri(source_base_uri)
+    base_path = base_path.rstrip("/")
+    target_base = target_base_uri.rstrip("/")
+
+    service_client = DataLakeServiceClient(
+        account_url=f"https://{host}",
+        credential=_credential_instance(),
+    )
+    fs_client = service_client.get_file_system_client(file_system=filesystem)
+
+    mappings: list[TableMapping] = []
+    for item in fs_client.get_paths(path=base_path, recursive=False):
+        if not item.is_directory:
+            continue
+        table_name = item.name.rstrip("/").rsplit("/", 1)[-1]
+        source_uri = f"abfss://{filesystem}@{host}/{item.name.rstrip('/')}"
+        target_uri = f"{target_base}/{table_name}"
+        mappings.append(TableMapping(source_uri=source_uri, target_uri=target_uri, table_name=table_name))
+
+    logger.info("Discovered %d table(s) under %s", len(mappings), source_base_uri)
+    return mappings
+
+
 class PurviewClient:
     def __init__(self, account_name: str, token: str) -> None:
         self._base = f"https://{account_name}.purview.azure.com"
