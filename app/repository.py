@@ -231,16 +231,6 @@ def run_purview_check(source_uri: str, df_columns: list[str], purview_account: s
         return empty
 
 
-_DDL_TABLES = """
-CREATE TABLE IF NOT EXISTS pii_pipeline_tables (
-    table_name TEXT PRIMARY KEY,
-    source_uri TEXT NOT NULL,
-    target_uri TEXT NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-)
-"""
-
 _DDL_RUNS = """
 CREATE TABLE IF NOT EXISTS pii_pipeline_runs (
     run_id UUID PRIMARY KEY,
@@ -317,31 +307,11 @@ class AuditDB:
 
     def _init_schema(self) -> None:
         with self._cursor() as cur:
-            cur.execute(_DDL_TABLES)
             cur.execute(_DDL_RUNS)
             cur.execute(_DDL_COLUMN_EVENTS)
             cur.execute(_DDL_ALERTS)
 
-    def list_table_mappings(self) -> list[TableMapping]:
-        sql = """
-            SELECT table_name, source_uri, target_uri
-            FROM pii_pipeline_tables
-            WHERE enabled = TRUE
-            ORDER BY table_name
-        """
-        with self._cursor() as cur:
-            cur.execute(sql)
-            return [TableMapping(source_uri=row[1], target_uri=row[2], table_name=row[0]) for row in cur.fetchall()]
-
-    def open_run(self, *args) -> None:
-        if len(args) == 3 and isinstance(args[2], TableMapping):
-            run_id, started_at, mapping = args
-        elif len(args) == 3:
-            started_at, source_uri, target_uri = args
-            run_id = "00000000-0000-0000-0000-000000000000"
-            mapping = TableMapping(source_uri, target_uri)
-        else:
-            raise TypeError("open_run expects (run_id, started_at, mapping) or (started_at, source_uri, target_uri)")
+    def open_run(self, run_id: str, started_at: datetime, mapping: TableMapping) -> None:
         sql = """
             INSERT INTO pii_pipeline_runs
                 (run_id, pipeline_version, started_at, table_name, source_uri, target_uri, status)
@@ -350,14 +320,7 @@ class AuditDB:
         with self._cursor() as cur:
             cur.execute(sql, (run_id, PIPELINE_VERSION, started_at, mapping.table_name, mapping.source_uri, mapping.target_uri, "running"))
 
-    def record_columns(self, *args) -> None:
-        if len(args) == 2:
-            run_id, column_stats = args
-        elif len(args) == 1:
-            run_id = "00000000-0000-0000-0000-000000000000"
-            column_stats = args[0]
-        else:
-            raise TypeError("record_columns expects (run_id, column_stats) or (column_stats)")
+    def record_columns(self, run_id: str, column_stats: list) -> None:
         rows = [(run_id, s["column"], s["detections"], json.dumps(s["entity_counts"])) for s in column_stats]
         sql = """
             INSERT INTO pii_pipeline_column_events
@@ -375,14 +338,7 @@ class AuditDB:
         with self._cursor() as cur:
             cur.execute(sql, (run_id, table_name, subject, body, severity))
 
-    def close_run(self, *args) -> None:
-        if len(args) == 2:
-            run_id, audit = args
-        elif len(args) == 1:
-            run_id = "00000000-0000-0000-0000-000000000000"
-            audit = args[0]
-        else:
-            raise TypeError("close_run expects (run_id, audit) or (audit)")
+    def close_run(self, run_id: str, audit: dict) -> None:
         sql = """
             UPDATE pii_pipeline_runs SET
                 finished_at = %s,

@@ -46,8 +46,6 @@ class PipelineConfig:
     identifier_cols: tuple[str, ...] = ()
     source_base_uri: str | None = None
     target_base_uri: str | None = None
-    fallback_source_uri: str | None = None
-    fallback_target_uri: str | None = None
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -60,8 +58,6 @@ class PipelineConfig:
             identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
-            fallback_source_uri=os.environ.get("SOURCE_ABFSS_URI"),
-            fallback_target_uri=os.environ.get("TARGET_ABFSS_URI"),
         )
 
 
@@ -73,35 +69,18 @@ def _normalize_uri(uri: str) -> str:
     return uri.rstrip("/").lower()
 
 
-def resolve_table_mappings(config: PipelineConfig, db: AuditDB | None) -> list[TableMapping]:
-    # 1. Dynamic 1-to-1 discovery via base URIs — primary path for large table fleets
-    if config.source_base_uri and config.target_base_uri:
-        try:
-            mappings = discover_table_mappings(config.source_base_uri, config.target_base_uri)
-            if mappings:
-                return mappings
-            logger.warning("Dynamic discovery found no tables under %s", config.source_base_uri)
-        except Exception as exc:
-            logger.warning("Dynamic discovery failed; trying DB table: %s", exc)
-
-    # 2. DB-driven table list
-    if db is not None:
-        try:
-            mappings = db.list_table_mappings()
-            if isinstance(mappings, list) and mappings:
-                return mappings
-        except Exception as exc:
-            logger.warning("Table mapping lookup failed; falling back to env table: %s", exc)
-
-    # 3. Single-table env fallback
-    if config.fallback_source_uri and config.fallback_target_uri:
-        return [TableMapping(config.fallback_source_uri, config.fallback_target_uri, "env_fallback")]
-
-    raise RuntimeError(
-        "No table mappings found. Set SOURCE_BASE_ABFSS_URI + TARGET_BASE_ABFSS_URI for dynamic "
-        "discovery, populate pii_pipeline_tables in PostgreSQL, or set SOURCE_ABFSS_URI + "
-        "TARGET_ABFSS_URI for a single-table fallback."
-    )
+def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
+    if not config.source_base_uri or not config.target_base_uri:
+        raise RuntimeError(
+            "SOURCE_BASE_ABFSS_URI and TARGET_BASE_ABFSS_URI must both be set."
+        )
+    mappings = discover_table_mappings(config.source_base_uri, config.target_base_uri)
+    if not mappings:
+        raise RuntimeError(
+            f"No Delta table directories found under {config.source_base_uri!r}. "
+            "Ensure the path exists and contains at least one table subdirectory."
+        )
+    return mappings
 
 
 def _new_audit(config: PipelineConfig) -> dict:
@@ -154,10 +133,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
     if db:
         try:
-            if isinstance(db, AuditDB):
-                db.open_run(run_id, started_at, mapping)
-            else:
-                db.open_run(started_at, mapping.source_uri, mapping.target_uri)
+            db.open_run(run_id, started_at, mapping)
         except Exception as exc:
             logger.warning("Audit open_run failed (non-fatal): %s", exc)
 
@@ -198,10 +174,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
         if db and stats["column_stats"]:
             try:
-                if isinstance(db, AuditDB):
-                    db.record_columns(run_id, stats["column_stats"])
-                else:
-                    db.record_columns(stats["column_stats"])
+                db.record_columns(run_id, stats["column_stats"])
             except Exception as exc:
                 logger.warning("Audit record_columns failed (non-fatal): %s", exc)
 
@@ -219,10 +192,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
     finally:
         if db:
             try:
-                if isinstance(db, AuditDB):
-                    db.close_run(run_id, audit)
-                else:
-                    db.close_run(audit)
+                db.close_run(run_id, audit)
             except Exception as exc:
                 logger.warning("Audit close_run failed (non-fatal): %s", exc)
 
@@ -230,5 +200,5 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
     config = config or PipelineConfig.from_env()
     db = connect_audit_db(config.database_url)
-    mappings = resolve_table_mappings(config, db)
+    mappings = resolve_table_mappings(config)
     return [run_table(config, mapping, db) for mapping in mappings]

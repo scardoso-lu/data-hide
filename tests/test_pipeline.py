@@ -24,13 +24,14 @@ import pytest
 
 SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
 TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
+RAW_TARGET = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/dbo/jaffle_raw_customers"
 
 BASE_SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables"
 BASE_TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized"
 
 REQUIRED_ENV = {
-    "SOURCE_ABFSS_URI": SOURCE_URI,
-    "TARGET_ABFSS_URI": TARGET_URI,
+    "SOURCE_BASE_ABFSS_URI": BASE_SOURCE_URI,
+    "TARGET_BASE_ABFSS_URI": BASE_TARGET_URI,
 }
 
 RAW_DF = pd.DataFrame({
@@ -60,13 +61,15 @@ MOCK_STATS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
-def env(monkeypatch):
-    """Set the minimum required env vars; remove optional ones."""
+def env(monkeypatch, mocker):
+    """Set required env vars and default discover mock returning a single table."""
     for k, v in REQUIRED_ENV.items():
         monkeypatch.setenv(k, v)
-    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN",
-                "QUASI_IDENTIFIER_COLS", "SOURCE_BASE_ABFSS_URI", "TARGET_BASE_ABFSS_URI"):
+    for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
         monkeypatch.delenv(opt, raising=False)
+    from main import TableMapping
+    mocker.patch("main.discover_table_mappings",
+                 return_value=[TableMapping(SOURCE_URI, TARGET_URI, "test_table")])
 
 
 @pytest.fixture()
@@ -229,14 +232,13 @@ class TestPipelineSuccess:
         assert audit["total_entities_detected"] == 4
         assert audit["entity_counts"]["EMAIL_ADDRESS"] == 2
 
-    def test_no_alert_sent_on_success(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
+    def test_no_alert_recorded_on_success(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
-        mock_alert = mocker.patch("main.send_alert")
         from main import main
         main()
-        mock_alert.assert_not_called()
+        mock_db.record_alert.assert_not_called()
 
     def test_column_events_recorded_in_db(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
@@ -278,23 +280,24 @@ class TestPipelineSuccess:
 class TestPipelineFailure:
 
     def test_refuses_same_source_and_target(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, monkeypatch,
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
-        monkeypatch.setenv("TARGET_ABFSS_URI", SOURCE_URI)
+        from main import TableMapping
+        mocker.patch("main.discover_table_mappings",
+                     return_value=[TableMapping(SOURCE_URI, SOURCE_URI, "test_table")])
 
         from main import main
         with pytest.raises(RuntimeError, match="Source and target table URIs are identical"):
             main()
 
     def test_allows_raw_named_target_when_writing_parquet_file(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, monkeypatch,
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
-        monkeypatch.setenv(
-            "TARGET_ABFSS_URI",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/dbo/jaffle_raw_customers",
-        )
+        from main import TableMapping
+        mocker.patch("main.discover_table_mappings",
+                     return_value=[TableMapping(SOURCE_URI, RAW_TARGET, "test_table")])
 
         from main import main
         main()
@@ -352,10 +355,9 @@ class TestPipelineFailure:
         assert "disk full" in audit["error_message"]
 
     def test_alert_recorded_on_failure(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker, monkeypatch,
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
         mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
     ):
-        mock_alert = mocker.patch("main.send_alert")
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("timeout")
 
@@ -363,8 +365,8 @@ class TestPipelineFailure:
         with pytest.raises(RuntimeError):
             main()
 
-        mock_alert.assert_called_once()
-        subject = mock_alert.call_args.args[0]
+        mock_db.record_alert.assert_called_once()
+        subject = mock_db.record_alert.call_args.args[2]
         assert "FAILED" in subject
 
     def test_audit_close_run_called_even_when_db_write_fails(
@@ -585,21 +587,13 @@ class TestDynamicDiscovery:
         assert f"{BASE_TARGET_URI}/customers" in written_uris
         assert f"{BASE_TARGET_URI}/orders" in written_uris
 
-    def test_empty_discovery_falls_back_to_env_single_table(
-        self, monkeypatch, mock_auth, mock_engines, mock_validate,
+    def test_empty_discovery_raises(
+        self, base_env, mock_auth, mock_engines, mock_validate,
         mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
     ):
-        monkeypatch.setenv("SOURCE_BASE_ABFSS_URI", BASE_SOURCE_URI)
-        monkeypatch.setenv("TARGET_BASE_ABFSS_URI", BASE_TARGET_URI)
-        monkeypatch.setenv("SOURCE_ABFSS_URI", SOURCE_URI)
-        monkeypatch.setenv("TARGET_ABFSS_URI", TARGET_URI)
-        for opt in ("DATABASE_URL", "PURVIEW_ACCOUNT_NAME", "K_ANONYMITY_MIN", "QUASI_IDENTIFIER_COLS"):
-            monkeypatch.delenv(opt, raising=False)
-
-        mock_write = self._std_mocks(mocker, [])
+        mocker.patch("main.discover_table_mappings", return_value=[])
         mocker.patch("main.connect_audit_db", return_value=None)
 
         from main import main
-        main()
-        assert mock_write.call_count == 1
-        assert mock_write.call_args.args[1] == TARGET_URI
+        with pytest.raises(RuntimeError, match="No Delta table directories found"):
+            main()

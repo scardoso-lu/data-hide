@@ -78,24 +78,16 @@ cp .env.example .env
 | `AZURE_CLIENT_SECRET` | Service principal secret value |
 | `DATABASE_URL` | PostgreSQL DSN for audit records and alerts (table mappings no longer required here) |
 
-### Table mapping — pick one
+### Table mapping
 
-The pipeline resolves which tables to process in this priority order:
-
-| Priority | Variables | Behaviour |
-|---|---|---|
-| 1 | `SOURCE_BASE_ABFSS_URI` + `TARGET_BASE_ABFSS_URI` | **Dynamic discovery** — lists every Delta table directory directly under the source base and maps it 1-to-1 to the same name under the target base. Scales to any number of tables without configuration. |
-| 2 | `pii_pipeline_tables` (PostgreSQL) | DB-driven list — used when base URIs are not set and the table has enabled rows. |
-| 3 | `SOURCE_ABFSS_URI` + `TARGET_ABFSS_URI` | Single-table fallback for smoke tests and local runs. |
-
-**Dynamic discovery example** — every table under `Tables/raw/` gets an anonymized copy under `Files/anonymized/`:
+Set both base URIs and the pipeline discovers all tables automatically:
 
 ```
 SOURCE_BASE_ABFSS_URI=abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/Source.Lakehouse/Tables/raw
 TARGET_BASE_ABFSS_URI=abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/Target.Lakehouse/Files/anonymized
 ```
 
-The pipeline discovers `Tables/raw/customers`, `Tables/raw/orders`, … at runtime and writes to `Files/anonymized/customers`, `Files/anonymized/orders`, … automatically.
+Every Delta table directory found directly under `SOURCE_BASE_ABFSS_URI` gets an anonymized copy written under the same name at `TARGET_BASE_ABFSS_URI`. `Tables/raw/customers` → `Files/anonymized/customers`, and so on for every table, with no per-table configuration required.
 
 ### Optional
 
@@ -104,7 +96,6 @@ The pipeline discovers `Tables/raw/customers`, `Tables/raw/orders`, … at runti
 | `PURVIEW_ACCOUNT_NAME` | *(disabled)* | Purview account name for label cross-check |
 | `K_ANONYMITY_MIN` | `5` | Minimum group size for quasi-identifier combinations |
 | `HASH_SALT` | empty | Salt for deterministic identifier hashes |
-| `SOURCE_ABFSS_URI`, `TARGET_ABFSS_URI` | *(disabled)* | Single-table fallback (priority 3) |
 
 ### OneLake ABFS URI format
 
@@ -122,7 +113,7 @@ The compose file spins up a Postgres instance and the pipeline in one command.
 
 ```bash
 cp .env.example .env
-# Fill in AZURE_* and seed pii_pipeline_tables in PostgreSQL
+# Fill in AZURE_*, SOURCE_BASE_ABFSS_URI, and TARGET_BASE_ABFSS_URI
 
 docker compose up --build
 ```

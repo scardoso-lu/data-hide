@@ -9,16 +9,18 @@ from datetime import datetime, timezone
 
 import pytest
 
-from main import AuditDB, PIPELINE_VERSION, connect_audit_db
+from main import AuditDB, PIPELINE_VERSION, TableMapping, connect_audit_db
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+RUN_ID      = "aaaaaaaa-0000-0000-0000-000000000001"
 STARTED_AT  = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
 FINISHED_AT = datetime(2024, 1, 15, 10, 5, 30, tzinfo=timezone.utc)
 SOURCE_URI  = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
 TARGET_URI  = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
+MAPPING     = TableMapping(SOURCE_URI, TARGET_URI, "test_table")
 
 SUCCESS_AUDIT = {
     "pipeline_end_ts":         FINISHED_AT.isoformat(),
@@ -90,7 +92,7 @@ class TestSchemaInit:
     def test_expected_ddl_statements(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
         AuditDB("postgresql://test")
-        assert cur.execute.call_count == 4
+        assert cur.execute.call_count == 3
 
     def test_connection_committed(self, mock_psycopg2):
         _, conn, _ = mock_psycopg2
@@ -118,7 +120,7 @@ class TestOpenRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.open_run(STARTED_AT, SOURCE_URI, TARGET_URI)
+        db.open_run(RUN_ID, STARTED_AT, MAPPING)
 
         cur.execute.assert_called_once()
         sql, params = cur.execute.call_args.args
@@ -129,7 +131,7 @@ class TestOpenRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.open_run(STARTED_AT, SOURCE_URI, TARGET_URI)
+        db.open_run(RUN_ID, STARTED_AT, MAPPING)
         _, params = cur.execute.call_args.args
         assert "running" in params
 
@@ -138,7 +140,7 @@ class TestOpenRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.open_run(STARTED_AT, SOURCE_URI, TARGET_URI)
+        db.open_run(RUN_ID, STARTED_AT, MAPPING)
         _, params = cur.execute.call_args.args
         assert SOURCE_URI in params
         assert TARGET_URI in params
@@ -148,7 +150,7 @@ class TestOpenRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.open_run(STARTED_AT, SOURCE_URI, TARGET_URI)
+        db.open_run(RUN_ID, STARTED_AT, MAPPING)
         _, params = cur.execute.call_args.args
         assert PIPELINE_VERSION in params
 
@@ -170,7 +172,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns(COLUMN_STATS)
+        db.record_columns(RUN_ID, COLUMN_STATS)
 
         mock_exec_vals.assert_called_once()
 
@@ -178,7 +180,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns(COLUMN_STATS)
+        db.record_columns(RUN_ID, COLUMN_STATS)
 
         rows = mock_exec_vals.call_args.args[2]
         assert len(rows) == len(COLUMN_STATS)
@@ -187,7 +189,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns(COLUMN_STATS)
+        db.record_columns(RUN_ID, COLUMN_STATS)
 
         rows = mock_exec_vals.call_args.args[2]
         inserted_cols = [r[1] for r in rows]
@@ -197,7 +199,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns(COLUMN_STATS)
+        db.record_columns(RUN_ID, COLUMN_STATS)
 
         rows = mock_exec_vals.call_args.args[2]
         assert rows[0][2] == 10   # email
@@ -208,7 +210,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns([
+        db.record_columns(RUN_ID, [
             {"column": "email", "detections": 3, "entity_counts": {"EMAIL_ADDRESS": 3}},
         ])
 
@@ -221,7 +223,7 @@ class TestRecordColumns:
         mock_exec_vals = mocker.patch("main.psycopg2.extras.execute_values")
         db = AuditDB("postgresql://test")
 
-        db.record_columns([])
+        db.record_columns(RUN_ID, [])
 
         mock_exec_vals.assert_called_once()
         rows = mock_exec_vals.call_args.args[2]
@@ -239,7 +241,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
 
         cur.execute.assert_called_once()
         sql, _ = cur.execute.call_args.args
@@ -250,7 +252,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert "success" in params
 
@@ -259,7 +261,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(FAILURE_AUDIT)
+        db.close_run(RUN_ID, FAILURE_AUDIT)
         _, params = cur.execute.call_args.args
         assert "failure" in params
         assert "Connection refused" in params
@@ -269,7 +271,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert None in params  # error_message is NULL
 
@@ -278,7 +280,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert 500 in params   # total_rows_processed
         assert 312 in params   # total_entities_detected
@@ -288,7 +290,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         json_params = [p for p in params if isinstance(p, str) and "email" in p]
         assert json_params, "No JSON-encoded columns_anonymized found in params"
@@ -300,7 +302,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         # unique_entities has EMAIL_ADDRESS: 150 (entity_counts has 200 — must find the right one)
         matching = [
@@ -316,7 +318,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert 3 in params  # suppressed_rows
 
@@ -325,7 +327,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert 0 in params  # residual_pii_count
 
@@ -334,7 +336,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert "{}" in params
 
@@ -343,7 +345,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         assert 5 in params  # k_anonymity_k
 
@@ -352,7 +354,7 @@ class TestCloseRun:
         db = AuditDB("postgresql://test")
         cur.execute.reset_mock()
 
-        db.close_run(SUCCESS_AUDIT)
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
         _, params = cur.execute.call_args.args
         matching = [
             p for p in params
