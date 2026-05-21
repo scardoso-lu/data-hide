@@ -22,6 +22,11 @@ _GPS_NAME_TOKENS = frozenset({
 })
 _WKT_POINT_RE = re.compile(r"POINT\s*\(", re.IGNORECASE)
 
+_TIMESTAMP_NAME_TOKENS = frozenset({
+    "time", "timestamp", "datetime", "date", "at",
+    "created", "updated", "recorded", "captured", "ts", "dt", "occurred",
+})
+
 
 def _is_text_column(dtype) -> bool:
     return pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype)
@@ -186,6 +191,36 @@ def _is_numeric_gps_column(series: pd.Series, tokens: set[str]) -> bool:
     if non_null.empty:
         return False
     return bool(non_null.between(-180, 180).all())
+
+
+def detect_timestamp_columns(df: pd.DataFrame) -> list[str]:
+    """Return column names that contain timestamps or dates.
+
+    A datetime64 column always qualifies.  A string/object column qualifies
+    when its name contains a timestamp keyword and ≥80 % of the non-null
+    sample parses as a datetime.
+    """
+    result: list[str] = []
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_datetime64_any_dtype(series.dtype):
+            result.append(col)
+            continue
+        if not _is_text_column(series.dtype):
+            continue
+        tokens = set(_tokens(str(col)))
+        if not (tokens & _TIMESTAMP_NAME_TOKENS):
+            continue
+        sample = series.dropna().head(20)
+        if sample.empty:
+            continue
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce")
+            if parsed.notna().mean() >= 0.8:
+                result.append(col)
+        except Exception:
+            pass
+    return result
 
 
 def _is_wkt_gps_column(series: pd.Series) -> bool:

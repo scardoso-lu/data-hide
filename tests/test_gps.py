@@ -2,9 +2,10 @@
 
 import pandas as pd
 import pytest
+from datetime import datetime, timezone
 
-from app.classification import detect_gps_columns
-from app.anonymization import anonymize_gps_columns, _round_wkt
+from app.classification import detect_gps_columns, detect_timestamp_columns
+from app.anonymization import anonymize_gps_columns, bin_timestamp_columns, _round_wkt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,3 +157,123 @@ class TestAnonymizeGpsColumns:
         df = pd.DataFrame({"lat": [49.6112]})
         result, anonymized = anonymize_gps_columns(df, ["lat", "nonexistent"], precision=2)
         assert anonymized == ["lat"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# detect_timestamp_columns
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDetectTimestampColumns:
+
+    def test_detects_datetime64_column(self):
+        df = pd.DataFrame({"recorded_at": pd.to_datetime(["2024-01-15 08:30:00", "2024-01-15 09:00:00"])})
+        assert "recorded_at" in detect_timestamp_columns(df)
+
+    def test_detects_string_column_with_timestamp_name(self):
+        df = pd.DataFrame({"timestamp": ["2024-01-15 08:30:00", "2024-01-15 09:00:00"]})
+        assert "timestamp" in detect_timestamp_columns(df)
+
+    def test_detects_created_at_name(self):
+        df = pd.DataFrame({"created_at": pd.to_datetime(["2024-01-15", "2024-01-16"])})
+        assert "created_at" in detect_timestamp_columns(df)
+
+    def test_non_timestamp_string_column_excluded(self):
+        df = pd.DataFrame({"name": ["Alice", "Bob"]})
+        assert detect_timestamp_columns(df) == []
+
+    def test_numeric_column_excluded(self):
+        df = pd.DataFrame({"score": [88, 72]})
+        assert detect_timestamp_columns(df) == []
+
+    def test_returns_empty_for_no_timestamp_columns(self):
+        df = pd.DataFrame({"lat": [49.6], "lon": [6.1], "value": [42]})
+        assert detect_timestamp_columns(df) == []
+
+    def test_mixed_table_returns_only_timestamp_cols(self):
+        df = pd.DataFrame({
+            "lat": [49.6],
+            "lon": [6.1],
+            "recorded_at": pd.to_datetime(["2024-01-15 08:30:00"]),
+            "name": ["Alice"],
+        })
+        ts_cols = detect_timestamp_columns(df)
+        assert ts_cols == ["recorded_at"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bin_timestamp_columns
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBinTimestampColumns:
+
+    def test_floors_datetime64_to_midnight(self):
+        df = pd.DataFrame({"ts": pd.to_datetime(["2024-01-15 08:30:00", "2024-01-15 22:45:00"])})
+        result, binned = bin_timestamp_columns(df, ["ts"])
+        assert binned == ["ts"]
+        assert result["ts"].iloc[0] == pd.Timestamp("2024-01-15")
+        assert result["ts"].iloc[1] == pd.Timestamp("2024-01-15")
+
+    def test_two_different_days_stay_distinct(self):
+        df = pd.DataFrame({"ts": pd.to_datetime(["2024-01-15 08:30:00", "2024-01-16 09:00:00"])})
+        result, _ = bin_timestamp_columns(df, ["ts"])
+        assert result["ts"].iloc[0] != result["ts"].iloc[1]
+
+    def test_null_values_preserved(self):
+        df = pd.DataFrame({"ts": pd.to_datetime([None, "2024-01-15 08:30:00"])})
+        result, binned = bin_timestamp_columns(df, ["ts"])
+        assert binned == ["ts"]
+        assert pd.isna(result["ts"].iloc[0])
+        assert result["ts"].iloc[1] == pd.Timestamp("2024-01-15")
+
+    def test_string_column_not_binned(self):
+        df = pd.DataFrame({"ts": ["2024-01-15 08:30:00", "2024-01-15 09:00:00"]})
+        result, binned = bin_timestamp_columns(df, ["ts"])
+        assert binned == []
+        assert list(result["ts"]) == ["2024-01-15 08:30:00", "2024-01-15 09:00:00"]
+
+    def test_original_dataframe_not_mutated(self):
+        original_val = pd.Timestamp("2024-01-15 08:30:00")
+        df = pd.DataFrame({"ts": pd.to_datetime(["2024-01-15 08:30:00"])})
+        bin_timestamp_columns(df, ["ts"])
+        assert df["ts"].iloc[0] == original_val
+
+    def test_empty_ts_cols_returns_unchanged_df(self):
+        df = pd.DataFrame({"ts": pd.to_datetime(["2024-01-15 08:30:00"])})
+        result, binned = bin_timestamp_columns(df, [])
+        assert binned == []
+        assert result["ts"].iloc[0] == pd.Timestamp("2024-01-15 08:30:00")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compound quasi-identifier: GPS + timestamp → k-anonymity
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGpsTimestampKAnonymity:
+    """Verify GPS spatial rounding + timestamp binning together feed k-anonymity."""
+
+    def test_rounded_gps_reduces_cardinality_for_grouping(self):
+        df = pd.DataFrame({
+            "lat": [49.61234, 49.61567, 49.61890],
+            "lon": [6.13456, 6.13123, 6.13789],
+        })
+        result, _ = anonymize_gps_columns(df, ["lat", "lon"], precision=1)
+        assert result["lat"].nunique() == 1
+        assert result["lon"].nunique() == 1
+
+    def test_floored_timestamps_form_equal_groups_within_day(self):
+        df = pd.DataFrame({"ts": pd.to_datetime([
+            "2024-01-15 08:00:00",
+            "2024-01-15 13:00:00",
+            "2024-01-15 22:00:00",
+        ])})
+        result, binned = bin_timestamp_columns(df, ["ts"])
+        assert binned == ["ts"]
+        assert result["ts"].nunique() == 1
+
+    def test_different_days_stay_in_separate_groups(self):
+        df = pd.DataFrame({"ts": pd.to_datetime([
+            "2024-01-15 08:00:00",
+            "2024-01-16 08:00:00",
+        ])})
+        result, _ = bin_timestamp_columns(df, ["ts"])
+        assert result["ts"].nunique() == 2

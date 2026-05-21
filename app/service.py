@@ -12,6 +12,7 @@ from .anonymization import (
     EntityRegistry,
     anonymize_dataframe,
     anonymize_gps_columns,
+    bin_timestamp_columns,
     build_engines,
     enforce_k_anonymity,
     hash_identifier_columns,
@@ -21,6 +22,7 @@ from .classification import (
     detect_gps_columns,
     detect_identifier_columns,
     detect_quasi_identifiers,
+    detect_timestamp_columns,
     flag_free_text_columns,
     sanitize_column_names,
 )
@@ -51,7 +53,7 @@ class PipelineConfig:
     target_base_uri: str | None = None
     sql_endpoint: str | None = None
     sql_database: str | None = None
-    gps_precision: int = 2
+    gps_precision: int = 1
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -115,6 +117,7 @@ def _new_audit(config: PipelineConfig) -> dict:
         "residual_pii_count": 0,
         "column_renames": {},
         "gps_columns_anonymized": [],
+        "timestamp_columns_binned": [],
         "hashed_columns": [],
         "purview_available": False,
         "purview_flagged_columns": [],
@@ -164,10 +167,20 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         df_raw, col_renames = sanitize_column_names(df_raw)
         audit["column_renames"] = col_renames
 
+        gps_anonymized: list[str] = []
         gps_cols = detect_gps_columns(df_raw)
         if gps_cols:
             df_raw, gps_anonymized = anonymize_gps_columns(df_raw, gps_cols, config.gps_precision)
             audit["gps_columns_anonymized"] = gps_anonymized
+
+        # Temporal generalisation: when GPS is present, floor timestamps to day.
+        # Sub-day precision + rounded city coordinates is near-unique per person.
+        ts_binned: list[str] = []
+        if gps_anonymized:
+            ts_cols = detect_timestamp_columns(df_raw)
+            if ts_cols:
+                df_raw, ts_binned = bin_timestamp_columns(df_raw, ts_cols)
+                audit["timestamp_columns_binned"] = ts_binned
 
         id_cols = detect_identifier_columns(df_raw, list(config.identifier_cols))
         df_raw, hashed = hash_identifier_columns(df_raw, id_cols, config.hash_salt)
@@ -182,6 +195,9 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         audit["purview_discrepancies"] = pv["discrepancies"]
 
         qi_cols = detect_quasi_identifiers(df_raw, list(config.quasi_identifier_cols))
+        # Rounded GPS columns and binned timestamps form a compound spatial quasi-identifier.
+        # Promote them into the k-anonymity check so groups smaller than k are suppressed.
+        qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
         audit["quasi_columns"] = qi_cols
         if qi_cols:
             df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
