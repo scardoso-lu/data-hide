@@ -23,6 +23,7 @@ from main import (
     validate_residual_pii,
     write_delta,
 )
+from app.repository import _parse_abfss_uri
 
 
 class TestAccountNameParser:
@@ -47,6 +48,10 @@ class TestAccountNameParser:
     ])
     def test_extracts_correct_account(self, uri, expected):
         assert _account_name(uri) == expected
+
+    def test_extracts_account_from_onelake_https_uri(self):
+        uri = "https://onelake.dfs.fabric.microsoft.com/workspace-id/lakehouse-id/Tables/orders"
+        assert _account_name(uri) == "onelake"
 
     @pytest.mark.parametrize("bad_uri", [
         "not-a-uri",
@@ -73,6 +78,25 @@ class TestStorageOpts:
         uri_b = "abfss://c@accountB.dfs.core.windows.net/p"
         assert _storage_opts(uri_a, "tok")["account_name"] == "accountA"
         assert _storage_opts(uri_b, "tok")["account_name"] == "accountB"
+
+
+class TestStorageUriParser:
+
+    def test_parses_abfss_uri(self):
+        assert _parse_abfss_uri("abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables") == (
+            "ws",
+            "onelake.dfs.fabric.microsoft.com",
+            "lh/Tables",
+        )
+
+    def test_parses_onelake_https_uri(self):
+        assert _parse_abfss_uri(
+            "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables"
+        ) == (
+            "ffb5e061-3824-486b-ab7c-aaef61221403",
+            "onelake.dfs.fabric.microsoft.com",
+            "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+        )
 
 
 class TestWriteDelta:
@@ -410,6 +434,59 @@ class TestValidateResidualPII:
             if start >= 0:
                 findings.append(SimpleNamespace(start=start, end=start + len(email), entity_type="EMAIL_ADDRESS"))
             return findings
+
+    def test_non_identifier_ner_residuals_do_not_abort(self):
+        class LocationAnalyzer:
+            def analyze(self, text, entities=None, language=None):
+                from types import SimpleNamespace
+                return [
+                    SimpleNamespace(start=0, end=len(text), entity_type="LOCATION"),
+                    SimpleNamespace(start=0, end=len(text), entity_type="PERSON"),
+                    SimpleNamespace(start=0, end=len(text), entity_type="ORGANIZATION"),
+                ]
+
+        df = pd.DataFrame({
+            "indicator_label": ["Luxembourg", "France", "Kayl"],
+            "commune": ["Luxembourg", "Kayl", "France"],
+            "notes": ["Luxembourg", "France", "Kayl"],
+        })
+
+        assert validate_residual_pii(df, LocationAnalyzer()) == 0
+
+    def test_structured_phone_false_positive_does_not_abort(self):
+        class PhoneAnalyzer:
+            def analyze(self, text, entities=None, language=None):
+                from types import SimpleNamespace
+                return [SimpleNamespace(start=0, end=len(text), entity_type="PHONE_NUMBER")]
+
+        df = pd.DataFrame({
+            "record_key": ["source_2024_001"],
+            "source_file": ["bronze_communes_2024.csv"],
+        })
+
+        assert validate_residual_pii(df, PhoneAnalyzer()) == 0
+
+    def test_direct_phone_residual_still_fails(self):
+        class PhoneAnalyzer:
+            def analyze(self, text, entities=None, language=None):
+                from types import SimpleNamespace
+                return [SimpleNamespace(start=0, end=len(text), entity_type="PHONE_NUMBER")]
+
+        df = pd.DataFrame({"phone": ["+352 621 123 456"]})
+
+        with pytest.raises(RuntimeError, match="phone.PHONE_NUMBER=1"):
+            validate_residual_pii(df, PhoneAnalyzer())
+
+    def test_direct_email_residual_still_fails(self):
+        class EmailAnalyzer:
+            def analyze(self, text, entities=None, language=None):
+                from types import SimpleNamespace
+                return [SimpleNamespace(start=0, end=len(text), entity_type="EMAIL_ADDRESS")]
+
+        df = pd.DataFrame({"source_file": ["alice@example.com.csv"], "email": ["bob@example.com"]})
+
+        with pytest.raises(RuntimeError, match="email.EMAIL_ADDRESS=1"):
+            validate_residual_pii(df, EmailAnalyzer())
 
     def test_generated_tokens_are_not_residual_pii(self):
         df = pd.DataFrame({"name": ["PERSON_0"], "email": ["EMAIL_ADDRESS_0"]})

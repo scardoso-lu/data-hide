@@ -30,7 +30,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - spacy_models:/app/models       # cache spaCy models between one-shot runs
     restart: "no"                     # one-shot batch job — do not auto-restart
 
 volumes:
   pg_data:
+  spacy_models:

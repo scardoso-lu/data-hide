@@ -26,7 +26,7 @@ SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/r
 TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
 RAW_TARGET = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/dbo/jaffle_raw_customers"
 
-BASE_SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables"
+BASE_SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse"
 BASE_TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized"
 
 REQUIRED_ENV = {
@@ -638,9 +638,115 @@ class TestDiscoverTableMappingsFiltering:
         mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
         )
+        assert len(result) == 1
+        assert result[0].table_name == "customers"
+
+    def test_onelake_https_base_uri_is_supported(self, mocker):
+        from app.repository import discover_table_mappings
+        mocker.patch("app.repository._fabric_item_display_name", return_value=None)
+        items = [self._make_path_item(mocker, "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers", True)]
+        fs_client = self._make_fs_client(
+            mocker,
+            items,
+            {"f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers/_delta_log"},
+        )
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+            "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/target-lakehouse-id/Files/anonymized",
+        )
+
+        assert len(result) == 1
+        assert result[0].source_uri == (
+            "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/"
+            "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers"
+        )
+        assert result[0].target_uri == (
+            "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/"
+            "target-lakehouse-id/Files/anonymized/customers"
+        )
+
+    def test_onelake_item_id_path_resolves_to_lakehouse_name(self, mocker):
+        from app.repository import discover_table_mappings
+        items = [self._make_path_item(mocker, "SourceLakehouse.Lakehouse/Tables/customers", True)]
+        fs_client = self._make_fs_client(
+            mocker,
+            items,
+            {"SourceLakehouse.Lakehouse/Tables/customers/_delta_log"},
+        )
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.repository._fabric_item_display_name", return_value="SourceLakehouse")
+
+        result = discover_table_mappings(
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Files/anonymized",
+        )
+
+        fs_client.get_paths.assert_called_once_with(
+            path="SourceLakehouse.Lakehouse/Tables",
+            recursive=False,
+        )
+        assert len(result) == 1
+        assert result[0].source_uri == (
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/"
+            "SourceLakehouse.Lakehouse/Tables/customers"
+        )
+
+    def test_guid_workspace_keeps_guid_lakehouse_path(self, mocker):
+        from app.repository import discover_table_mappings
+        items = [self._make_path_item(mocker, "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers", True)]
+        fs_client = self._make_fs_client(
+            mocker,
+            items,
+            {"f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers/_delta_log"},
+        )
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        resolver = mocker.patch("app.repository._fabric_item_display_name", return_value="SourceLakehouse")
+
+        result = discover_table_mappings(
+            "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Files/anonymized",
+        )
+
+        resolver.assert_not_called()
+        fs_client.get_paths.assert_any_call(
+            path="f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+            recursive=False,
+        )
+        assert len(result) == 1
+
+    def test_recursive_delta_log_discovery_when_immediate_listing_has_no_tables(self, mocker):
+        from app.repository import discover_table_mappings
+        delta_log = self._make_path_item(mocker, "Lakehouse.Lakehouse/Tables/customers/_delta_log", True)
+        fs_client = self._make_fs_client(mocker, [], set())
+        fs_client.get_paths.side_effect = [
+            [],
+            [delta_log],
+        ]
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Lakehouse.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+        )
+
+        fs_client.get_paths.assert_any_call(path="Lakehouse.Lakehouse/Tables", recursive=True)
         assert len(result) == 1
         assert result[0].table_name == "customers"
 
@@ -658,7 +764,7 @@ class TestDiscoverTableMappingsFiltering:
         mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
         )
         assert len(result) == 1
@@ -677,7 +783,7 @@ class TestDiscoverTableMappingsFiltering:
         mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
         )
         assert len(result) == 1
@@ -702,7 +808,7 @@ class TestDiscoverTableMappingsFiltering:
         )
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",
@@ -725,7 +831,7 @@ class TestDiscoverTableMappingsFiltering:
         )
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",
@@ -744,7 +850,7 @@ class TestDiscoverTableMappingsFiltering:
         )
 
         result = discover_table_mappings(
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",

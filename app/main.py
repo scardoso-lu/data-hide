@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import sys
+from importlib import invalidate_caches
+from importlib.util import find_spec
 
+from . import repository as _repository
+from . import service as _service
+from .aggregation import aggregate_gps_table, detect_speed_column
 from .anonymization import (
+    SPACY_MODELS,
     EntityRegistry,
     _anonymize_json,
     _anonymize_text,
@@ -14,7 +22,7 @@ from .anonymization import (
     anonymize_gps_columns,
     bin_numeric_columns,
     bin_timestamp_columns,
-    build_engines,
+    build_engines as _build_engines,
     enforce_k_anonymity,
     hash_identifier_columns,
     validate_residual_pii,
@@ -29,10 +37,10 @@ from .classification import (
     sanitize_column_names,
 )
 from .repository import (
-    DefaultAzureCredential,
-    DeltaTable,
     PIPELINE_VERSION,
     AuditDB,
+    DefaultAzureCredential,
+    DeltaTable,
     PurviewClient,
     TableMapping,
     _account_name,
@@ -46,9 +54,6 @@ from .repository import (
     write_delta,
     write_deltalake,
 )
-from .aggregation import aggregate_gps_table, detect_speed_column
-from . import repository as _repository
-from . import service as _service
 from .service import PipelineConfig, record_alert, resolve_table_mappings, run_pipeline, run_table
 
 psycopg2 = _repository.psycopg2
@@ -59,6 +64,49 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+
+logger = logging.getLogger(__name__)
+
+_MODELS_DIR = os.environ.get("SPACY_MODELS_DIR")
+
+
+def _ensure_spacy_models() -> None:
+    models_dir = os.path.abspath(_MODELS_DIR or "models")
+    os.makedirs(models_dir, exist_ok=True)
+    if models_dir not in sys.path:
+        sys.path.insert(0, models_dir)
+
+    for model in set(SPACY_MODELS.values()):
+        if find_spec(model) is None:
+            logger.info("Downloading spaCy model %s -> %s", model, models_dir)
+            _download_spacy_model(model, models_dir)
+            invalidate_caches()
+        else:
+            logger.info("Using cached spaCy model %s from %s", model, models_dir)
+
+        if find_spec(model) is None:
+            raise RuntimeError(f"spaCy model {model} was downloaded but is not importable from {models_dir}")
+
+
+def _download_spacy_model(model: str, models_dir: str) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "spacy",
+            "download",
+            model,
+            "--target",
+            models_dir,
+            "--no-cache-dir",
+        ],
+        check=True,
+    )
+
+
+def build_engines():
+    _ensure_spacy_models()
+    return _build_engines()
 
 
 def main() -> None:

@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 # Disable .pyc bytecode; keep stdout/stderr unbuffered for live log streaming
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    SPACY_MODELS_DIR=/app/models
 
 WORKDIR /app
 
@@ -32,22 +33,12 @@ https://packages.microsoft.com/debian/12/prod bookworm main" \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── spaCy models (baked in at build time; no network needed at runtime) ────────
-# en_core_web_lg — English
-# fr_core_news_lg — French
-# de_core_news_lg — German and Luxembourgish (no dedicated lb model exists)
-RUN python -m spacy download en_core_web_lg \
-    && python -m spacy download fr_core_news_lg \
-    && python -m spacy download de_core_news_lg \
-    && pip cache purge
-
 # ── Application code ──────────────────────────────────────────────────────────
 COPY app ./app
 
 # ── Non-root user (uid/gid 1001) ──────────────────────────────────────────────
-# Created after pip/spaCy steps so package installation still runs as root and
-# the installed files remain world-readable (755 dirs / 644 files).
-# The container writes nothing to disk at runtime — no volume is needed.
+# /app/models is writable by appuser so spaCy models can be downloaded at
+# first startup and reused across runs via a mounted volume.
 RUN groupadd --gid 1001 appgroup \
     && useradd \
         --uid 1001 \
@@ -55,7 +46,9 @@ RUN groupadd --gid 1001 appgroup \
         --no-create-home \
         --no-log-init \
         --shell /bin/sh \
-        appuser
+        appuser \
+    && mkdir -p /app/models \
+    && chown appuser:appgroup /app/models
 
 USER appuser
 

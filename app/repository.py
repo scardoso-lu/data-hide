@@ -34,6 +34,7 @@ except ModuleNotFoundError:
 ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
 PURVIEW_TOKEN_SCOPE = "https://purview.azure.net/.default"
 SQL_TOKEN_SCOPE = "https://database.windows.net/.default"
+FABRIC_TOKEN_SCOPE = "https://api.fabric.microsoft.com/.default"
 PIPELINE_VERSION = "2.2.0"
 
 logger = logging.getLogger(__name__)
@@ -70,24 +71,131 @@ def acquire_token(scope: str) -> str:
     return token.token
 
 
-def _account_name(abfss_uri: str) -> str:
-    m = re.search(r"@([^.@/]+)\.", abfss_uri)
-    if not m:
+def _account_name(uri: str) -> str:
+    try:
+        _, host, _ = _parse_abfss_uri(uri)
+    except ValueError:
         raise ValueError(
-            f"Cannot parse account name from URI: '{abfss_uri}'. "
-            "Expected: abfss://container@account.dfs.fabric.microsoft.com/..."
-        )
-    return m.group(1)
+            f"Cannot parse account name from URI: '{uri}'. "
+            "Expected: abfss://container@account.dfs.fabric.microsoft.com/... "
+            "or https://account.dfs.fabric.microsoft.com/container/..."
+        ) from None
+    return host.split(".", 1)[0]
 
 
-def _parse_abfss_uri(abfss_uri: str) -> tuple[str, str, str]:
-    m = re.match(r"^abfss://([^@/]+)@([^/]+)/(.+)$", abfss_uri)
-    if not m:
+def _parse_abfss_uri(uri: str) -> tuple[str, str, str]:
+    abfss_match = re.match(r"^abfss://([^@/]+)@([^/]+)(?:/(.*))?$", uri)
+    if abfss_match:
+        return abfss_match.group(1), abfss_match.group(2), abfss_match.group(3) or ""
+
+    https_match = re.match(r"^https://([^/]+)/([^/]+)/(.+)$", uri)
+    if https_match:
+        return https_match.group(2), https_match.group(1), https_match.group(3)
+
+    if not abfss_match:
         raise ValueError(
-            f"Cannot parse ABFSS URI: '{abfss_uri}'. "
-            "Expected: abfss://filesystem@host/path"
+            f"Cannot parse storage URI: '{uri}'. "
+            "Expected: abfss://filesystem@host/path or https://host/filesystem/path"
         )
-    return m.group(1), m.group(2), m.group(3)
+
+
+def _format_abfss_uri(filesystem: str, host: str, path: str) -> str:
+    return f"abfss://{filesystem}@{host}/{path.strip('/')}"
+
+
+def _looks_like_uuid(value: str) -> bool:
+    return bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    ))
+
+
+def _fabric_item_display_name(workspace_id: str, item_id: str) -> str | None:
+    token = acquire_token(FABRIC_TOKEN_SCOPE)
+    response = requests.get(
+        f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items/{item_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    display_name = response.json().get("displayName")
+    return display_name if isinstance(display_name, str) and display_name else None
+
+
+def _resolve_onelake_item_id_path(filesystem: str, host: str, path: str) -> str:
+    if host.lower() != "onelake.dfs.fabric.microsoft.com":
+        return path
+
+    parts = path.strip("/").split("/", 1)
+    if not parts or not _looks_like_uuid(parts[0]):
+        return path
+
+    # OneLake requires workspace and artifact identifiers to use the same mode:
+    # GUID+GUID or friendly-name+friendly-name.  Do not rewrite a GUID workspace
+    # path to a friendly lakehouse name, because OneLake rejects that mix with
+    # FriendlyNameSupportDisabled.
+    if _looks_like_uuid(filesystem):
+        return path
+
+    item_id = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    try:
+        display_name = _fabric_item_display_name(filesystem, item_id)
+    except Exception as exc:
+        logger.warning("Could not resolve Fabric item id '%s' in workspace '%s': %s", item_id, filesystem, exc)
+        return path
+
+    if not display_name:
+        return path
+
+    item_path = display_name if display_name.endswith(".Lakehouse") else f"{display_name}.Lakehouse"
+    return f"{item_path}/{rest}" if rest else item_path
+
+
+def _mapping_for_delta_path(filesystem: str, host: str, table_path: str, target_base: str) -> TableMapping:
+    table_path = table_path.rstrip("/")
+    table_name = table_path.rsplit("/", 1)[-1]
+    return TableMapping(
+        source_uri=_format_abfss_uri(filesystem, host, table_path),
+        target_uri=f"{target_base}/{table_name}",
+        table_name=table_name,
+    )
+
+
+def _discover_delta_mappings(fs_client, filesystem: str, host: str, base_path: str, target_base: str) -> list[TableMapping]:
+    mappings: list[TableMapping] = []
+    seen_paths: set[str] = set()
+
+    immediate_items = list(fs_client.get_paths(path=base_path, recursive=False))
+    logger.info("Listed %d immediate path(s) under %s", len(immediate_items), base_path)
+    for item in immediate_items:
+        if not item.is_directory:
+            continue
+        item_path = item.name.rstrip("/")
+        delta_log_path = f"{item_path}/_delta_log"
+        if not fs_client.get_directory_client(delta_log_path).exists():
+            logger.debug("Skipping %s - no _delta_log found", item.name)
+            continue
+        seen_paths.add(item_path)
+        mappings.append(_mapping_for_delta_path(filesystem, host, item_path, target_base))
+
+    if mappings:
+        return mappings
+
+    logger.info("No immediate Delta tables found under %s; scanning recursively for _delta_log", base_path)
+    for item in fs_client.get_paths(path=base_path, recursive=True):
+        if not item.is_directory:
+            continue
+        item_path = item.name.rstrip("/")
+        if not item_path.endswith("/_delta_log"):
+            continue
+        table_path = item_path[: -len("/_delta_log")]
+        if table_path in seen_paths:
+            continue
+        seen_paths.add(table_path)
+        mappings.append(_mapping_for_delta_path(filesystem, host, table_path, target_base))
+
+    return mappings
 
 
 def _parquet_file_path(uri_path: str) -> str:
@@ -197,8 +305,11 @@ def discover_table_mappings(source_base_uri: str, target_base_uri: str, *, sql_e
         DataLakeServiceClient = _DataLakeServiceClient
 
     filesystem, host, base_path = _parse_abfss_uri(source_base_uri)
+    base_path = _resolve_onelake_item_id_path(filesystem, host, base_path)
     base_path = base_path.rstrip("/")
-    target_base = target_base_uri.rstrip("/")
+    target_filesystem, target_host, target_path = _parse_abfss_uri(target_base_uri)
+    target_path = _resolve_onelake_item_id_path(target_filesystem, target_host, target_path)
+    target_base = _format_abfss_uri(target_filesystem, target_host, target_path).rstrip("/")
 
     service_client = DataLakeServiceClient(
         account_url=f"https://{host}",
@@ -206,21 +317,8 @@ def discover_table_mappings(source_base_uri: str, target_base_uri: str, *, sql_e
     )
     fs_client = service_client.get_file_system_client(file_system=filesystem)
 
-    mappings: list[TableMapping] = []
-    delta_table_names: set[str] = set()
-    for item in fs_client.get_paths(path=base_path, recursive=False):
-        if not item.is_directory:
-            continue
-        delta_log_path = f"{item.name.rstrip('/')}/_delta_log"
-        if not fs_client.get_directory_client(delta_log_path).exists():
-            logger.debug("Skipping %s — no _delta_log found", item.name)
-            continue
-        table_name = item.name.rstrip("/").rsplit("/", 1)[-1]
-        source_uri = f"abfss://{filesystem}@{host}/{item.name.rstrip('/')}"
-        target_uri = f"{target_base}/{table_name}"
-        mappings.append(TableMapping(source_uri=source_uri, target_uri=target_uri, table_name=table_name))
-        delta_table_names.add(table_name)
-
+    mappings = _discover_delta_mappings(fs_client, filesystem, host, base_path, target_base)
+    delta_table_names = {mapping.table_name for mapping in mappings}
     logger.info("Discovered %d Delta table(s) under %s", len(mappings), source_base_uri)
 
     if sql_endpoint and sql_database:
@@ -366,7 +464,6 @@ CREATE TABLE IF NOT EXISTS pii_pipeline_alerts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
-
 
 class AuditDB:
     def __init__(self, dsn: str) -> None:

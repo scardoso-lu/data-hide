@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -22,8 +23,49 @@ SPACY_MODELS: dict[str, str] = {
     "lb": "de_core_news_lg",
 }
 SUPPORTED_LANGUAGES: list[str] = list(SPACY_MODELS.keys())
-GDPR_ENTITIES: list[str] | None = None
+GDPR_ENTITIES: list[str] | None = [
+    "PERSON",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "IP_ADDRESS",
+    "URL",
+    "CRYPTO",
+]
 logger = logging.getLogger(__name__)
+SPACY_TO_PRESIDIO_ENTITY_MAPPING = {
+    "PERSON": "PERSON",
+    "PER": "PERSON",
+    "ORG": "ORGANIZATION",
+    "GPE": "LOCATION",
+    "LOC": "LOCATION",
+    "FAC": "LOCATION",
+    "DATE": "DATE_TIME",
+    "TIME": "DATE_TIME",
+    "NORP": "NRP",
+}
+SPACY_LABELS_TO_IGNORE = [
+    "CARDINAL",
+    "ORDINAL",
+    "QUANTITY",
+    "PERCENT",
+    "MONEY",
+    "PRODUCT",
+    "EVENT",
+    "WORK_OF_ART",
+    "LAW",
+    "LANGUAGE",
+]
+RESIDUAL_BLOCKING_ENTITIES = {
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "IP_ADDRESS",
+    "URL",
+    "CRYPTO",
+}
 PSEUDONYM_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]*_\d+\b")
 
 
@@ -42,14 +84,80 @@ def _analyze(text: str, analyzer: Any):
 
 
 def build_engines() -> Any:
-    from presidio_analyzer import AnalyzerEngine
+    from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
     from presidio_analyzer.nlp_engine import NlpEngineProvider
+    from presidio_analyzer.recognizer_registry.recognizers_loader_utils import (
+        RecognizerConfigurationLoader,
+        RecognizerListLoader,
+    )
 
     provider = NlpEngineProvider(nlp_configuration={
         "nlp_engine_name": "spacy",
         "models": [{"lang_code": lang, "model_name": model} for lang, model in SPACY_MODELS.items()],
+        "ner_model_configuration": {
+            "model_to_presidio_entity_mapping": SPACY_TO_PRESIDIO_ENTITY_MAPPING,
+            "labels_to_ignore": SPACY_LABELS_TO_IGNORE,
+        },
     })
-    return AnalyzerEngine(nlp_engine=provider.create_engine(), supported_languages=SUPPORTED_LANGUAGES)
+    nlp_engine = provider.create_engine()
+    registry = _build_recognizer_registry(nlp_engine, RecognizerConfigurationLoader, RecognizerListLoader, RecognizerRegistry)
+    return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=SUPPORTED_LANGUAGES)
+
+
+def _build_recognizer_registry(
+    nlp_engine: Any,
+    configuration_loader: Any,
+    list_loader: Any,
+    registry_cls: Any,
+) -> Any:
+    config = _filter_recognizer_config(configuration_loader.get(), SUPPORTED_LANGUAGES)
+    recognizers = list_loader.get(
+        config["recognizers"],
+        config["supported_languages"],
+        config["global_regex_flags"],
+    )
+    registry = registry_cls(
+        recognizers=recognizers,
+        supported_languages=config["supported_languages"],
+        global_regex_flags=config["global_regex_flags"],
+    )
+    registry.add_nlp_recognizer(nlp_engine=nlp_engine)
+    return registry
+
+
+def _filter_recognizer_config(config: dict, supported_languages: list[str]) -> dict:
+    filtered = copy.deepcopy(config)
+    filtered["supported_languages"] = supported_languages
+    recognizers = []
+
+    for recognizer in filtered.get("recognizers", []):
+        languages = recognizer.get("supported_languages") if isinstance(recognizer, dict) else None
+        if not languages:
+            recognizers.append(recognizer)
+            continue
+
+        kept_languages = [
+            language
+            for language in languages
+            if _recognizer_language_code(language) in supported_languages
+        ]
+        if not kept_languages:
+            continue
+
+        recognizer["supported_languages"] = kept_languages
+        recognizers.append(recognizer)
+
+    filtered["recognizers"] = recognizers
+    return filtered
+
+
+def _recognizer_language_code(language: object) -> str | None:
+    if isinstance(language, str):
+        return language
+    if isinstance(language, dict):
+        value = language.get("language")
+        return value if isinstance(value, str) else None
+    return None
 
 
 class EntityRegistry:
@@ -227,7 +335,7 @@ def _scan_json_for_residuals(obj: object, analyzer: Any, column: str, path: str)
             results.extend(_scan_json_for_residuals(item, analyzer, column, f"{path}[{index}]"))
         return results
     if isinstance(obj, str):
-        return _summarize_findings(column, path, _residual_findings(obj, analyzer))
+        return _summarize_findings(column, path, obj, _residual_findings(obj, analyzer))
     return []
 
 
@@ -236,14 +344,30 @@ def _looks_like_json(s: str) -> bool:
     return bool(ch) and ch[0] in ("{", "[")
 
 
-def _summarize_findings(column: str, path: str | None, findings: list) -> list[dict]:
+def _summarize_findings(column: str, path: str | None, text: str, findings: list) -> list[dict]:
     counts: dict[str, int] = {}
     for finding in findings:
+        if not _is_blocking_residual(text, finding):
+            continue
         counts[finding.entity_type] = counts.get(finding.entity_type, 0) + 1
     return [
         {"column": column, "path": path, "entity_type": entity_type, "count": count}
         for entity_type, count in counts.items()
     ]
+
+
+def _is_plausible_phone_residual(text: str, finding: Any) -> bool:
+    value = text[finding.start:finding.end]
+    digits = re.sub(r"\D", "", value)
+    return len(digits) >= 7 and not re.search(r"[A-Za-z]", value)
+
+
+def _is_blocking_residual(text: str, finding: Any) -> bool:
+    if finding.entity_type not in RESIDUAL_BLOCKING_ENTITIES:
+        return False
+    if finding.entity_type == "PHONE_NUMBER":
+        return _is_plausible_phone_residual(text, finding)
+    return True
 
 
 def residual_pii_findings(df: pd.DataFrame, analyzer: Any) -> list[dict]:
@@ -263,7 +387,7 @@ def residual_pii_findings(df: pd.DataFrame, analyzer: Any) -> list[dict]:
                             continue
                     except (json.JSONDecodeError, ValueError):
                         pass
-                findings.extend(_summarize_findings(col, None, _residual_findings(val, analyzer)))
+                findings.extend(_summarize_findings(col, None, val, _residual_findings(val, analyzer)))
     return findings
 
 
