@@ -8,17 +8,22 @@ import logging
 import os
 import uuid
 
+from .aggregation import aggregate_gps_table, detect_speed_column
 from .anonymization import (
     EntityRegistry,
     anonymize_dataframe,
+    anonymize_gps_columns,
+    bin_timestamp_columns,
     build_engines,
     enforce_k_anonymity,
     hash_identifier_columns,
     validate_residual_pii,
 )
 from .classification import (
+    detect_gps_columns,
     detect_identifier_columns,
     detect_quasi_identifiers,
+    detect_timestamp_columns,
     flag_free_text_columns,
     sanitize_column_names,
 )
@@ -49,6 +54,7 @@ class PipelineConfig:
     target_base_uri: str | None = None
     sql_endpoint: str | None = None
     sql_database: str | None = None
+    gps_precision: int = 1
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -63,6 +69,7 @@ class PipelineConfig:
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
             sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
             sql_database=os.environ.get("SQL_DATABASE"),
+            gps_precision=int(os.environ.get("GPS_PRECISION", "2")),
         )
 
 
@@ -110,6 +117,10 @@ def _new_audit(config: PipelineConfig) -> dict:
         "suppressed_rows": 0,
         "residual_pii_count": 0,
         "column_renames": {},
+        "gps_columns_anonymized": [],
+        "timestamp_columns_binned": [],
+        "output_type": "anonymized_rows",
+        "aggregate_cells": 0,
         "hashed_columns": [],
         "purview_available": False,
         "purview_flagged_columns": [],
@@ -159,6 +170,26 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         df_raw, col_renames = sanitize_column_names(df_raw)
         audit["column_renames"] = col_renames
 
+        gps_anonymized: list[str] = []
+        gps_cols = detect_gps_columns(df_raw)
+        if gps_cols:
+            df_raw, gps_anonymized = anonymize_gps_columns(df_raw, gps_cols, config.gps_precision)
+            audit["gps_columns_anonymized"] = gps_anonymized
+
+        # Detect whether this is a GPS trajectory table (GPS + speed + timestamp).
+        # Trajectory tables follow a separate aggregation path — addresses are
+        # NLP-anonymized first, then individual rows are collapsed into spatial-
+        # temporal statistics safe for external LLM consumption.
+        ts_cols: list[str] = detect_timestamp_columns(df_raw) if gps_anonymized else []
+        speed_col: str | None = detect_speed_column(df_raw) if gps_anonymized else None
+        is_trajectory = bool(gps_anonymized) and speed_col is not None and bool(ts_cols)
+
+        # Non-trajectory GPS: floor timestamps to day for row-level k-anonymity.
+        ts_binned: list[str] = []
+        if not is_trajectory and gps_anonymized and ts_cols:
+            df_raw, ts_binned = bin_timestamp_columns(df_raw, ts_cols)
+            audit["timestamp_columns_binned"] = ts_binned
+
         id_cols = detect_identifier_columns(df_raw, list(config.identifier_cols))
         df_raw, hashed = hash_identifier_columns(df_raw, id_cols, config.hash_salt)
         audit["hashed_columns"] = hashed
@@ -171,12 +202,16 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         audit["purview_flagged_columns"] = pv["flagged_columns"]
         audit["purview_discrepancies"] = pv["discrepancies"]
 
-        qi_cols = detect_quasi_identifiers(df_raw, list(config.quasi_identifier_cols))
-        audit["quasi_columns"] = qi_cols
-        if qi_cols:
-            df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
-            audit["suppressed_rows"] = k_info["suppressed_rows"]
+        if not is_trajectory:
+            qi_cols = detect_quasi_identifiers(df_raw, list(config.quasi_identifier_cols))
+            qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
+            audit["quasi_columns"] = qi_cols
+            if qi_cols:
+                df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
+                audit["suppressed_rows"] = k_info["suppressed_rows"]
 
+        # NLP anonymization: always run so address columns are cleaned before
+        # either row-level output or trajectory aggregation drops them.
         analyzer = build_engines()
         registry = EntityRegistry()
         df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry)
@@ -192,7 +227,20 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             except Exception as exc:
                 logger.warning("Audit record_columns failed (non-fatal): %s", exc)
 
-        audit["residual_pii_count"] = validate_residual_pii(df_clean, analyzer)
+        if is_trajectory:
+            # Collapse individual pings into (cell × hour × day_of_week) statistics.
+            # Addresses are already NLP-anonymized above and are dropped by grouping.
+            # Cells with fewer than k pings are suppressed — no residual PII check
+            # needed since the aggregate contains only numeric and day-name columns.
+            df_clean, agg_stats = aggregate_gps_table(
+                df_clean, gps_anonymized, speed_col, ts_cols[0], config.k_anonymity_min,
+            )
+            audit["output_type"] = "gps_aggregate"
+            audit["aggregate_cells"] = agg_stats["cells_retained"]
+            audit["suppressed_rows"] = agg_stats["pings_suppressed"]
+        else:
+            audit["residual_pii_count"] = validate_residual_pii(df_clean, analyzer)
+
         write_delta(df_clean, mapping.target_uri, _fresh_opts(mapping.target_uri))
 
         audit["pipeline_end_ts"] = datetime.now(timezone.utc).isoformat()

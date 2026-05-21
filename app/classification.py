@@ -15,6 +15,18 @@ SENSITIVE = "SENSITIVE"
 FREE_TEXT = "FREE_TEXT"
 QUASI_IDENTIFIER = "QUASI_IDENTIFIER"
 
+_GPS_NAME_TOKENS = frozenset({
+    "lat", "latitude", "lon", "lng", "longitude",
+    "gps", "coord", "coords", "coordinate", "coordinates",
+    "geom", "geometry", "wkt", "point",
+})
+_WKT_POINT_RE = re.compile(r"POINT\s*\(", re.IGNORECASE)
+
+_TIMESTAMP_NAME_TOKENS = frozenset({
+    "time", "timestamp", "datetime", "date", "at",
+    "created", "updated", "recorded", "captured", "ts", "dt", "occurred",
+})
+
 
 def _is_text_column(dtype) -> bool:
     return pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype)
@@ -152,6 +164,73 @@ def detect_identifier_columns(df: pd.DataFrame, explicit_cols: list[str] | None 
     if explicit_cols:
         return [c for c in explicit_cols if c in df.columns]
     return columns_by_category(df, IDENTIFIER)
+
+
+def detect_gps_columns(df: pd.DataFrame) -> list[str]:
+    """Return column names that contain GPS coordinates (numeric lat/lon or WKT POINT strings).
+
+    A numeric column qualifies when its name contains a GPS keyword and all
+    non-null values fall within [-180, 180].  A string column qualifies when
+    ≥80 % of its non-null sample values match the WKT POINT(…) pattern.
+    """
+    result: list[str] = []
+    for col in df.columns:
+        series = df[col]
+        tokens = set(_tokens(str(col)))
+        if _is_numeric_gps_column(series, tokens) or _is_wkt_gps_column(series):
+            result.append(col)
+    return result
+
+
+def _is_numeric_gps_column(series: pd.Series, tokens: set[str]) -> bool:
+    if not pd.api.types.is_numeric_dtype(series.dtype):
+        return False
+    if not (tokens & _GPS_NAME_TOKENS):
+        return False
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    return bool(non_null.between(-180, 180).all())
+
+
+def detect_timestamp_columns(df: pd.DataFrame) -> list[str]:
+    """Return column names that contain timestamps or dates.
+
+    A datetime64 column always qualifies.  A string/object column qualifies
+    when its name contains a timestamp keyword and ≥80 % of the non-null
+    sample parses as a datetime.
+    """
+    result: list[str] = []
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_datetime64_any_dtype(series.dtype):
+            result.append(col)
+            continue
+        if not _is_text_column(series.dtype):
+            continue
+        tokens = set(_tokens(str(col)))
+        if not (tokens & _TIMESTAMP_NAME_TOKENS):
+            continue
+        sample = series.dropna().head(20)
+        if sample.empty:
+            continue
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce")
+            if parsed.notna().mean() >= 0.8:
+                result.append(col)
+        except Exception:
+            pass
+    return result
+
+
+def _is_wkt_gps_column(series: pd.Series) -> bool:
+    if not _is_text_column(series.dtype):
+        return False
+    sample = [v for v in series.dropna().head(20).tolist() if isinstance(v, str)]
+    if not sample:
+        return False
+    matches = sum(1 for v in sample if _WKT_POINT_RE.match(v.strip()))
+    return matches / len(sample) >= 0.8
 
 
 def sanitize_column_names(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:

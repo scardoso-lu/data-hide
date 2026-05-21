@@ -278,6 +278,57 @@ def _merge_residual_summaries(findings: list[dict]) -> list[dict]:
     ]
 
 
+def _round_wkt(wkt: str, precision: int) -> str:
+    """Round all decimal numbers embedded in a WKT geometry string."""
+    return re.sub(r"-?\d+\.\d+", lambda m: str(round(float(m.group()), precision)), wkt)
+
+
+def anonymize_gps_columns(df: pd.DataFrame, gps_cols: list[str], precision: int = 2) -> tuple[pd.DataFrame, list[str]]:
+    """Reduce spatial precision of GPS columns by rounding to `precision` decimal places.
+
+    Numeric columns (lat/lon floats) are rounded directly.
+    String columns containing WKT POINT geometries have their embedded
+    coordinate values rounded.  Null values are preserved unchanged.
+    """
+    if not gps_cols:
+        return df, []
+    df = df.copy()
+    anonymized: list[str] = []
+    for col in gps_cols:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            df[col] = series.round(precision)
+        else:
+            df[col] = series.map(lambda v, p=precision: _round_wkt(v, p) if isinstance(v, str) else v)
+        anonymized.append(col)
+    return df, anonymized
+
+
+def bin_timestamp_columns(df: pd.DataFrame, ts_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    """Floor timestamp columns to daily granularity (temporal generalisation).
+
+    Sub-day precision combined with rounded GPS coordinates is near-unique per
+    person in a city.  Flooring to midnight removes the time-of-day signal
+    while preserving the date for analytics.  Null values are preserved.
+    Only columns with an actual datetime64 dtype are processed; ambiguous
+    string timestamps are left untouched to avoid silent format changes.
+    """
+    if not ts_cols:
+        return df, []
+    df = df.copy()
+    binned: list[str] = []
+    for col in ts_cols:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if pd.api.types.is_datetime64_any_dtype(series.dtype):
+            df[col] = series.dt.floor("D")
+            binned.append(col)
+    return df, binned
+
+
 def validate_residual_pii(df: pd.DataFrame, analyzer: Any) -> int:
     residuals = _merge_residual_summaries(residual_pii_findings(df, analyzer))
     total = sum(item["count"] for item in residuals)
