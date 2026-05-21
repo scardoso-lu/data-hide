@@ -11,12 +11,14 @@ import uuid
 from .anonymization import (
     EntityRegistry,
     anonymize_dataframe,
+    anonymize_gps_columns,
     build_engines,
     enforce_k_anonymity,
     hash_identifier_columns,
     validate_residual_pii,
 )
 from .classification import (
+    detect_gps_columns,
     detect_identifier_columns,
     detect_quasi_identifiers,
     flag_free_text_columns,
@@ -49,6 +51,7 @@ class PipelineConfig:
     target_base_uri: str | None = None
     sql_endpoint: str | None = None
     sql_database: str | None = None
+    gps_precision: int = 2
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -63,6 +66,7 @@ class PipelineConfig:
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
             sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
             sql_database=os.environ.get("SQL_DATABASE"),
+            gps_precision=int(os.environ.get("GPS_PRECISION", "2")),
         )
 
 
@@ -110,6 +114,7 @@ def _new_audit(config: PipelineConfig) -> dict:
         "suppressed_rows": 0,
         "residual_pii_count": 0,
         "column_renames": {},
+        "gps_columns_anonymized": [],
         "hashed_columns": [],
         "purview_available": False,
         "purview_flagged_columns": [],
@@ -158,6 +163,11 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
         df_raw, col_renames = sanitize_column_names(df_raw)
         audit["column_renames"] = col_renames
+
+        gps_cols = detect_gps_columns(df_raw)
+        if gps_cols:
+            df_raw, gps_anonymized = anonymize_gps_columns(df_raw, gps_cols, config.gps_precision)
+            audit["gps_columns_anonymized"] = gps_anonymized
 
         id_cols = detect_identifier_columns(df_raw, list(config.identifier_cols))
         df_raw, hashed = hash_identifier_columns(df_raw, id_cols, config.hash_salt)

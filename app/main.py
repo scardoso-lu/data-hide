@@ -11,6 +11,7 @@ from .anonymization import (
     _anonymize_text,
     _scan_json_for_pii,
     anonymize_dataframe,
+    anonymize_gps_columns,
     build_engines,
     enforce_k_anonymity,
     hash_identifier_columns,
@@ -18,6 +19,7 @@ from .anonymization import (
 )
 from .classification import (
     classify_columns,
+    detect_gps_columns,
     detect_identifier_columns,
     detect_quasi_identifiers,
     flag_free_text_columns,
@@ -71,6 +73,8 @@ def main() -> None:
     _service.sanitize_column_names = sanitize_column_names
     _service.flag_free_text_columns = flag_free_text_columns
     _service.detect_quasi_identifiers = detect_quasi_identifiers
+    _service.detect_gps_columns = detect_gps_columns
+    _service.anonymize_gps_columns = anonymize_gps_columns
     _service.detect_identifier_columns = detect_identifier_columns
     _service.hash_identifier_columns = hash_identifier_columns
     _service.enforce_k_anonymity = enforce_k_anonymity

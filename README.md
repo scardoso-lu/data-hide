@@ -46,6 +46,7 @@ Each GDPR obligation is traced to the file and function that implements it.
 | Art. 4(1) — Personal data | Identify and protect all natural-person identifiers | NLP entity detection across text columns | `app/anonymization.py` | `_analyze()` |
 | Art. 5(1)(b) — Purpose limitation | Write anonymized data to a separate target; never overwrite source | Source ≠ target URI guard before any write | `app/service.py` | `run_table()` |
 | Art. 5(1)(c) — Data minimisation | Remove direct identifiers | Auto-detect and SHA-256 hash identifier columns | `app/classification.py` · `app/anonymization.py` | `detect_identifier_columns()` · `hash_identifier_columns()` |
+| Art. 5(1)(c) — Data minimisation | Reduce GPS precision | Round lat/lon coordinates to N decimal places (default 2 d.p. ≈ 1 km) | `app/classification.py` · `app/anonymization.py` | `detect_gps_columns()` · `anonymize_gps_columns()` |
 | Art. 5(1)(c) — Data minimisation | Suppress rare quasi-identifier combinations | k-anonymity: groups smaller than `K_ANONYMITY_MIN` are dropped | `app/anonymization.py` | `enforce_k_anonymity()` |
 | Art. 5(1)(d) — Accuracy | Guarantee no residual PII in output | Scan every text cell after anonymization; abort if anything remains | `app/anonymization.py` | `validate_residual_pii()` |
 | Art. 5(1)(f) — Integrity & confidentiality | Cryptographically protect identifiers | Salted SHA-256 hash; salt stored only in env variable | `app/anonymization.py` | `hash_identifier_columns()` |
@@ -144,6 +145,7 @@ Edit `.env` with your values:
 | `HASH_SALT` | No | Salt mixed into SHA-256 identifier hashes |
 | `SQL_ENDPOINT_URL` | No | Fabric SQL Analytics Endpoint hostname — enables shortcut discovery |
 | `SQL_DATABASE` | No | Database name on the SQL endpoint (typically the Lakehouse name) |
+| `GPS_PRECISION` | No (default `2`) | Decimal places for spatial rounding of GPS columns (2 ≈ 1 km, 3 ≈ 110 m) |
 
 OneLake URI format:
 ```
