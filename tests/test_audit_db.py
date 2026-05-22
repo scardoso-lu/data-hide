@@ -38,6 +38,7 @@ SUCCESS_AUDIT = {
     "residual_pii_count":      0,
     "column_renames":          {},
     "hashed_columns":          ["employee_id"],
+    "key_vault_key_version":   "2025-05-22-resolved-version",
     "purview_available":       True,
     "purview_flagged_columns": ["email"],
     "purview_discrepancies":   [],
@@ -105,7 +106,7 @@ class TestSchemaInit:
         sqls = " ".join(c.args[0] for c in cur.execute.call_args_list)
         for col in ("unique_entities", "free_text_cols", "k_anonymity_k",
                     "quasi_columns", "suppressed_rows", "residual_pii",
-                    "column_renames", "hashed_columns"):
+                    "column_renames", "hashed_columns", "key_vault_key_version"):
             assert col in sqls, f"Expected column '{col}' in DDL"
 
 
@@ -364,6 +365,27 @@ class TestCloseRun:
         assert matching, "No JSON-encoded hashed_columns found in params"
         parsed = json.loads(matching[0])
         assert "employee_id" in parsed
+
+    def test_key_vault_key_version_in_params(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        assert "2025-05-22-resolved-version" in params
+
+    def test_key_vault_key_version_null_when_unset(self, mock_psycopg2):
+        """Tables with no identifier columns produce audit rows with NULL key version."""
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        audit_without_kv = {**SUCCESS_AUDIT, "key_vault_key_version": None}
+        db.close_run(RUN_ID, audit_without_kv)
+        _, params = cur.execute.call_args.args
+        # NULL must be passed as Python None so psycopg2 maps it to SQL NULL.
+        assert None in params
 
 
 # ─────────────────────────────────────────────────────────────────────────────

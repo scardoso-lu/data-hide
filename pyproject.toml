@@ -1,0 +1,61 @@
+[project]
+name = "fabric-pii-pipeline"
+version = "2.3.0"
+description = "Stateless Microsoft Fabric OneLake Delta table anonymization pipeline."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+# Runtime dependencies.
+#
+# Each entry has a floor (the minimum tested version) AND a ceiling
+# (the next major release).  The ceiling caps supply-chain exposure:
+# a compromised or breaking release uploaded to PyPI cannot be picked
+# up automatically by `uv sync`.  Bump an upper bound deliberately
+# after reviewing the upstream changelog, then re-run `uv lock`.
+dependencies = [
+    # Azure authentication
+    "azure-identity>=1.17.0,<2.0.0",
+    "azure-storage-file-datalake>=12.15.0,<13.0.0",
+
+    # Azure Key Vault — RSA-bound pseudonymization of identifier columns
+    "azure-keyvault-keys>=4.9.0,<5.0.0",
+
+    # Delta Lake (delta-rs, no PySpark required)
+    "deltalake>=0.18.0,<1.0.0",
+
+    # Data manipulation
+    "pandas>=2.1.0,<3.0.0",
+    "pyarrow>=15.0.0,<20.0.0",
+
+    # Microsoft Presidio — PII detection (anonymizer not needed; tokens applied inline)
+    "presidio-analyzer>=2.2.354,<3.0.0",
+
+    # spaCy NLP runtime (models downloaded separately by the pipeline at startup)
+    "spacy>=3.7.4,<4.0.0",
+
+    # Language detection — routes each text to the correct spaCy/Presidio model
+    "langdetect>=1.0.9,<2.0.0",
+
+    # PostgreSQL audit persistence (binary wheel — no libpq-dev needed)
+    "psycopg2-binary>=2.9.9,<3.0.0",
+
+    # SQL Analytics Endpoint reads (Fabric shortcuts via T-SQL)
+    "pyodbc>=5.0.0,<6.0.0",
+
+    # HTTP client — Purview catalog API + webhook alerts
+    "requests>=2.31.0,<3.0.0",
+]
+
+[dependency-groups]
+# Installed by `uv sync` (default) but excluded from production images
+# via `uv sync --no-dev` in the Dockerfile.
+dev = [
+    "pytest>=7.4.0,<9.0.0",
+    "pytest-mock>=3.12.0,<4.0.0",
+]
+
+[tool.uv]
+# This repository is an application, not a library.  `package = false`
+# tells uv not to attempt to build/install the source tree as a wheel
+# — uv only manages the virtual environment and dependency resolution.
+package = false

@@ -1,12 +1,65 @@
 import sys
 import types
+from types import SimpleNamespace
+
+import pytest
 
 from app.anonymization import (
     SPACY_LABELS_TO_IGNORE,
     SPACY_TO_PRESIDIO_ENTITY_MAPPING,
     SUPPORTED_LANGUAGES,
+    _resolve_overlapping_findings,
     build_engines,
 )
+
+
+def _f(entity_type: str, start: int, end: int, score: float = 1.0):
+    return SimpleNamespace(entity_type=entity_type, start=start, end=end, score=score)
+
+
+class TestResolveOverlappingFindings:
+    """Regression coverage for the Presidio EMAIL_ADDRESS / URL overlap.
+
+    Presidio's recognizers fire independently, so the same character range
+    can be returned twice with different entity types.  Without resolution
+    the inline-token substitution in ``_anonymize_text`` corrupts the output
+    (``URL_1ADDRESS_0`` for ``bob.smith@company.com``) and the returned
+    finding count is inflated.
+    """
+
+    def test_email_swallows_subspan_url(self):
+        # The shape that broke ``bob.smith@company.com``:
+        # EMAIL_ADDRESS covers the whole string; URL is a subspan starting
+        # at the same offset with a lower score.  Without resolution both
+        # would survive and the second substitution would corrupt the first.
+        findings = [_f("EMAIL_ADDRESS", 0, 21, 1.0), _f("URL", 0, 6, 0.5)]
+        kept = _resolve_overlapping_findings(findings)
+        assert [(k.entity_type, k.start, k.end) for k in kept] == [("EMAIL_ADDRESS", 0, 21)]
+
+    def test_non_overlapping_findings_all_kept(self):
+        findings = [_f("PERSON", 0, 5, 0.9), _f("EMAIL_ADDRESS", 10, 25, 1.0)]
+        kept = _resolve_overlapping_findings(findings)
+        assert len(kept) == 2
+
+    def test_adjacent_findings_are_not_overlapping(self):
+        # Touching at the boundary (end == next.start) must not be treated
+        # as overlap — both spans contribute distinct tokens.
+        findings = [_f("PERSON", 0, 10, 0.9), _f("EMAIL_ADDRESS", 10, 25, 1.0)]
+        kept = _resolve_overlapping_findings(findings)
+        assert len(kept) == 2
+
+    def test_broader_span_wins_when_same_start(self):
+        findings = [_f("URL", 0, 6, 0.5), _f("EMAIL_ADDRESS", 0, 21, 1.0)]
+        kept = _resolve_overlapping_findings(findings)
+        assert kept[0].entity_type == "EMAIL_ADDRESS"
+
+    def test_higher_score_wins_when_spans_equal(self):
+        findings = [_f("URL", 0, 21, 0.5), _f("EMAIL_ADDRESS", 0, 21, 1.0)]
+        kept = _resolve_overlapping_findings(findings)
+        assert kept[0].entity_type == "EMAIL_ADDRESS"
+
+    def test_empty_input_returns_empty(self):
+        assert _resolve_overlapping_findings([]) == []
 
 
 def test_build_engines_ignores_unmapped_cardinal_spacy_label(monkeypatch):

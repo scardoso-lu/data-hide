@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
-# Disable .pyc bytecode; keep stdout/stderr unbuffered for live log streaming
+# Disable .pyc bytecode; keep stdout/stderr unbuffered for live log streaming.
+# UV_LINK_MODE=copy avoids hardlink warnings when the cache and target dirs
+# live on different filesystems (common in Docker layered builds).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    SPACY_MODELS_DIR=/app/models
+    SPACY_MODELS_DIR=/app/models \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -29,9 +35,19 @@ https://packages.microsoft.com/debian/12/prod bookworm main" \
         unixodbc-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python dependencies (own layer — cached unless requirements.txt changes) ──
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ── uv binary ────────────────────────────────────────────────────────────────
+# Pulled from the official Astral image, verified by digest in the published
+# manifest.  Pinned to a major version to limit supply-chain exposure;
+# bump deliberately and re-run `uv lock` when upgrading.
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+
+# ── Python dependencies (own layer — cached unless lock files change) ─────────
+# --frozen     refuses to update uv.lock; fails the build if the lock is stale,
+#              guaranteeing the image matches what was committed and reviewed.
+# --no-dev     skips pytest etc., keeping the runtime image lean.
+# --no-install-project is defensive: pyproject sets `package = false` already.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ── Application code ──────────────────────────────────────────────────────────
 COPY app ./app

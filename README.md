@@ -12,7 +12,7 @@ flowchart TD
     A2["SQL Analytics Endpoint\n(SQL_ENDPOINT_URL · optional)"]
     B["Pandas DataFrame\nper discovered table"]
     C["Dynamic Column Classification\ndetect_identifier_columns\ndetect_quasi_identifiers\nflag_free_text_columns"]
-    D["Hash & k-Anonymity\nhash_identifier_columns\nenforce_k_anonymity"]
+    D["Pseudonymize & k-Anonymity\npseudonymize_identifier_columns (Key Vault RSA)\nenforce_k_anonymity"]
     E["Presidio + spaCy NLP\nanonymize_dataframe\n(EN · FR · DE · LB)"]
     F["Purview Sensitivity Check\nrun_purview_check\n(optional)"]
     G["Residual PII Validation\nvalidate_residual_pii"]
@@ -41,11 +41,11 @@ flowchart TD
 |---|---|---|
 | Art. 4(1) — Personal data | Identify and protect all natural-person identifiers | NLP entity detection across text columns |
 | Art. 5(1)(b) — Purpose limitation | Write anonymized data to a separate target; never overwrite source | Source ≠ target URI guard before any write |
-| Art. 5(1)(c) — Data minimisation | Remove direct identifiers | Auto-detect and SHA-256 hash identifier columns |
+| Art. 5(1)(c) — Data minimisation | Remove direct identifiers | Auto-detect identifier columns and replace with deterministic tokens derived from an RSA key in Azure Key Vault |
 | Art. 5(1)(c) — Data minimisation | Reduce GPS precision | Round lat/lon to N decimal places; floor co-located timestamps to day |
 | Art. 5(1)(c) — Data minimisation | Suppress rare quasi-identifier combinations | k-anonymity: groups smaller than `K_ANONYMITY_MIN` are dropped |
 | Art. 5(1)(d) — Accuracy | Guarantee no residual PII in output | Scan every text cell after anonymization; abort if anything remains |
-| Art. 5(1)(f) — Integrity & confidentiality | Cryptographically protect identifiers | Salted SHA-256 hash; salt stored only in env variable |
+| Art. 5(1)(f) — Integrity & confidentiality | Cryptographically protect identifiers | HSM-bound key derivation: an RSA key in Azure Key Vault signs a fixed constant once per run; the resulting secret stays in process memory and drives HMAC-SHA256 pseudonymization |
 | Art. 25 — Data protection by design | Pseudonymise by default | Replace PII spans with stable tokens (`PERSON_0`, `EMAIL_ADDRESS_1`, …) |
 | Art. 30 — Records of processing activities | Log every processing activity | One PostgreSQL row per run and per column with entity counts |
 | Art. 32 — Security of processing | Appropriate technical and organisational measures | Non-root container, no runtime file writes, ABFSS TLS, salted hashes |
@@ -75,9 +75,12 @@ Non-trajectory GPS tables (no speed column) have coordinates rounded to `GPS_PRE
 
 | Tool | Version |
 |---|---|
+| [uv](https://docs.astral.sh/uv/) | 0.5+ (for local development) |
 | Docker + Docker Compose | 24+ |
 | Azure Service Principal or Managed Identity | — |
 | PostgreSQL | 14+ (provided by Compose for local runs) |
+
+uv manages the virtualenv, the Python version (read from `.python-version`), and the dependency graph (resolved into the committed `uv.lock`). Install it via `winget install --id=astral-sh.uv`, `brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
 The Service Principal needs:
 
@@ -103,7 +106,8 @@ Edit `.env` with your values:
 | `SOURCE_BASE_ABFSS_URI` | Yes | Base path of raw Delta tables to anonymize |
 | `TARGET_BASE_ABFSS_URI` | Yes | Base path where anonymized output is written |
 | `K_ANONYMITY_MIN` | No (default `5`) | Minimum group size for quasi-identifier suppression |
-| `HASH_SALT` | No | Salt mixed into SHA-256 identifier hashes |
+| `KEY_VAULT_URL` | If identifier columns exist | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
+| `KEY_VAULT_RSA_KEY_NAME` | If identifier columns exist | RSA key name used to derive pseudonyms; the latest enabled version is always used and never leaves the HSM |
 | `GPS_PRECISION` | No (default `1`) | Decimal places for GPS rounding (1 ≈ 11 km) |
 | `SQL_ENDPOINT_URL` | No | Fabric SQL Analytics Endpoint — enables shortcut discovery |
 | `SQL_DATABASE` | No | Database name on the SQL endpoint |
@@ -132,3 +136,16 @@ docker run --rm \
   -e DATABASE_URL="postgresql://user:pass@your-pg-host:5432/pii_audit" \
   fabric-pii-pipeline:latest
 ```
+
+### 4 — Local development
+
+```bash
+uv sync                                       # create .venv from uv.lock
+uv run python -m spacy download en_core_web_lg
+uv run python -m spacy download fr_core_news_lg
+uv run python -m spacy download de_core_news_lg
+uv run pytest                                 # full test suite
+uv run pytest -m "not requires_spacy"         # skip spaCy-dependent tests
+```
+
+`uv sync` recreates `.venv` deterministically from `uv.lock`. When you change a dependency in `pyproject.toml`, run `uv lock` (or `make lock`) to refresh the lock file and commit the result — the Dockerfile uses `uv sync --frozen` and will fail the build if `uv.lock` is stale.

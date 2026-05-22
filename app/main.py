@@ -24,9 +24,10 @@ from .anonymization import (
     bin_timestamp_columns,
     build_engines as _build_engines,
     enforce_k_anonymity,
-    hash_identifier_columns,
+    pseudonymize_identifier_columns,
     validate_residual_pii,
 )
+from .keyvault import KeyVaultPseudonymizer, build_pseudonymizer_from_env
 from .classification import (
     classify_columns,
     detect_gps_columns,
@@ -133,7 +134,8 @@ def main() -> None:
     _service.bin_numeric_columns = bin_numeric_columns
     _service.bin_timestamp_columns = bin_timestamp_columns
     _service.detect_identifier_columns = detect_identifier_columns
-    _service.hash_identifier_columns = hash_identifier_columns
+    _service.pseudonymize_identifier_columns = pseudonymize_identifier_columns
+    _service.build_pseudonymizer_from_env = build_pseudonymizer_from_env
     _service.enforce_k_anonymity = enforce_k_anonymity
     _service.record_alert = record_alert
     run_pipeline(PipelineConfig.from_env())

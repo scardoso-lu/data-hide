@@ -139,9 +139,9 @@ def mock_detect_ids(mocker):
 
 @pytest.fixture()
 def mock_hash(mocker):
-    """Mock hash_identifier_columns — identity transform, no columns hashed."""
-    m = mocker.patch("main.hash_identifier_columns")
-    m.side_effect = lambda df, cols, salt="": (df.copy(), [])
+    """Mock pseudonymize_identifier_columns — identity transform, no columns pseudonymized."""
+    m = mocker.patch("main.pseudonymize_identifier_columns")
+    m.side_effect = lambda df, cols, pseudonymizer: (df.copy(), [])
     return m
 
 

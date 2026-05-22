@@ -17,13 +17,37 @@ from main import (
     detect_quasi_identifiers,
     enforce_k_anonymity,
     flag_free_text_columns,
-    hash_identifier_columns,
+    pseudonymize_identifier_columns,
     run_purview_check,
     sanitize_column_names,
     validate_residual_pii,
     write_delta,
 )
 from app.repository import _parse_abfss_uri
+
+
+class _FakePseudonymizer:
+    """Deterministic in-memory pseudonymizer for tests.
+
+    Mimics KeyVaultPseudonymizer.pseudonymize: nulls pass through, every
+    other value is hashed under a fixed secret derived from ``key``.
+    """
+
+    def __init__(self, key: bytes = b"test-key") -> None:
+        self._key = key
+
+    def __call__(self, value):
+        import hmac
+        import hashlib
+        import pandas as pd
+
+        try:
+            if pd.isna(value):
+                return value
+        except (TypeError, ValueError):
+            pass
+        raw = value if isinstance(value, str) else str(value)
+        return hmac.new(self._key, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
 
 
 class TestAccountNameParser:
@@ -553,11 +577,10 @@ class TestValidateResidualPII:
         with pytest.raises(RuntimeError, match="Residual PII"):
             validate_residual_pii(df, analyzer)
 
-    def test_hash_passes_validation(self, analyzer):
-        """SHA-256 hex digest must not be detected as PII."""
-        import hashlib
-        h = hashlib.sha256(b"EMP001").hexdigest()[:24]
-        df = pd.DataFrame({"employee_id": [h]})
+    def test_pseudonym_passes_validation(self, analyzer):
+        """24-hex pseudonym tokens must not be detected as PII."""
+        token = _FakePseudonymizer()("EMP001")
+        df = pd.DataFrame({"employee_id": [token]})
         count = validate_residual_pii(df, analyzer)
         assert count == 0
 
@@ -613,71 +636,78 @@ class TestDetectIdentifierColumns:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Identifier column hashing
+# Identifier column pseudonymization (Key Vault-bound)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestHashIdentifierColumns:
+class TestPseudonymizeIdentifierColumns:
 
-    def test_string_value_hashed(self):
+    def test_string_value_pseudonymized(self):
         df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
-        result_df, hashed = hash_identifier_columns(df, ["employee_id"])
+        result_df, pseudonymized = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert "EMP001" not in result_df["employee_id"].values
         assert "EMP002" not in result_df["employee_id"].values
-        assert "employee_id" in hashed
+        assert "employee_id" in pseudonymized
 
-    def test_hash_is_deterministic(self):
+    def test_mapping_is_deterministic_for_same_key(self):
         df = pd.DataFrame({"employee_id": ["EMP001"]})
-        r1, _ = hash_identifier_columns(df.copy(), ["employee_id"])
-        r2, _ = hash_identifier_columns(df.copy(), ["employee_id"])
+        r1, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer())
+        r2, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer())
         assert r1["employee_id"].iloc[0] == r2["employee_id"].iloc[0]
 
-    def test_same_value_same_hash_across_rows(self):
+    def test_same_value_same_pseudonym_across_rows(self):
         df = pd.DataFrame({"employee_id": ["EMP001", "EMP001"]})
-        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert result_df["employee_id"].iloc[0] == result_df["employee_id"].iloc[1]
 
-    def test_different_values_different_hashes(self):
+    def test_different_values_different_pseudonyms(self):
         df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
-        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert result_df["employee_id"].iloc[0] != result_df["employee_id"].iloc[1]
 
     def test_null_preserved(self):
         df = pd.DataFrame({"employee_id": [None, "EMP001"]})
-        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert pd.isna(result_df["employee_id"].iloc[0])
 
-    def test_integer_id_hashed(self):
+    def test_integer_id_pseudonymized(self):
         df = pd.DataFrame({"employee_id": pd.array([12345, 67890], dtype="int64")})
-        result_df, hashed = hash_identifier_columns(df, ["employee_id"])
+        result_df, pseudonymized = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert 12345 not in result_df["employee_id"].values
-        assert "employee_id" in hashed
+        assert "employee_id" in pseudonymized
 
-    def test_salt_changes_hash(self):
+    def test_different_keys_produce_different_pseudonyms(self):
         df = pd.DataFrame({"employee_id": ["EMP001"]})
-        r1, _ = hash_identifier_columns(df.copy(), ["employee_id"], salt="salt_a")
-        r2, _ = hash_identifier_columns(df.copy(), ["employee_id"], salt="salt_b")
+        r1, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer(b"key_a"))
+        r2, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer(b"key_b"))
         assert r1["employee_id"].iloc[0] != r2["employee_id"].iloc[0]
 
     def test_empty_id_cols_returns_unchanged(self):
         df = pd.DataFrame({"employee_id": ["EMP001"]})
-        result_df, hashed = hash_identifier_columns(df, [])
+        result_df, pseudonymized = pseudonymize_identifier_columns(df, [], _FakePseudonymizer())
         assert result_df["employee_id"].iloc[0] == "EMP001"
-        assert hashed == []
+        assert pseudonymized == []
 
-    def test_hash_has_fixed_length(self):
+    def test_pseudonym_has_fixed_length(self):
         df = pd.DataFrame({"employee_id": ["short", "a_much_longer_employee_id_string"]})
-        result_df, _ = hash_identifier_columns(df, ["employee_id"])
+        result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert len(result_df["employee_id"].iloc[0]) == 24
         assert len(result_df["employee_id"].iloc[1]) == 24
 
     def test_original_dataframe_not_mutated(self):
         df = pd.DataFrame({"employee_id": ["EMP001"]})
         original = df["employee_id"].iloc[0]
-        hash_identifier_columns(df, ["employee_id"])
+        pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
         assert df["employee_id"].iloc[0] == original
 
     def test_missing_column_silently_skipped(self):
         df = pd.DataFrame({"employee_id": ["EMP001"]})
-        result_df, hashed = hash_identifier_columns(df, ["employee_id", "nonexistent"])
-        assert "employee_id" in hashed
-        assert "nonexistent" not in hashed
+        result_df, pseudonymized = pseudonymize_identifier_columns(
+            df, ["employee_id", "nonexistent"], _FakePseudonymizer(),
+        )
+        assert "employee_id" in pseudonymized
+        assert "nonexistent" not in pseudonymized
+
+    def test_none_pseudonymizer_raises(self):
+        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        with pytest.raises(ValueError, match="pseudonymizer is required"):
+            pseudonymize_identifier_columns(df, ["employee_id"], None)

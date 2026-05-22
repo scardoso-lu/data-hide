@@ -19,7 +19,7 @@ from .anonymization import (
     bin_timestamp_columns,
     build_engines,
     enforce_k_anonymity,
-    hash_identifier_columns,
+    pseudonymize_identifier_columns,
     validate_residual_pii,
 )
 from .classification import (
@@ -30,6 +30,7 @@ from .classification import (
     flag_free_text_columns,
     sanitize_column_names,
 )
+from .keyvault import build_pseudonymizer_from_env
 from .repository import (
     AuditDB,
     TableMapping,
@@ -50,7 +51,8 @@ class PipelineConfig:
     database_url: str | None
     purview_account_name: str | None
     k_anonymity_min: int
-    hash_salt: str
+    key_vault_url: str | None = None
+    key_vault_rsa_key_name: str | None = None
     quasi_identifier_cols: tuple[str, ...] = ()
     identifier_cols: tuple[str, ...] = ()
     source_base_uri: str | None = None
@@ -65,14 +67,15 @@ class PipelineConfig:
             database_url=os.environ.get("DATABASE_URL"),
             purview_account_name=os.environ.get("PURVIEW_ACCOUNT_NAME"),
             k_anonymity_min=int(os.environ.get("K_ANONYMITY_MIN", "5")),
-            hash_salt=os.environ.get("HASH_SALT", ""),
+            key_vault_url=os.environ.get("KEY_VAULT_URL"),
+            key_vault_rsa_key_name=os.environ.get("KEY_VAULT_RSA_KEY_NAME"),
             quasi_identifier_cols=_csv(os.environ.get("QUASI_IDENTIFIER_COLS", "")),
             identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
             sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
             sql_database=os.environ.get("SQL_DATABASE"),
-            gps_precision=int(os.environ.get("GPS_PRECISION", "2")),
+            gps_precision=int(os.environ.get("GPS_PRECISION", "1")),
         )
 
 
@@ -126,6 +129,7 @@ def _new_audit(config: PipelineConfig) -> dict:
         "output_type": "anonymized_rows",
         "aggregate_cells": 0,
         "hashed_columns": [],
+        "key_vault_key_version": None,
         "purview_available": False,
         "purview_flagged_columns": [],
         "purview_discrepancies": [],
@@ -154,8 +158,6 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             "Source and target table URIs are identical. Refusing to overwrite the source table. "
             f"table_name={mapping.table_name!r} uri={mapping.source_uri}"
         )
-    if not config.hash_salt:
-        logger.warning("HASH_SALT is not set; identifier hashes are unsalted.")
 
     if db:
         try:
@@ -195,8 +197,22 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             audit["timestamp_columns_binned"] = ts_binned
 
         id_cols = detect_identifier_columns(df_raw, list(config.identifier_cols))
-        df_raw, hashed = hash_identifier_columns(df_raw, id_cols, config.hash_salt)
-        audit["hashed_columns"] = hashed
+        if id_cols:
+            pseudonymizer = build_pseudonymizer_from_env(
+                config.key_vault_url,
+                config.key_vault_rsa_key_name,
+            )
+            if pseudonymizer is None:
+                raise RuntimeError(
+                    "Identifier columns detected but Key Vault is not configured. "
+                    "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or restrict "
+                    "IDENTIFIER_COLS so no identifier columns remain."
+                )
+            df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer)
+            audit["key_vault_key_version"] = pseudonymizer.key_version
+        else:
+            pseudonymized = []
+        audit["hashed_columns"] = pseudonymized
 
         free_text_cols = flag_free_text_columns(df_raw)
         audit["free_text_columns"] = free_text_cols

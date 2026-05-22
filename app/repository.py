@@ -35,7 +35,7 @@ ONELAKE_TOKEN_SCOPE = "https://storage.azure.com/.default"
 PURVIEW_TOKEN_SCOPE = "https://purview.azure.net/.default"
 SQL_TOKEN_SCOPE = "https://database.windows.net/.default"
 FABRIC_TOKEN_SCOPE = "https://api.fabric.microsoft.com/.default"
-PIPELINE_VERSION = "2.2.0"
+PIPELINE_VERSION = "2.3.0"
 
 logger = logging.getLogger(__name__)
 _credential: Optional[object] = None
@@ -431,6 +431,7 @@ CREATE TABLE IF NOT EXISTS pii_pipeline_runs (
     timestamp_cols_binned JSONB,
     numeric_cols_binned JSONB,
     hashed_columns JSONB,
+    key_vault_key_version TEXT,
     purview_ok BOOLEAN NOT NULL DEFAULT FALSE,
     purview_flagged JSONB,
     purview_diffs JSONB,
@@ -537,6 +538,7 @@ class AuditDB:
                 timestamp_cols_binned = %s,
                 numeric_cols_binned = %s,
                 hashed_columns = %s,
+                key_vault_key_version = %s,
                 purview_ok = %s,
                 purview_flagged = %s,
                 purview_diffs = %s,
@@ -566,6 +568,7 @@ class AuditDB:
                 json.dumps(audit.get("timestamp_columns_binned", [])),
                 json.dumps(audit.get("numeric_columns_binned", [])),
                 json.dumps(audit.get("hashed_columns", [])),
+                audit.get("key_vault_key_version"),
                 audit.get("purview_available", False),
                 json.dumps(audit.get("purview_flagged_columns", [])),
                 json.dumps(audit.get("purview_discrepancies", [])),

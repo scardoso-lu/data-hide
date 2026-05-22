@@ -2,18 +2,22 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a stateless Python pipeline for anonymizing Microsoft Fabric OneLake Delta tables. The main application lives in `main.py`, which handles Azure authentication, Delta reads/writes, Presidio anonymization, Purview checks, audit logging, and alerts. Tests live in `tests/` and are split by behavior: orchestration, anonymization, audit database, alerts, and helpers. Runtime packaging is defined by `Dockerfile`, local orchestration by `docker-compose.yml`, and dependencies by `requirements.txt` plus `requirements-dev.txt`.
+This repository contains a stateless Python pipeline for anonymizing Microsoft Fabric OneLake Delta tables. The main application lives in `app/`, with `main.py` as a thin shim entrypoint. Tests live in `tests/` and are split by behavior: orchestration, anonymization, audit database, alerts, key vault, and helpers. Runtime packaging is defined by `Dockerfile`, local orchestration by `docker-compose.yml`, and dependencies by `pyproject.toml` plus the committed `uv.lock` lock file.
 
 ## Build, Test, and Development Commands
 
-Prefix shell commands with `rtk`; use `rtk proxy powershell -Command "..."` for PowerShell built-ins.
+The project uses [uv](https://docs.astral.sh/uv/) as its package manager. uv reads `.python-version` and `pyproject.toml`, manages the `.venv` directory automatically, and resolves against the committed `uv.lock`.
 
-- `rtk proxy powershell -Command "python -m venv .venv"`: create a local virtual environment.
-- `rtk proxy powershell -Command "pip install -r requirements-dev.txt"`: install runtime and test dependencies.
-- `rtk proxy powershell -Command "python -m spacy download en_core_web_lg && python -m spacy download fr_core_news_lg && python -m spacy download de_core_news_lg"`: install the required NLP models (English, French, German/Luxembourgish) for full anonymization tests and local runs.
-- `rtk proxy powershell -Command "pytest"`: run the test suite configured by `pytest.ini`.
-- `rtk docker compose up --build`: build and run the pipeline with local PostgreSQL.
-- `rtk docker build -t fabric-pii-pipeline:latest .`: build the standalone container image.
+- `uv sync`: create the venv and install runtime + dev dependencies from `uv.lock`.
+- `uv sync --no-dev`: production install — runtime deps only.
+- `uv run python -m spacy download en_core_web_lg && uv run python -m spacy download fr_core_news_lg && uv run python -m spacy download de_core_news_lg`: install the required NLP models (English, French, German/Luxembourgish) for full anonymization tests and local runs.
+- `uv run pytest`: run the test suite configured by `pytest.ini`.
+- `uv run pytest -m "not requires_spacy and not slow"`: skip spaCy-dependent tests.
+- `uv lock --upgrade`: refresh `uv.lock` to the latest versions within the ranges declared in `pyproject.toml`.
+- `docker compose up --build`: build and run the pipeline with local PostgreSQL.
+- `docker build -t fabric-pii-pipeline:latest .`: build the standalone container image.
+
+Commit `uv.lock` whenever `pyproject.toml` changes — the Dockerfile uses `uv sync --frozen` and will fail the build if the lock is stale.
 
 ## Coding Style & Naming Conventions
 
@@ -21,7 +25,7 @@ Use Python 3 style with 4-space indentation, type hints where they clarify funct
 
 ## Testing Guidelines
 
-The project uses `pytest` with `tests` as the configured test root. Mark tests that require the full spaCy model with `requires_spacy` or `slow` as appropriate. Mock external I/O in unit and orchestration tests: Delta Lake, Azure credentials, PostgreSQL, Purview, and alert webhooks. Run `rtk proxy powershell -Command "pytest"` before submitting changes.
+The project uses `pytest` with `tests` as the configured test root. Mark tests that require the full spaCy model with `requires_spacy` or `slow` as appropriate. Mock external I/O in unit and orchestration tests: Delta Lake, Azure credentials, PostgreSQL, Purview, Key Vault, and alert webhooks. Run `uv run pytest` before submitting changes.
 
 ## Commit & Pull Request Guidelines
 

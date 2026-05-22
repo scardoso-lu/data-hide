@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 
@@ -177,8 +176,32 @@ class EntityRegistry:
         return dict(self._counters)
 
 
+def _resolve_overlapping_findings(findings: list) -> list:
+    """Collapse Presidio findings so no two cover the same character range.
+
+    Presidio's recognizers fire independently, so a string like
+    ``bob.smith@company.com`` produces both an EMAIL_ADDRESS finding for the
+    full span and a URL finding for a substring of it.  Applying both as
+    inline token substitutions corrupts the output (``URL_1ADDRESS_0``) and
+    inflates the returned finding count.  Keep the broadest, highest-score
+    finding per overlapping region and drop the rest.
+    """
+    if not findings:
+        return findings
+    # Sort so that for any shared start position the broader span comes first,
+    # and ties on width are broken by score.  After sorting, a single forward
+    # sweep suffices to discard anything that overlaps a previously kept span.
+    ordered = sorted(findings, key=lambda f: (f.start, -f.end, -getattr(f, "score", 0.0)))
+    kept: list = []
+    for f in ordered:
+        if kept and f.start < kept[-1].end:
+            continue
+        kept.append(f)
+    return kept
+
+
 def _anonymize_text(text: str, analyzer: Any, registry: EntityRegistry) -> tuple[str, list]:
-    findings = _analyze(text, analyzer)
+    findings = _resolve_overlapping_findings(_analyze(text, analyzer))
     if not findings:
         return text, []
     result = text
@@ -273,28 +296,33 @@ def enforce_k_anonymity(df: pd.DataFrame, quasi_cols: list[str], k: int) -> tupl
     return filtered, {"suppressed_rows": len(df) - len(filtered), "k": k}
 
 
-def _hash_value(val: object, salt_bytes: bytes) -> object:
-    try:
-        if pd.isna(val):
-            return val
-    except (TypeError, ValueError):
-        pass
-    raw = val if isinstance(val, str) else str(val)
-    return hashlib.sha256(salt_bytes + raw.encode("utf-8")).hexdigest()[:24]
+def pseudonymize_identifier_columns(
+    df: pd.DataFrame,
+    id_cols: list[str],
+    pseudonymizer: Callable[[object], object],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Replace identifier values with Key Vault-bound pseudonym tokens.
 
-
-def hash_identifier_columns(df: pd.DataFrame, id_cols: list[str], salt: str = "") -> tuple[pd.DataFrame, list[str]]:
+    ``pseudonymizer`` is a callable that maps each non-null value to a
+    deterministic token (see ``app.keyvault.KeyVaultPseudonymizer``).  Nulls
+    are preserved.  Missing columns are silently skipped so callers can pass
+    a superset of column names.
+    """
     if not id_cols:
         return df, []
+    if pseudonymizer is None:
+        raise ValueError(
+            "pseudonymizer is required to anonymize identifier columns; "
+            "configure KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME."
+        )
     df = df.copy()
-    hashed: list[str] = []
-    salt_bytes = salt.encode("utf-8")
+    pseudonymized: list[str] = []
     for col in id_cols:
         if col not in df.columns:
             continue
-        df[col] = df[col].map(lambda v, _sb=salt_bytes: _hash_value(v, _sb))
-        hashed.append(col)
-    return df, hashed
+        df[col] = df[col].map(pseudonymizer)
+        pseudonymized.append(col)
+    return df, pseudonymized
 
 
 def _anonymize_json(obj: object, analyzer: Any, registry: EntityRegistry) -> tuple[object, list]:
@@ -407,12 +435,14 @@ def _round_wkt(wkt: str, precision: int) -> str:
     return re.sub(r"-?\d+\.\d+", lambda m: str(round(float(m.group()), precision)), wkt)
 
 
-def anonymize_gps_columns(df: pd.DataFrame, gps_cols: list[str], precision: int = 2) -> tuple[pd.DataFrame, list[str]]:
+def anonymize_gps_columns(df: pd.DataFrame, gps_cols: list[str], precision: int = 1) -> tuple[pd.DataFrame, list[str]]:
     """Reduce spatial precision of GPS columns by rounding to `precision` decimal places.
 
-    Numeric columns (lat/lon floats) are rounded directly.
-    String columns containing WKT POINT geometries have their embedded
-    coordinate values rounded.  Null values are preserved unchanged.
+    Default precision is 1 (≈11 km cells), the city-safe setting that matches
+    GPS_PRECISION in .env.example.  Numeric columns (lat/lon floats) are
+    rounded directly.  String columns containing WKT POINT geometries have
+    their embedded coordinate values rounded.  Null values are preserved
+    unchanged.
     """
     if not gps_cols:
         return df, []
