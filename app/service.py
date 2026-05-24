@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import os
+from time import perf_counter
 import uuid
 
 import pandas as pd
@@ -23,12 +26,15 @@ from .anonymization import (
     validate_residual_pii,
 )
 from .classification import (
+    ACTION_HASH,
+    FREE_TEXT,
+    IDENTIFIER,
+    QUASI_IDENTIFIER,
+    apply_column_policies,
+    classify_columns,
+    classify_pii_columns,
     detect_gps_columns,
-    detect_identifier_columns,
-    detect_quasi_identifiers,
     detect_timestamp_columns,
-    flag_free_text_columns,
-    sanitize_column_names,
 )
 from .keyvault import build_pseudonymizer_from_env
 from .repository import (
@@ -46,6 +52,15 @@ from .repository import (
 logger = logging.getLogger(__name__)
 
 
+def _column_policy_enabled() -> bool:
+    """`ENABLE_COLUMN_POLICY=0` disables the column-policy layer entirely
+    (operator escape hatch in case the value-sampling tier behaves badly on
+    an unusual dataset).  Default: enabled."""
+    return os.environ.get("ENABLE_COLUMN_POLICY", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     database_url: str | None
@@ -59,7 +74,8 @@ class PipelineConfig:
     target_base_uri: str | None = None
     sql_endpoint: str | None = None
     sql_database: str | None = None
-    gps_precision: int = 1
+    gps_precision: int = 2
+    max_table_workers: int = 1
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -75,7 +91,8 @@ class PipelineConfig:
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
             sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
             sql_database=os.environ.get("SQL_DATABASE"),
-            gps_precision=int(os.environ.get("GPS_PRECISION", "1")),
+            gps_precision=int(os.environ.get("GPS_PRECISION", "2")),
+            max_table_workers=_env_int_at_least("MAX_TABLE_WORKERS", 1, 1),
         )
 
 
@@ -83,8 +100,28 @@ def _csv(value: str) -> tuple[str, ...]:
     return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
+def _env_int_at_least(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be {minimum} or greater")
+    return value
+
+
 def _normalize_uri(uri: str) -> str:
     return uri.rstrip("/").lower()
+
+
+@contextmanager
+def timed_stage(audit: dict, name: str):
+    start = perf_counter()
+    try:
+        yield
+    finally:
+        audit.setdefault("stage_seconds", {})[name] = round(perf_counter() - start, 6)
 
 
 def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
@@ -130,6 +167,7 @@ def _new_audit(config: PipelineConfig) -> dict:
         "aggregate_cells": 0,
         "hashed_columns": [],
         "key_vault_key_version": None,
+        "stage_seconds": {},
         "purview_available": False,
         "purview_flagged_columns": [],
         "purview_discrepancies": [],
@@ -146,6 +184,52 @@ def record_alert(db: AuditDB | None, run_id: str | None, mapping: TableMapping |
         db.record_alert(run_id, mapping.table_name if mapping else None, subject, body)
     except Exception as exc:
         logger.error("Alert persistence failed: %s", exc)
+
+
+def _read_source_table(config: PipelineConfig, mapping: TableMapping) -> pd.DataFrame:
+    if mapping.read_mode == "sql":
+        return read_sql_table(
+            mapping.table_name,
+            config.sql_endpoint,
+            config.sql_database,
+            schema=mapping.schema or "dbo",
+        )
+    if mapping.read_mode == "delta":
+        return read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
+    raise RuntimeError(f"Unsupported read_mode {mapping.read_mode!r} for table {mapping.table_name!r}")
+
+
+def _apply_purview_audit(audit: dict, purview_result: dict) -> None:
+    audit["purview_available"] = purview_result["available"]
+    audit["purview_flagged_columns"] = purview_result["flagged_columns"]
+    audit["purview_discrepancies"] = purview_result["discrepancies"]
+
+
+def _apply_anonymization_audit(audit: dict, stats: dict, registry: EntityRegistry) -> None:
+    audit["total_columns_scanned"] = len(stats["text_columns_scanned"])
+    audit["columns_anonymized"] = stats["columns_with_detections"]
+    audit["total_entities_detected"] = stats["total_entities_detected"]
+    audit["entity_counts"] = stats["entity_counts"]
+    audit["unique_entities"] = registry.unique_counts()
+
+
+def _profile_columns_by_category(profiles, category: str) -> list[str]:
+    return [profile.name for profile in profiles if category in profile.categories]
+
+
+def _configured_or_profiled_columns(configured: tuple[str, ...], profiles, category: str, df: pd.DataFrame) -> list[str]:
+    if configured:
+        return [col for col in configured if col in df.columns]
+    return _profile_columns_by_category(profiles, category)
+
+
+def _close_audit_run(db: AuditDB | None, run_id: str, audit: dict) -> None:
+    if db is None:
+        return
+    try:
+        db.close_run(run_id, audit)
+    except Exception as exc:
+        logger.warning("Audit close_run failed (non-fatal): %s", exc)
 
 
 def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None, run_id: str | None = None) -> dict:
@@ -166,84 +250,116 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             logger.warning("Audit open_run failed (non-fatal): %s", exc)
 
     try:
-        if mapping.read_mode == "sql":
-            df_raw = read_sql_table(mapping.table_name, config.sql_endpoint, config.sql_database)
-        else:
-            df_raw = read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
+        with timed_stage(audit, "read"):
+            df_raw = _read_source_table(config, mapping)
         audit["total_rows_processed"] = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
 
-        df_raw, col_renames = sanitize_column_names(df_raw)
-        audit["column_renames"] = col_renames
+        with timed_stage(audit, "gps_detection_and_transform"):
+            gps_anonymized: list[str] = []
+            gps_cols = detect_gps_columns(df_raw)
+            if gps_cols:
+                df_raw, gps_anonymized = anonymize_gps_columns(df_raw, gps_cols, config.gps_precision)
+                audit["gps_columns_anonymized"] = gps_anonymized
 
-        gps_anonymized: list[str] = []
-        gps_cols = detect_gps_columns(df_raw)
-        if gps_cols:
-            df_raw, gps_anonymized = anonymize_gps_columns(df_raw, gps_cols, config.gps_precision)
-            audit["gps_columns_anonymized"] = gps_anonymized
+            # Trajectory tables are GPS + speed + timestamp.
+            ts_cols: list[str] = detect_timestamp_columns(df_raw) if gps_anonymized else []
+            speed_col: str | None = detect_speed_column(df_raw) if gps_anonymized else None
+            is_trajectory = bool(gps_anonymized) and speed_col is not None and bool(ts_cols)
 
-        # Detect whether this is a GPS trajectory table (GPS + speed + timestamp).
-        # Trajectory tables follow a separate aggregation path — addresses are
-        # NLP-anonymized first, then individual rows are collapsed into spatial-
-        # temporal statistics safe for external LLM consumption.
-        ts_cols: list[str] = detect_timestamp_columns(df_raw) if gps_anonymized else []
-        speed_col: str | None = detect_speed_column(df_raw) if gps_anonymized else None
-        is_trajectory = bool(gps_anonymized) and speed_col is not None and bool(ts_cols)
-
-        # Non-trajectory GPS: floor timestamps to day for row-level k-anonymity.
         ts_binned: list[str] = []
-        if not is_trajectory and gps_anonymized and ts_cols:
-            df_raw, ts_binned = bin_timestamp_columns(df_raw, ts_cols)
-            audit["timestamp_columns_binned"] = ts_binned
+        with timed_stage(audit, "timestamp_binning"):
+            if not is_trajectory and gps_anonymized and ts_cols:
+                df_raw, ts_binned = bin_timestamp_columns(df_raw, ts_cols)
+                audit["timestamp_columns_binned"] = ts_binned
 
-        id_cols = detect_identifier_columns(df_raw, list(config.identifier_cols))
-        if id_cols:
-            pseudonymizer = build_pseudonymizer_from_env(
-                config.key_vault_url,
-                config.key_vault_rsa_key_name,
-            )
-            if pseudonymizer is None:
-                raise RuntimeError(
-                    "Identifier columns detected but Key Vault is not configured. "
-                    "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or restrict "
-                    "IDENTIFIER_COLS so no identifier columns remain."
+        with timed_stage(audit, "column_classification"):
+            column_profiles = classify_columns(df_raw)
+
+        pseudonymizer = None
+        with timed_stage(audit, "identifier_pseudonymization"):
+            id_cols = _configured_or_profiled_columns(config.identifier_cols, column_profiles, IDENTIFIER, df_raw)
+            if id_cols:
+                pseudonymizer = build_pseudonymizer_from_env(
+                    config.key_vault_url,
+                    config.key_vault_rsa_key_name,
                 )
-            df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer)
-            audit["key_vault_key_version"] = pseudonymizer.key_version
-        else:
-            pseudonymized = []
+                if pseudonymizer is None:
+                    raise RuntimeError(
+                        "Identifier columns detected but Key Vault is not configured. "
+                        "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or restrict "
+                        "IDENTIFIER_COLS so no identifier columns remain."
+                    )
+                df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer)
+                audit["key_vault_key_version"] = pseudonymizer.key_version
+            else:
+                pseudonymized = []
         audit["hashed_columns"] = pseudonymized
 
-        free_text_cols = flag_free_text_columns(df_raw)
-        audit["free_text_columns"] = free_text_cols
+        audit["free_text_columns"] = _profile_columns_by_category(column_profiles, FREE_TEXT)
 
-        pv = run_purview_check(mapping.source_uri, list(df_raw.columns), config.purview_account_name)
-        audit["purview_available"] = pv["available"]
-        audit["purview_flagged_columns"] = pv["flagged_columns"]
-        audit["purview_discrepancies"] = pv["discrepancies"]
+        with timed_stage(audit, "purview_check"):
+            pv = run_purview_check(mapping.source_uri, list(df_raw.columns), config.purview_account_name)
+        _apply_purview_audit(audit, pv)
 
-        if not is_trajectory:
-            qi_cols = detect_quasi_identifiers(df_raw, list(config.quasi_identifier_cols))
-            qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
-            audit["quasi_columns"] = qi_cols
-            numeric_qi = [c for c in qi_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
-            if numeric_qi:
-                df_raw, num_binned = bin_numeric_columns(df_raw, numeric_qi)
-                audit["numeric_columns_binned"] = num_binned
-            if qi_cols:
-                df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
-                audit["suppressed_rows"] = k_info["suppressed_rows"]
+        with timed_stage(audit, "k_anonymity"):
+            if not is_trajectory:
+                qi_cols = _configured_or_profiled_columns(config.quasi_identifier_cols, column_profiles, QUASI_IDENTIFIER, df_raw)
+                qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
+                audit["quasi_columns"] = qi_cols
+                numeric_qi = [c for c in qi_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
+                if numeric_qi:
+                    df_raw, num_binned = bin_numeric_columns(df_raw, numeric_qi)
+                    audit["numeric_columns_binned"] = num_binned
+                if qi_cols:
+                    df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
+                    audit["suppressed_rows"] = k_info["suppressed_rows"]
 
-        # NLP anonymization: always run so address columns are cleaned before
-        # either row-level output or trajectory aggregation drops them.
-        analyzer = build_engines()
+        with timed_stage(audit, "build_engines"):
+            analyzer = build_engines()
         registry = EntityRegistry()
-        df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry)
-        audit["total_columns_scanned"] = len(stats["text_columns_scanned"])
-        audit["columns_anonymized"] = stats["columns_with_detections"]
-        audit["total_entities_detected"] = stats["total_entities_detected"]
-        audit["entity_counts"] = stats["entity_counts"]
-        audit["unique_entities"] = registry.unique_counts()
+
+        # ── Column-policy classification (Phase 2/3 of the column-aware
+        # PII layer).  Runs Tier A (Purview) → B1 (presidio-structured
+        # value sampling) → B2 (spaCy embedding similarity) per column.
+        # Hash/tokenise classified columns BEFORE row-by-row Presidio scans.
+        # Failures here are non-fatal — the existing per-cell scan remains
+        # the backstop.
+        if _column_policy_enabled():
+            with timed_stage(audit, "column_policy_classification"):
+                try:
+                    policies = classify_pii_columns(df_raw, analyzer=analyzer)
+                except Exception as exc:
+                    logger.warning("Column-policy classification failed (non-fatal): %s", exc)
+                    policies = {}
+
+            policy_needs_hash = any(p.action == ACTION_HASH for p in policies.values())
+            policy_pseudonymizer = pseudonymizer if policy_needs_hash else None
+            if policy_needs_hash and policy_pseudonymizer is None:
+                policy_pseudonymizer = build_pseudonymizer_from_env(
+                    config.key_vault_url, config.key_vault_rsa_key_name,
+                )
+
+            with timed_stage(audit, "column_policy_mask"):
+                df_raw, policy_stats = apply_column_policies(
+                    df_raw, policies,
+                    registry=registry,
+                    pseudonymizer=policy_pseudonymizer,
+                )
+            audit["column_policy"] = {
+                "columns_processed": policy_stats["columns_processed"],
+                "actions_applied": policy_stats["actions_applied"],
+                "entity_types": policy_stats["entity_types"],
+                "values_masked": policy_stats["values_masked"],
+                "skipped_columns": policy_stats["skipped_columns"],
+                "sources": {
+                    col: pol.source for col, pol in policies.items()
+                },
+            }
+
+        with timed_stage(audit, "anonymization"):
+            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry)
+        _apply_anonymization_audit(audit, stats, registry)
 
         if db and stats["column_stats"]:
             try:
@@ -252,23 +368,23 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 logger.warning("Audit record_columns failed (non-fatal): %s", exc)
 
         if is_trajectory:
-            # Collapse individual pings into (cell × hour × day_of_week) statistics.
-            # Addresses are already NLP-anonymized above and are dropped by grouping.
-            # Cells with fewer than k pings are suppressed — no residual PII check
-            # needed since the aggregate contains only numeric and day-name columns.
-            df_clean, agg_stats = aggregate_gps_table(
-                df_clean, gps_anonymized, speed_col, ts_cols[0], config.k_anonymity_min,
-            )
+            with timed_stage(audit, "gps_aggregation"):
+                df_clean, agg_stats = aggregate_gps_table(
+                    df_clean, gps_anonymized, speed_col, ts_cols[0], config.k_anonymity_min,
+                )
             audit["output_type"] = "gps_aggregate"
             audit["aggregate_cells"] = agg_stats["cells_retained"]
             audit["suppressed_rows"] = agg_stats["pings_suppressed"]
         else:
-            audit["residual_pii_count"] = validate_residual_pii(df_clean, analyzer)
+            with timed_stage(audit, "residual_validation"):
+                audit["residual_pii_count"] = validate_residual_pii(df_clean)
 
-        write_delta(df_clean, mapping.target_uri, _fresh_opts(mapping.target_uri))
+        with timed_stage(audit, "write"):
+            write_delta(df_clean, mapping.target_uri, _fresh_opts(mapping.target_uri))
 
         audit["pipeline_end_ts"] = datetime.now(timezone.utc).isoformat()
         audit["status"] = "success"
+        logger.info("Table '%s' stage timings: %s", mapping.table_name or mapping.source_uri, audit["stage_seconds"])
         return audit
     except Exception as exc:
         audit["pipeline_end_ts"] = datetime.now(timezone.utc).isoformat()
@@ -276,15 +392,23 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         record_alert(db, run_id, mapping, "Pipeline FAILED", f"source: {mapping.source_uri}\nerror: {exc}")
         raise
     finally:
-        if db:
-            try:
-                db.close_run(run_id, audit)
-            except Exception as exc:
-                logger.warning("Audit close_run failed (non-fatal): %s", exc)
+        _close_audit_run(db, run_id, audit)
 
 
 def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
     config = config or PipelineConfig.from_env()
     db = connect_audit_db(config.database_url)
     mappings = resolve_table_mappings(config)
-    return [run_table(config, mapping, db) for mapping in mappings]
+    if config.max_table_workers <= 1 or len(mappings) <= 1:
+        return [run_table(config, mapping, db) for mapping in mappings]
+
+    workers = min(config.max_table_workers, len(mappings))
+    logger.info("Processing %d table(s) with %d process worker(s)", len(mappings), workers)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_run_table_worker, config, mapping) for mapping in mappings]
+        return [future.result() for future in futures]
+
+
+def _run_table_worker(config: PipelineConfig, mapping: TableMapping) -> dict:
+    db = connect_audit_db(config.database_url)
+    return run_table(config, mapping, db)

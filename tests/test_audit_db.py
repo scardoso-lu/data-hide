@@ -39,6 +39,7 @@ SUCCESS_AUDIT = {
     "column_renames":          {},
     "hashed_columns":          ["employee_id"],
     "key_vault_key_version":   "2025-05-22-resolved-version",
+    "stage_seconds":           {"read": 1.5, "anonymization": 2.25},
     "purview_available":       True,
     "purview_flagged_columns": ["email"],
     "purview_discrepancies":   [],
@@ -93,7 +94,7 @@ class TestSchemaInit:
     def test_expected_ddl_statements(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
         AuditDB("postgresql://test")
-        assert cur.execute.call_count == 3
+        assert cur.execute.call_count == 5
 
     def test_connection_committed(self, mock_psycopg2):
         _, conn, _ = mock_psycopg2
@@ -106,7 +107,8 @@ class TestSchemaInit:
         sqls = " ".join(c.args[0] for c in cur.execute.call_args_list)
         for col in ("unique_entities", "free_text_cols", "k_anonymity_k",
                     "quasi_columns", "suppressed_rows", "residual_pii",
-                    "column_renames", "hashed_columns", "key_vault_key_version"):
+                    "column_renames", "hashed_columns", "key_vault_key_version",
+                    "stage_seconds"):
             assert col in sqls, f"Expected column '{col}' in DDL"
 
 
@@ -386,6 +388,21 @@ class TestCloseRun:
         _, params = cur.execute.call_args.args
         # NULL must be passed as Python None so psycopg2 maps it to SQL NULL.
         assert None in params
+
+    def test_stage_seconds_json_encoded(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+
+        db.close_run(RUN_ID, SUCCESS_AUDIT)
+        _, params = cur.execute.call_args.args
+        matching = [
+            p for p in params
+            if isinstance(p, str)
+            and "anonymization" in p
+            and json.loads(p).get("anonymization") == 2.25
+        ]
+        assert matching, "No JSON-encoded stage_seconds found in params"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

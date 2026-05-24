@@ -2,14 +2,18 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from app.anonymization import (
+    EntityRegistry,
     SPACY_LABELS_TO_IGNORE,
     SPACY_TO_PRESIDIO_ENTITY_MAPPING,
     SUPPORTED_LANGUAGES,
     _resolve_overlapping_findings,
+    anonymize_dataframe,
     build_engines,
+    validate_residual_pii,
 )
 
 
@@ -60,6 +64,71 @@ class TestResolveOverlappingFindings:
 
     def test_empty_input_returns_empty(self):
         assert _resolve_overlapping_findings([]) == []
+
+
+def test_anonymize_dataframe_caches_repeated_text_values():
+    class FakeAnalyzer:
+        def __init__(self):
+            self.calls = 0
+
+        def analyze(self, text, entities=None, language=None, score_threshold=None):
+            self.calls += 1
+            start = text.find("Alice")
+            if start < 0:
+                return []
+            return [_f("PERSON", start, start + len("Alice"))]
+
+    analyzer = FakeAnalyzer()
+    df = pd.DataFrame({"name": ["Alice", "Alice", "Bob"]})
+
+    result, stats = anonymize_dataframe(df, analyzer, EntityRegistry())
+
+    assert analyzer.calls == 2
+    assert list(result["name"]) == ["PERSON_0", "PERSON_0", "Bob"]
+    assert stats["entity_counts"] == {"PERSON": 2}
+
+
+def test_residual_validation_catches_deterministic_email():
+    df = pd.DataFrame({"email": ["alice@example.com"]})
+
+    with pytest.raises(RuntimeError, match="email.EMAIL_ADDRESS=1"):
+        validate_residual_pii(df)
+
+
+def test_residual_validation_ignores_structured_metadata_false_positives():
+    df = pd.DataFrame({
+        "dataset_last_update": ["2026-05-23T14:45:20"],
+        "record_key": ["LU280019400644750000"],
+        "resource_last_modified": ["2026-05-23 14:45:20"],
+        "source_file": ["annonces_20260523144520.csv"],
+    })
+
+    assert validate_residual_pii(df) == 0
+
+
+def test_residual_validation_ignores_numeric_measure_false_positives():
+    df = pd.DataFrame({
+        "announced_price_eur_current_raw": ["4111111111111111", "1640000"],
+        "announced_price_m2_eur_current_raw": ["4999123", "5500000000000004"],
+    })
+
+    assert validate_residual_pii(df) == 0
+
+
+def test_residual_validation_still_blocks_explicit_structured_pii_columns():
+    df = pd.DataFrame({
+        "phone": ["+352 621 123 456"],
+        "credit_card": ["4111111111111111"],
+        "iban": ["GB29NWBK60161331926819"],
+    })
+
+    with pytest.raises(RuntimeError) as exc_info:
+        validate_residual_pii(df)
+
+    message = str(exc_info.value)
+    assert "phone.PHONE_NUMBER=1" in message
+    assert "credit_card.CREDIT_CARD=1" in message
+    assert "iban.IBAN_CODE=1" in message
 
 
 def test_build_engines_ignores_unmapped_cardinal_spacy_label(monkeypatch):

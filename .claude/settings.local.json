@@ -1,5 +1,20 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(uv lock *)",
+      "Bash(rtk uv *)",
+      "Bash(rtk git *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)",
+      "Bash(uv run *)",
+      "Bash(ANONYMIZATION_REGIONS=eu uv run python -c ' *)",
+      "Bash(ENABLE_FUZZY_TYPO_MATCH=1 uv run pytest --tb=line -q)",
+      "Bash(rtk docker *)",
+      "Bash(docker compose *)",
+      "Bash(PYTHONIOENCODING=utf-8 uv run python -c ' *)",
+      "Bash(rtk wc *)"
+    ],
     "deny": [
       "Read(.env)",
       "Read(.env.*)",
@@ -8,7 +23,6 @@
       "Read(**/*secret*)",
       "Read(**/*credential*)",
       "Read(**/*token*)"
-    ],
-    "allow": [ ]
+    ]
   }
 }

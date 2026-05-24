@@ -1,9 +1,11 @@
 """
 Unit tests for URI helpers, storage options, the optional Purview check,
 free-text column flagging, quasi-identifier detection, k-anonymity enforcement,
-column name sanitization, and residual PII validation.
+and residual PII validation.
 No external services or spaCy model required (except residual PII tests).
 """
+
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
@@ -11,7 +13,6 @@ import pytest
 from main import (
     PurviewClient,
     _account_name,
-    _scan_json_for_pii,
     _storage_opts,
     detect_identifier_columns,
     detect_quasi_identifiers,
@@ -19,11 +20,10 @@ from main import (
     flag_free_text_columns,
     pseudonymize_identifier_columns,
     run_purview_check,
-    sanitize_column_names,
     validate_residual_pii,
     write_delta,
 )
-from app.repository import _parse_abfss_uri
+from app.repository import AuditDB, _parse_abfss_uri, read_delta
 
 
 class _FakePseudonymizer:
@@ -123,49 +123,257 @@ class TestStorageUriParser:
         )
 
 
-class TestWriteDelta:
+class TestReadDeltaLookback:
 
-    def test_uploads_parquet_file_to_explicit_path(self, mocker):
+    class _FakeDeltaTable:
+        def __init__(self, uri, storage_options=None):
+            self.uri = uri
+            self.storage_options = storage_options
+
+        def to_pyarrow_dataset(self):
+            import pyarrow as pa
+
+            return pa.table({
+                "id": [1, 2, 3],
+                "created_at": [
+                    datetime(2023, 12, 31, tzinfo=timezone.utc),
+                    datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    datetime(2025, 1, 2, tzinfo=timezone.utc),
+                ],
+                "name": ["old", "edge", "new"],
+            })
+
+    def test_delta_read_uses_duckdb_cutoff_before_dataframe_materialization(self, monkeypatch, mocker):
         import app.repository as repo
 
+        monkeypatch.setattr(repo, "DeltaTable", self._FakeDeltaTable)
+        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
+
+        assert list(df["id"]) == [2, 3]
+
+    def test_delta_read_filters_string_temporal_columns_by_name(self, monkeypatch, mocker):
+        import pyarrow as pa
+        import app.repository as repo
+
+        class FakeDeltaTable:
+            def __init__(self, uri, storage_options=None):
+                pass
+
+            def to_pyarrow_dataset(self):
+                return pa.table({
+                    "id": [1, 2],
+                    "event_date": ["2023-12-31", "2024-01-02"],
+                })
+
+        monkeypatch.setattr(repo, "DeltaTable", FakeDeltaTable)
+        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
+
+        assert list(df["id"]) == [2]
+
+
+class TestWriteDelta:
+
+    class _FakeDuckDB:
+        def connect(self):
+            return self._Connection()
+
+        class _Connection:
+            def install_extension(self, name):
+                pass
+
+            def load_extension(self, name):
+                pass
+
+            def register(self, name, df):
+                pass
+
+            def execute(self, sql):
+                import pathlib
+                import re
+
+                match = re.search(r"COPY _df TO '([^']+)'", sql)
+                if match:
+                    table_path = pathlib.Path(match.group(1))
+                    (table_path / "_delta_log").mkdir(parents=True)
+                    (table_path / "_delta_log" / "00000000000000000000.json").write_text("{}", encoding="utf-8")
+                    (table_path / "part-00000.parquet").write_bytes(b"parquet")
+
+            def close(self):
+                pass
+
+    def test_uploads_delta_directory_to_explicit_path(self, monkeypatch, mocker):
+        import app.repository as repo
+
+        fs_client = mocker.MagicMock()
         file_client = mocker.MagicMock()
         service = mocker.MagicMock()
-        service.get_file_client.return_value = file_client
+        service.get_file_system_client.return_value = fs_client
+        fs_client.get_file_client.return_value = file_client
         service_cls = mocker.MagicMock(return_value=service)
 
-        mocker.patch_object(repo, "DataLakeServiceClient", service_cls)
-        mocker.patch_object(repo, "_credential_instance", lambda: object())
+        monkeypatch.setattr(repo, "_duckdb", self._FakeDuckDB())
+        monkeypatch.setattr(repo, "DataLakeServiceClient", service_cls)
+        monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
         write_delta(
             pd.DataFrame({"x": [1]}),
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers.parquet",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
             {},
         )
 
         service_cls.assert_called_once()
-        service.get_file_client.assert_called_once_with(
-            file_system="ws",
-            file_path="lh.Lakehouse/Files/out/customers.parquet",
+        service.get_file_system_client.assert_called_once_with(file_system="ws")
+        uploaded_paths = {call.kwargs["file_path"] for call in fs_client.get_file_client.call_args_list}
+        assert "lh.Lakehouse/Tables/customers/_delta_log/00000000000000000000.json" in uploaded_paths
+        assert any(
+            path.startswith("lh.Lakehouse/Tables/customers/part-") and path.endswith(".parquet")
+            for path in uploaded_paths
         )
-        file_client.upload_data.assert_called_once()
+        assert file_client.upload_data.call_count == 2
         assert file_client.upload_data.call_args.kwargs["overwrite"] is True
 
-    def test_appends_default_parquet_name_for_folder_path(self, mocker):
+    def test_replaces_existing_remote_delta_directory_before_upload(self, monkeypatch, mocker):
         import app.repository as repo
 
+        fs_client = mocker.MagicMock()
+        directory_client = mocker.MagicMock()
+        directory_client.exists.return_value = True
         file_client = mocker.MagicMock()
         service = mocker.MagicMock()
-        service.get_file_client.return_value = file_client
+        service.get_file_system_client.return_value = fs_client
+        fs_client.get_directory_client.return_value = directory_client
+        fs_client.get_file_client.return_value = file_client
 
-        mocker.patch_object(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
-        mocker.patch_object(repo, "_credential_instance", lambda: object())
+        monkeypatch.setattr(repo, "_duckdb", self._FakeDuckDB())
+        monkeypatch.setattr(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
+        monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
-        write_delta(pd.DataFrame({"x": [1]}), "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers", {})
-
-        service.get_file_client.assert_called_once_with(
-            file_system="ws",
-            file_path="lh.Lakehouse/Files/out/customers/part-00000.parquet",
+        write_delta(
+            pd.DataFrame({"x": [1]}),
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
+            {},
         )
+
+        fs_client.get_directory_client.assert_called_once_with("lh.Lakehouse/Tables/customers")
+        directory_client.delete_directory.assert_called_once()
+        method_names = [call[0] for call in fs_client.method_calls]
+        assert method_names.index("get_directory_client") < method_names.index("get_file_client")
+
+    def test_uses_table_folder_name_for_delta_output(self, monkeypatch, mocker):
+        import app.repository as repo
+
+        fs_client = mocker.MagicMock()
+        file_client = mocker.MagicMock()
+        service = mocker.MagicMock()
+        service.get_file_system_client.return_value = fs_client
+        fs_client.get_file_client.return_value = file_client
+
+        monkeypatch.setattr(repo, "_duckdb", self._FakeDuckDB())
+        monkeypatch.setattr(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
+        monkeypatch.setattr(repo, "_credential_instance", lambda: object())
+
+        write_delta(pd.DataFrame({"x": [1]}), "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers", {})
+
+        uploaded_paths = {call.kwargs["file_path"] for call in fs_client.get_file_client.call_args_list}
+        assert any(
+            path.startswith("lh.Lakehouse/Tables/customers/part-") and path.endswith(".parquet")
+            for path in uploaded_paths
+        )
+        assert "lh.Lakehouse/Tables/customers/_delta_log/00000000000000000000.json" in uploaded_paths
+
+    def test_write_uses_delta_rs_not_duckdb_extension(self, monkeypatch, mocker):
+        import app.repository as repo
+
+        service = mocker.MagicMock()
+        service.get_file_system_client.return_value = mocker.MagicMock()
+
+        duckdb = mocker.MagicMock()
+        monkeypatch.setattr(repo, "_duckdb", duckdb)
+        monkeypatch.setattr(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
+        monkeypatch.setattr(repo, "_credential_instance", lambda: object())
+
+        write_delta(
+            pd.DataFrame({"x": [1]}),
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
+            {},
+        )
+
+        duckdb.connect.assert_not_called()
+
+    def test_rejects_lakehouse_files_target(self):
+        with pytest.raises(ValueError, match="Lakehouse Files"):
+            write_delta(
+                pd.DataFrame({"x": [1]}),
+                "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers",
+                {},
+            )
+
+    def test_rejects_empty_schema_before_storage_access(self, monkeypatch, mocker):
+        import app.repository as repo
+
+        service_cls = mocker.MagicMock()
+        monkeypatch.setattr(repo, "DataLakeServiceClient", service_cls)
+
+        with pytest.raises(ValueError, match="at least one column"):
+            write_delta(
+                pd.DataFrame(),
+                "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
+                {},
+            )
+
+        service_cls.assert_not_called()
+
+
+class TestAuditSchemaMigration:
+
+    class _Cursor:
+        def __init__(self, executed):
+            self.executed = executed
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=None):
+            self.executed.append(sql)
+
+    class _Connection:
+        def __init__(self, executed):
+            self.executed = executed
+
+        def cursor(self):
+            return TestAuditSchemaMigration._Cursor(self.executed)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def test_init_schema_adds_missing_audit_columns(self, monkeypatch):
+        import app.repository as repo
+
+        executed: list[str] = []
+        monkeypatch.setattr(
+            repo.psycopg2,
+            "connect",
+            lambda dsn: self._Connection(executed),
+        )
+
+        AuditDB("postgresql://example")
+
+        joined = "\n".join(executed)
+        assert "ADD COLUMN IF NOT EXISTS key_vault_key_version TEXT" in joined
+        assert "ADD COLUMN IF NOT EXISTS stage_seconds JSONB" in joined
 
 
 class TestPurviewQualifiedName:
@@ -390,53 +598,7 @@ class TestEnforceKAnonymity:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Column name sanitization
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestSanitizeColumnNames:
-
-    def test_identifier_column_name_preserved(self):
-        df = pd.DataFrame({"employee_id": ["EMP-001"], "name": ["Alice"]})
-        result_df, renames = sanitize_column_names(df)
-        assert list(result_df.columns) == ["employee_id", "name"]
-        assert renames == {}
-
-    def test_non_sensitive_columns_unchanged(self):
-        df = pd.DataFrame({"score": [10], "category": ["A"], "email": ["a@b.com"]})
-        result_df, renames = sanitize_column_names(df)
-        assert "score" in result_df.columns
-        assert "category" in result_df.columns
-        assert renames == {}
-
-    def test_identifier_column_does_not_get_category_prefix(self):
-        df = pd.DataFrame({"employee_id": ["EMP-001"]})
-        result_df, renames = sanitize_column_names(df)
-        assert list(result_df.columns) == ["employee_id"]
-        assert renames == {}
-
-    def test_multiple_sensitive_columns_preserved(self):
-        df = pd.DataFrame({"employee_id": ["EMP-001"], "person_id": ["P-001"], "score": [1]})
-        result_df, renames = sanitize_column_names(df)
-        assert list(result_df.columns) == ["employee_id", "person_id", "score"]
-        assert renames == {}
-
-    def test_sensitive_column_name_preserved(self):
-        df = pd.DataFrame({"risk_band": ["high", "high", "high", "low", "low", "low"]})
-        result_df, renames = sanitize_column_names(df)
-        assert list(result_df.columns) == ["risk_band"]
-        assert renames == {}
-
-    def test_no_renames_returns_empty_dict(self):
-        df = pd.DataFrame({"product": ["Widget"], "price": [9.99]})
-        _, renames = sanitize_column_names(df)
-        assert renames == {}
-
-    def test_original_dataframe_not_mutated(self):
-        df = pd.DataFrame({"ssn": ["123"]})
-        original_cols = list(df.columns)
-        sanitize_column_names(df)
-        assert list(df.columns) == original_cols
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Residual PII validation
@@ -444,144 +606,127 @@ class TestSanitizeColumnNames:
 
 class TestValidateResidualPII:
 
-    class FakeAnalyzer:
-        def analyze(self, text, entities=None, language=None):
-            from types import SimpleNamespace
-
-            findings = []
-            for token in ("PERSON_0", "EMAIL_ADDRESS_0"):
-                start = text.find(token)
-                if start >= 0:
-                    findings.append(SimpleNamespace(start=start, end=start + len(token), entity_type="PERSON"))
-            email = "alice@example.com"
-            start = text.find(email)
-            if start >= 0:
-                findings.append(SimpleNamespace(start=start, end=start + len(email), entity_type="EMAIL_ADDRESS"))
-            return findings
-
     def test_non_identifier_ner_residuals_do_not_abort(self):
-        class LocationAnalyzer:
-            def analyze(self, text, entities=None, language=None):
-                from types import SimpleNamespace
-                return [
-                    SimpleNamespace(start=0, end=len(text), entity_type="LOCATION"),
-                    SimpleNamespace(start=0, end=len(text), entity_type="PERSON"),
-                    SimpleNamespace(start=0, end=len(text), entity_type="ORGANIZATION"),
-                ]
-
         df = pd.DataFrame({
             "indicator_label": ["Luxembourg", "France", "Kayl"],
             "commune": ["Luxembourg", "Kayl", "France"],
             "notes": ["Luxembourg", "France", "Kayl"],
         })
 
-        assert validate_residual_pii(df, LocationAnalyzer()) == 0
+        assert validate_residual_pii(df) == 0
 
     def test_structured_phone_false_positive_does_not_abort(self):
-        class PhoneAnalyzer:
-            def analyze(self, text, entities=None, language=None):
-                from types import SimpleNamespace
-                return [SimpleNamespace(start=0, end=len(text), entity_type="PHONE_NUMBER")]
-
         df = pd.DataFrame({
             "record_key": ["source_2024_001"],
             "source_file": ["bronze_communes_2024.csv"],
         })
 
-        assert validate_residual_pii(df, PhoneAnalyzer()) == 0
+        assert validate_residual_pii(df) == 0
 
     def test_direct_phone_residual_still_fails(self):
-        class PhoneAnalyzer:
-            def analyze(self, text, entities=None, language=None):
-                from types import SimpleNamespace
-                return [SimpleNamespace(start=0, end=len(text), entity_type="PHONE_NUMBER")]
-
         df = pd.DataFrame({"phone": ["+352 621 123 456"]})
 
         with pytest.raises(RuntimeError, match="phone.PHONE_NUMBER=1"):
-            validate_residual_pii(df, PhoneAnalyzer())
+            validate_residual_pii(df)
 
     def test_direct_email_residual_still_fails(self):
-        class EmailAnalyzer:
-            def analyze(self, text, entities=None, language=None):
-                from types import SimpleNamespace
-                return [SimpleNamespace(start=0, end=len(text), entity_type="EMAIL_ADDRESS")]
-
         df = pd.DataFrame({"source_file": ["alice@example.com.csv"], "email": ["bob@example.com"]})
 
         with pytest.raises(RuntimeError, match="email.EMAIL_ADDRESS=1"):
-            validate_residual_pii(df, EmailAnalyzer())
+            validate_residual_pii(df)
+
+    def test_direct_url_residual_still_fails(self):
+        df = pd.DataFrame({"url": ["https://example.com/private/customer"]})
+
+        with pytest.raises(RuntimeError, match="url.URL=1"):
+            validate_residual_pii(df)
+
+    def test_direct_ip_residual_still_fails(self):
+        df = pd.DataFrame({"ip_address": ["192.168.10.25"]})
+
+        with pytest.raises(RuntimeError, match="ip_address.IP_ADDRESS=1"):
+            validate_residual_pii(df)
 
     def test_generated_tokens_are_not_residual_pii(self):
         df = pd.DataFrame({"name": ["PERSON_0"], "email": ["EMAIL_ADDRESS_0"]})
-        assert validate_residual_pii(df, self.FakeAnalyzer()) == 0
+        assert validate_residual_pii(df) == 0
 
     def test_residual_error_summarizes_column_without_value(self):
         df = pd.DataFrame({"email": ["alice@example.com"]})
         with pytest.raises(RuntimeError) as exc_info:
-            validate_residual_pii(df, self.FakeAnalyzer())
+            validate_residual_pii(df)
         message = str(exc_info.value)
         assert "email.EMAIL_ADDRESS=1" in message
         assert "alice@example.com" not in message
 
-    def test_passes_clean_dataframe(self, analyzer):
+    def test_passes_clean_dataframe(self):
         df = pd.DataFrame({"note": ["No issues found."], "qty": [5]})
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
-    def test_raises_on_residual_email(self, analyzer):
+    def test_raises_on_residual_email(self):
         df = pd.DataFrame({"email": ["alice@example.com"]})
         with pytest.raises(RuntimeError, match="Residual PII"):
-            validate_residual_pii(df, analyzer)
+            validate_residual_pii(df)
 
-    def test_raises_message_contains_count(self, analyzer):
+    def test_raises_message_contains_count(self):
         df = pd.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
         with pytest.raises(RuntimeError) as exc_info:
-            validate_residual_pii(df, analyzer)
+            validate_residual_pii(df)
         assert "finding" in str(exc_info.value)
 
-    def test_skips_non_object_columns(self, analyzer):
+    def test_skips_non_object_columns(self):
         df = pd.DataFrame({
             "id":    pd.array([1, 2, 3], dtype="int64"),
             "score": pd.array([0.1, 0.2, 0.3], dtype="float64"),
         })
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
-    def test_skips_non_string_values_in_object_column(self, analyzer):
+    def test_skips_non_string_values_in_object_column(self):
         df = pd.DataFrame({"mixed": [None, 42, {"key": "val"}]})
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
-    def test_empty_dataframe_passes(self, analyzer):
+    def test_empty_dataframe_passes(self):
         df = pd.DataFrame({"email": pd.Series([], dtype=object)})
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
-    def test_entity_token_passes(self, analyzer):
+    def test_entity_token_passes(self):
         """ENTITY_TYPE_N pseudonym tokens must not be flagged as PII."""
         df = pd.DataFrame({
             "name":  ["PERSON_0", "PERSON_1"],
             "email": ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"],
         })
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
-    def test_raises_on_pii_inside_json_string(self, analyzer):
+    def test_raises_on_pii_inside_json_string(self):
         df = pd.DataFrame({"payload": ['{"email": "alice@example.com"}']})
         with pytest.raises(RuntimeError, match="Residual PII"):
-            validate_residual_pii(df, analyzer)
+            validate_residual_pii(df)
 
-    def test_raises_on_pii_inside_native_dict(self, analyzer):
+    def test_raises_on_pii_inside_native_dict(self):
         df = pd.DataFrame({"data": [{"email": "alice@example.com"}]})
         with pytest.raises(RuntimeError, match="Residual PII"):
-            validate_residual_pii(df, analyzer)
+            validate_residual_pii(df)
 
-    def test_pseudonym_passes_validation(self, analyzer):
+    def test_raises_on_pii_inside_json_key(self):
+        df = pd.DataFrame({"data": [{"alice@example.com": "primary contact"}]})
+        with pytest.raises(RuntimeError, match=r"data:\$\.<key>\.EMAIL_ADDRESS"):
+            validate_residual_pii(df)
+
+    def test_metadata_column_exemption_does_not_hide_json_value_pii(self):
+        df = pd.DataFrame({"source_file": [{"email": "alice@example.com"}]})
+        with pytest.raises(RuntimeError, match=r"source_file:\$\.email\.EMAIL_ADDRESS=1"):
+            validate_residual_pii(df)
+
+    def test_pseudonym_passes_validation(self):
         """24-hex pseudonym tokens must not be detected as PII."""
         token = _FakePseudonymizer()("EMP001")
         df = pd.DataFrame({"employee_id": [token]})
-        count = validate_residual_pii(df, analyzer)
+        count = validate_residual_pii(df)
         assert count == 0
 
 
@@ -629,8 +774,8 @@ class TestDetectIdentifierColumns:
         assert result == ["emp_id"]
         assert "missing_col" not in result
 
-    def test_sanitized_identifier_column_detected(self):
-        """Columns renamed to IDENTIFIER_N by sanitize_column_names are also detected."""
+    def test_placeholder_identifier_column_detected(self):
+        """Legacy placeholder identifier column names are still detected."""
         df = pd.DataFrame({"IDENTIFIER_0": ["x"]})
         assert "IDENTIFIER_0" in detect_identifier_columns(df)
 

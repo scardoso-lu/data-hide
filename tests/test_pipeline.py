@@ -2,13 +2,13 @@
 Integration-style tests for the main() pipeline orchestration.
 
 All external I/O is mocked:
-  - delta-rs read (DeltaTable) / Parquet output adapter
+  - Delta read adapter / Delta output adapter
   - Azure identity (DefaultAzureCredential)
   - PostgreSQL (AuditDB via connect_audit_db)
   - HTTP webhook (requests.post)
 
-anonymize_dataframe, build_engines, validate_residual_pii, sanitize_column_names,
-flag_free_text_columns, and detect_quasi_identifiers are also mocked in most
+anonymize_dataframe, build_engines, validate_residual_pii,
+and classify_columns are also mocked in most
 tests so the spaCy model is not loaded on every orchestration test.
 test_anonymization.py covers correctness.
 One integration test re-uses the session-scoped analyzer fixture to verify
@@ -27,7 +27,7 @@ TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/c
 RAW_TARGET = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/dbo/jaffle_raw_customers"
 
 BASE_SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse"
-BASE_TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized"
+BASE_TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables"
 
 REQUIRED_ENV = {
     "SOURCE_BASE_ABFSS_URI": BASE_SOURCE_URI,
@@ -74,8 +74,7 @@ def env(monkeypatch, mocker):
 
 @pytest.fixture()
 def mock_delta(mocker):
-    mock_read = mocker.patch("main.DeltaTable")
-    mock_read.return_value.to_pandas.return_value = RAW_DF.copy()
+    mock_read = mocker.patch("main.read_delta", return_value=RAW_DF.copy())
     mock_write = mocker.patch("main.write_delta")
     return mock_read, mock_write
 
@@ -115,26 +114,8 @@ def mock_validate(mocker):
 
 
 @pytest.fixture()
-def mock_sanitize(mocker):
-    """Column name sanitization — identity transform, no renames."""
-    m = mocker.patch("main.sanitize_column_names")
-    m.side_effect = lambda df: (df.copy(), {})
-    return m
-
-
-@pytest.fixture()
-def mock_free_text(mocker):
-    return mocker.patch("main.flag_free_text_columns", return_value=[])
-
-
-@pytest.fixture()
-def mock_quasi(mocker):
-    return mocker.patch("main.detect_quasi_identifiers", return_value=[])
-
-
-@pytest.fixture()
-def mock_detect_ids(mocker):
-    return mocker.patch("main.detect_identifier_columns", return_value=[])
+def mock_classify(mocker):
+    return mocker.patch("main.classify_columns", return_value=[])
 
 
 @pytest.fixture()
@@ -153,14 +134,14 @@ class TestPipelineSuccess:
 
     def test_runs_without_exception(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()  # must not raise
 
     def test_write_is_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -169,7 +150,7 @@ class TestPipelineSuccess:
 
     def test_write_receives_anonymized_dataframe(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -181,7 +162,7 @@ class TestPipelineSuccess:
 
     def test_numeric_column_unchanged_after_write(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -192,7 +173,7 @@ class TestPipelineSuccess:
 
     def test_write_target_uri_is_target(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         _, mock_write = mock_delta
@@ -203,7 +184,7 @@ class TestPipelineSuccess:
 
     def test_audit_open_run_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
@@ -211,7 +192,7 @@ class TestPipelineSuccess:
 
     def test_audit_close_run_called_with_success(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
@@ -223,7 +204,7 @@ class TestPipelineSuccess:
 
     def test_audit_records_entity_counts(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
@@ -234,7 +215,7 @@ class TestPipelineSuccess:
 
     def test_no_alert_recorded_on_success(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
@@ -242,7 +223,7 @@ class TestPipelineSuccess:
 
     def test_column_events_recorded_in_db(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
@@ -251,27 +232,19 @@ class TestPipelineSuccess:
 
     def test_residual_validation_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
         mock_validate.assert_called_once()
 
-    def test_sanitize_column_names_called(
+    def test_column_classification_called(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()
-        mock_sanitize.assert_called_once()
-
-    def test_flag_free_text_called(
-        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
-    ):
-        from main import main
-        main()
-        mock_free_text.assert_called_once()
+        mock_classify.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,7 +255,7 @@ class TestPipelineFailure:
 
     def test_refuses_same_source_and_target(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import TableMapping
         mocker.patch("main.discover_table_mappings",
@@ -294,7 +267,7 @@ class TestPipelineFailure:
 
     def test_allows_raw_named_target_when_writing_parquet_file(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import TableMapping
         mocker.patch("main.discover_table_mappings",
@@ -305,7 +278,7 @@ class TestPipelineFailure:
 
     def test_exception_propagates(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -316,7 +289,7 @@ class TestPipelineFailure:
 
     def test_close_run_still_called_on_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("storage unavailable")
@@ -329,7 +302,7 @@ class TestPipelineFailure:
 
     def test_close_run_status_is_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -343,7 +316,7 @@ class TestPipelineFailure:
 
     def test_error_message_captured_in_audit(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("disk full")
@@ -357,7 +330,7 @@ class TestPipelineFailure:
 
     def test_alert_recorded_on_failure(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         _, mock_write = mock_delta
         mock_write.side_effect = RuntimeError("timeout")
@@ -372,7 +345,7 @@ class TestPipelineFailure:
 
     def test_audit_close_run_called_even_when_db_write_fails(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         """If the delta write fails mid-pipeline, close_run must still fire."""
         db = mocker.MagicMock()
@@ -388,7 +361,7 @@ class TestPipelineFailure:
 
     def test_residual_pii_aborts_pipeline(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_engines, mock_classify, mock_hash, mocker,
     ):
         """validate_residual_pii raising RuntimeError must abort before write."""
         mocker.patch(
@@ -403,6 +376,25 @@ class TestPipelineFailure:
 
         mock_write.assert_not_called()
 
+    def test_invalid_read_mode_aborts_before_read(
+        self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
+        mock_engines, mock_validate, mock_classify, mock_hash, mocker,
+    ):
+        from main import TableMapping
+
+        mocker.patch(
+            "main.discover_table_mappings",
+            return_value=[TableMapping(SOURCE_URI, TARGET_URI, "test_table", read_mode="csv")],
+        )
+        mock_read, mock_write = mock_delta
+
+        from main import main
+        with pytest.raises(RuntimeError, match="Unsupported read_mode"):
+            main()
+
+        mock_read.assert_not_called()
+        mock_write.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional features disabled
@@ -412,7 +404,7 @@ class TestOptionalFeatures:
 
     def test_pipeline_runs_without_database_url(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         """No DATABASE_URL → connect_audit_db returns None → pipeline continues."""
         mocker.patch("main.connect_audit_db", return_value=None)
@@ -421,14 +413,14 @@ class TestOptionalFeatures:
 
     def test_pipeline_runs_without_alert_webhook(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         from main import main
         main()  # alert webhooks are not part of the runtime contract
 
     def test_audit_db_failure_does_not_abort_pipeline(
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         db = mocker.MagicMock()
         db.open_run.side_effect = Exception("DB down")
@@ -439,7 +431,7 @@ class TestOptionalFeatures:
 
     def test_purview_check_skipped_when_not_configured(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db, mocker,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash,
+        mock_engines, mock_validate, mock_classify, mock_hash,
     ):
         mock_purview = mocker.patch("main.run_purview_check")
         mock_purview.return_value = {
@@ -455,10 +447,9 @@ class TestOptionalFeatures:
 
     def test_k_anonymity_skipped_when_no_quasi_cols(
         self, env, mock_delta, mock_auth, mock_anonymize, mock_db,
-        mock_engines, mock_validate, mock_sanitize, mock_free_text, mocker,
+        mock_engines, mock_validate, mock_classify, mocker,
     ):
-        """detect_quasi_identifiers returning [] means enforce_k_anonymity is never called."""
-        mocker.patch("main.detect_quasi_identifiers", return_value=[])
+        """No quasi-identifier category means enforce_k_anonymity is never called."""
         mock_k = mocker.patch("main.enforce_k_anonymity")
 
         from main import main
@@ -471,11 +462,22 @@ class TestOptionalFeatures:
 # End-to-end with real Presidio (uses session-scoped engine fixture)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestPipelineConfigValidation:
+
+    def test_rejects_non_positive_max_table_workers(self, monkeypatch):
+        from main import PipelineConfig
+
+        monkeypatch.setenv("MAX_TABLE_WORKERS", "0")
+
+        with pytest.raises(ValueError, match="MAX_TABLE_WORKERS"):
+            PipelineConfig.from_env()
+
+
 class TestEndToEndAnonymization:
 
     def test_emails_anonymized_in_written_dataframe(
         self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
-        mock_sanitize, mock_free_text, mock_quasi,
+        mock_classify,
     ):
         """Full chain: real Presidio engine, mocked storage + DB."""
         mocker.patch("main.build_engines", return_value=analyzer)
@@ -492,7 +494,7 @@ class TestEndToEndAnonymization:
 
     def test_score_column_untouched_in_written_dataframe(
         self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
-        mock_sanitize, mock_free_text, mock_quasi,
+        mock_classify,
     ):
         mocker.patch("main.build_engines", return_value=analyzer)
         mocker.patch("main.validate_residual_pii", return_value=0)
@@ -506,7 +508,7 @@ class TestEndToEndAnonymization:
 
     def test_entity_tokens_in_output(
         self, env, mock_delta, mock_auth, mock_db, analyzer, mocker,
-        mock_sanitize, mock_free_text, mock_quasi,
+        mock_classify,
     ):
         """After anonymization, columns should contain ENTITY_TYPE_N tokens."""
         mocker.patch("main.build_engines", return_value=analyzer)
@@ -544,8 +546,7 @@ class TestDynamicDiscovery:
 
     def _std_mocks(self, mocker, mappings):
         mocker.patch("main.discover_table_mappings", return_value=mappings)
-        mock_read = mocker.patch("main.DeltaTable")
-        mock_read.return_value.to_pandas.return_value = RAW_DF.copy()
+        mocker.patch("main.read_delta", return_value=RAW_DF.copy())
         mock_write = mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
         mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
@@ -553,10 +554,10 @@ class TestDynamicDiscovery:
 
     def test_discover_is_called(
         self, base_env, mock_auth, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mock_discover = mocker.patch("main.discover_table_mappings", return_value=self._two_mappings())
-        mocker.patch("main.DeltaTable").return_value.to_pandas.return_value = RAW_DF.copy()
+        mocker.patch("main.read_delta", return_value=RAW_DF.copy())
         mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
         mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
@@ -567,7 +568,7 @@ class TestDynamicDiscovery:
 
     def test_write_called_once_per_table(
         self, base_env, mock_auth, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mock_write = self._std_mocks(mocker, self._two_mappings())
 
@@ -577,7 +578,7 @@ class TestDynamicDiscovery:
 
     def test_target_uris_match_source_table_names(
         self, base_env, mock_auth, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mock_write = self._std_mocks(mocker, self._two_mappings())
 
@@ -590,7 +591,7 @@ class TestDynamicDiscovery:
 
     def test_empty_discovery_raises(
         self, base_env, mock_auth, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mocker.patch("main.discover_table_mappings", return_value=[])
         mocker.patch("main.connect_audit_db", return_value=None)
@@ -598,6 +599,82 @@ class TestDynamicDiscovery:
         from main import main
         with pytest.raises(RuntimeError, match="No tables found"):
             main()
+
+    def test_parallel_tables_use_process_workers(self, base_env, monkeypatch):
+        import app.service as service
+        from main import TableMapping
+
+        mappings = self._two_mappings()
+        submitted = []
+        executor_max_workers = []
+
+        class _Future:
+            def __init__(self, value):
+                self._value = value
+
+            def result(self):
+                return self._value
+
+        class _Executor:
+            def __init__(self, max_workers):
+                executor_max_workers.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, func, config, mapping):
+                submitted.append((func, mapping))
+                return _Future({"table": mapping.table_name})
+
+        monkeypatch.setattr(service, "connect_audit_db", lambda database_url: object())
+        monkeypatch.setattr(service, "resolve_table_mappings", lambda config: mappings)
+        monkeypatch.setattr(service, "ProcessPoolExecutor", _Executor)
+
+        config = service.PipelineConfig(
+            database_url=None,
+            purview_account_name=None,
+            k_anonymity_min=5,
+            source_base_uri=BASE_SOURCE_URI,
+            target_base_uri=BASE_TARGET_URI,
+            max_table_workers=4,
+        )
+
+        result = service.run_pipeline(config)
+
+        assert executor_max_workers == [2]
+        assert [mapping.table_name for _, mapping in submitted] == ["customers", "orders"]
+        assert all(func is service._run_table_worker for func, _ in submitted)
+        assert result == [{"table": "customers"}, {"table": "orders"}]
+
+    def test_table_worker_opens_its_own_audit_connection(self, monkeypatch):
+        import app.service as service
+        from main import TableMapping
+
+        config = service.PipelineConfig(
+            database_url="postgresql://audit",
+            purview_account_name=None,
+            k_anonymity_min=5,
+            source_base_uri=BASE_SOURCE_URI,
+            target_base_uri=BASE_TARGET_URI,
+        )
+        mapping = TableMapping(f"{BASE_SOURCE_URI}/customers", f"{BASE_TARGET_URI}/customers", "customers")
+        db = object()
+
+        monkeypatch.setattr(service, "connect_audit_db", lambda database_url: db)
+
+        calls = []
+
+        def _run_table(config_arg, mapping_arg, db_arg):
+            calls.append((config_arg, mapping_arg, db_arg))
+            return {"table": mapping_arg.table_name}
+
+        monkeypatch.setattr(service, "run_table", _run_table)
+
+        assert service._run_table_worker(config, mapping) == {"table": "customers"}
+        assert calls == [(config, mapping, db)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -639,10 +716,25 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
         )
         assert len(result) == 1
         assert result[0].table_name == "customers"
+
+    def test_files_target_base_rejected(self, mocker):
+        from app.repository import discover_table_mappings
+        items = [self._make_path_item(mocker, "Tables/customers", True)]
+        fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        with pytest.raises(ValueError, match="Lakehouse Files"):
+            discover_table_mappings(
+                "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
+                "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            )
 
     def test_onelake_https_base_uri_is_supported(self, mocker):
         from app.repository import discover_table_mappings
@@ -660,7 +752,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
-            "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/target-lakehouse-id/Files/anonymized",
+            "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/target-lakehouse-id/Tables",
         )
 
         assert len(result) == 1
@@ -670,7 +762,7 @@ class TestDiscoverTableMappingsFiltering:
         )
         assert result[0].target_uri == (
             "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/"
-            "target-lakehouse-id/Files/anonymized/customers"
+            "target-lakehouse-id/Tables/customers"
         )
 
     def test_onelake_item_id_path_resolves_to_lakehouse_name(self, mocker):
@@ -689,7 +781,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
-            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Files/anonymized",
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Tables",
         )
 
         fs_client.get_paths.assert_called_once_with(
@@ -718,7 +810,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
-            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Files/anonymized",
+            "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Tables",
         )
 
         resolver.assert_not_called()
@@ -743,10 +835,35 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Lakehouse.Lakehouse/Tables",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
         )
 
         fs_client.get_paths.assert_any_call(path="Lakehouse.Lakehouse/Tables", recursive=True)
+        assert len(result) == 1
+        assert result[0].table_name == "customers"
+
+    def test_recursive_delta_log_discovery_when_immediate_listing_is_large(self, mocker):
+        from app.repository import discover_table_mappings
+
+        items = [self._make_path_item(mocker, f"Tables/folder_{idx}", True) for idx in range(25)]
+        delta_log = self._make_path_item(mocker, "Tables/customers/_delta_log", True)
+        fs_client = self._make_fs_client(mocker, items, set())
+        fs_client.get_paths.side_effect = [
+            items,
+            [delta_log],
+        ]
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+
+        result = discover_table_mappings(
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
+        )
+
+        fs_client.get_paths.assert_any_call(path="Src.Lakehouse/Tables", recursive=True)
+        fs_client.get_directory_client.assert_not_called()
         assert len(result) == 1
         assert result[0].table_name == "customers"
 
@@ -765,7 +882,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
         )
         assert len(result) == 1
         assert result[0].table_name == "customers"
@@ -784,7 +901,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
         )
         assert len(result) == 1
 
@@ -799,17 +916,19 @@ class TestDiscoverTableMappingsFiltering:
         mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
 
     def test_sql_shortcuts_included(self, mocker):
-        """SQL tables not present in ADLS get read_mode='sql' mappings."""
+        """SQL tables not present in ADLS get read_mode='sql' mappings; schema
+        is preserved in both source and target paths so a schema-enabled
+        Fabric lakehouse registers the destination table."""
         from app.repository import discover_table_mappings
         self._adls_setup(mocker, ["customers"])
         mocker.patch(
             "app.repository._discover_sql_table_names",
-            return_value=["customers", "customer_view"],
+            return_value=[("dbo", "customers"), ("dbo", "customer_view")],
         )
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",
         )
@@ -820,19 +939,22 @@ class TestDiscoverTableMappingsFiltering:
         assert delta_m.read_mode == "delta"
         assert sql_m.read_mode == "sql"
         assert sql_m.source_uri.startswith("sql://")
+        assert sql_m.schema == "dbo"
+        assert sql_m.target_uri.endswith("/dbo/customer_view")
 
     def test_delta_table_not_duplicated_by_sql(self, mocker):
-        """A table present in both ADLS and SQL appears exactly once as delta."""
+        """A schema-less Delta source (Tables/<name>) is the same physical
+        table as the SQL spec (dbo.<name>) — dedup keeps the Delta side."""
         from app.repository import discover_table_mappings
         self._adls_setup(mocker, ["customers", "orders"])
         mocker.patch(
             "app.repository._discover_sql_table_names",
-            return_value=["customers", "orders"],
+            return_value=[("dbo", "customers"), ("dbo", "orders")],
         )
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",
         )
@@ -851,7 +973,7 @@ class TestDiscoverTableMappingsFiltering:
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
-            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Files/anonymized",
+            "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables",
             sql_endpoint="ws.datawarehouse.fabric.microsoft.com",
             sql_database="SourceLakehouse",
         )
@@ -865,7 +987,7 @@ class TestDiscoverTableMappingsFiltering:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSQLShortcutRouting:
-    """Verify that run_table reads SQL mappings via read_sql_table, not DeltaTable."""
+    """Verify that run_table reads SQL mappings via read_sql_table, not Delta read."""
 
     @pytest.fixture()
     def sql_env(self, monkeypatch, mocker):
@@ -889,7 +1011,7 @@ class TestSQLShortcutRouting:
 
     def test_read_sql_table_called_for_sql_mapping(
         self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mock_sql_read = mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
         mocker.patch("main.write_delta")
@@ -903,12 +1025,12 @@ class TestSQLShortcutRouting:
 
     def test_delta_table_not_called_for_sql_mapping(
         self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
-        mock_sanitize, mock_free_text, mock_quasi, mock_detect_ids, mock_hash, mocker,
+        mock_classify, mock_hash, mocker,
     ):
         mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
         mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
-        mock_delta_read = mocker.patch("main.DeltaTable")
+        mock_delta_read = mocker.patch("main.read_delta")
 
         from main import main
         main()
