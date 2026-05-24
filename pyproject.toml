@@ -63,7 +63,7 @@ dependencies = [
 # Installed by `uv sync` (default) but excluded from production images
 # via `uv sync --no-dev` in the Dockerfile.
 dev = [
-    "pytest>=7.4.0,<9.0.0",
+    "pytest>=9.0.3,<10.0.0",
     "pytest-mock>=3.12.0,<4.0.0",
 ]
 
