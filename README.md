@@ -1,6 +1,8 @@
 # Fabric PII Anonymization Pipeline
 
-A containerized, **stateless** Python pipeline that discovers every Delta table under a OneLake base path, anonymizes all personal data found in text columns using Presidio + spaCy NLP, and writes clean output back to OneLake — with a full PostgreSQL audit trail on every run.
+A containerized, **stateless** Python pipeline that discovers every Delta table under a OneLake base path, anonymizes all personal data found in text columns using a layered detection stack (Purview metadata → Presidio-structured value sampling → spaCy embedding similarity on column names → row-by-row Presidio NER with a semantic Art. 9 / Art. 10 detector), and writes clean Delta tables back to OneLake — with a full PostgreSQL audit trail on every run.
+
+The pipeline contains **no hand-curated keyword lists**. Every category of PII — including health conditions, religion, ethnicity, sexual orientation, trade-union membership, and criminal records — is detected through spaCy embeddings + rapidfuzz typo tolerance against a tiny set of concept anchors carried in code. Compliance and engineering teams never have to maintain `.txt` files of variants.
 
 ---
 
@@ -10,21 +12,25 @@ A containerized, **stateless** Python pipeline that discovers every Delta table 
 flowchart TD
     A["OneLake — Delta tables\n(SOURCE_BASE_ABFSS_URI)"]
     A2["SQL Analytics Endpoint\n(SQL_ENDPOINT_URL · optional)"]
-    B["Pandas DataFrame\nper discovered table"]
-    C["Dynamic Column Classification\ndetect_identifier_columns\ndetect_quasi_identifiers\nflag_free_text_columns"]
-    D["Pseudonymize & k-Anonymity\npseudonymize_identifier_columns (Key Vault RSA)\nenforce_k_anonymity"]
-    E["Presidio + spaCy NLP\nanonymize_dataframe\n(EN · FR · DE · LB)"]
-    F["Purview Sensitivity Check\nrun_purview_check\n(optional)"]
+    B["DuckDB-filtered source read\npast READ_LOOKBACK_DAYS"]
+    B2["Pandas DataFrame\nlimited rows per table"]
+    C["Dynamic Column Classification\nclassify_columns"]
+    D["Identifier pseudonymisation +\nGPS rounding + temporal binning"]
+    CP["Column-Policy Layer\n(Purview · Presidio-structured ·\nspaCy embedding similarity)"]
+    E["Presidio row-by-row scan\n+ semantic Art. 9 / Art. 10 recognizer\n(EN · FR · DE · LB)"]
+    F["Purview sensitivity check\nrun_purview_check (optional)"]
     G["Residual PII Validation\nvalidate_residual_pii"]
-    H["OneLake — Parquet output\n(TARGET_BASE_ABFSS_URI)"]
+    H["OneLake — Delta tables\n(TARGET_BASE_ABFSS_URI)"]
     I["Pipeline aborts\ntarget not written"]
     J["PostgreSQL Audit DB\nAuditDB · open_run / close_run"]
 
     A -->|"discover_table_mappings\nread_mode=delta"| B
     A2 -.->|"shortcuts not in ADLS\nread_mode=sql"| B
-    B --> C
+    B --> B2
+    B2 --> C
     C --> D
-    D --> E
+    D --> CP
+    CP --> E
     B -.->|optional| F
     F -.-> E
     E --> G
@@ -32,6 +38,8 @@ flowchart TD
     G -->|PII found| I
     E --> J
 ```
+
+See [`docs/learn_more.md`](docs/learn_more.md) for a breakdown of each detection layer.
 
 ---
 
@@ -41,6 +49,7 @@ flowchart TD
 |---|---|---|
 | Art. 4(1) — Personal data | Identify and protect all natural-person identifiers | NLP entity detection across text columns |
 | Art. 5(1)(b) — Purpose limitation | Write anonymized data to a separate target; never overwrite source | Source ≠ target URI guard before any write |
+| Art. 5(1)(c) — Data minimisation | Limit source rows by time | Source reads default to the past `365` days via temporal columns before rows are materialized for anonymization |
 | Art. 5(1)(c) — Data minimisation | Remove direct identifiers | Auto-detect identifier columns and replace with deterministic tokens derived from an RSA key in Azure Key Vault |
 | Art. 5(1)(c) — Data minimisation | Reduce GPS precision | Round lat/lon to N decimal places; floor co-located timestamps to day |
 | Art. 5(1)(c) — Data minimisation | Suppress rare quasi-identifier combinations | k-anonymity: groups smaller than `K_ANONYMITY_MIN` are dropped |
@@ -52,20 +61,6 @@ flowchart TD
 | Art. 35 — Data protection impact assessment | Document processing risks | Per-run audit records include entity counts, suppressed rows, and residual PII count |
 
 For full details on each GDPR article see [gdpr-info.eu](https://gdpr-info.eu).
-
----
-
-## GPS trajectory data
-
-Tables that contain GPS coordinates, a speed column, and a timestamp column are treated as **trajectory data** and follow a separate path:
-
-1. Addresses are NLP-anonymized (names, locations stripped from free-text columns).
-2. Individual rows are **aggregated** into `(grid cell × hour of day × day of week)` speed statistics — no vehicle identifiers or raw timestamps survive.
-3. Cells with fewer than `K_ANONYMITY_MIN` pings are suppressed.
-
-The resulting output contains only `avg_speed_kmh`, `p50_speed_kmh`, `p85_speed_kmh`, and `ping_count` per cell/time slot — safe for business analytics and external LLM consumption.
-
-Non-trajectory GPS tables (no speed column) have coordinates rounded to `GPS_PRECISION` decimal places (default `1` ≈ 11 km for city data) and timestamps floored to day before row-level k-anonymity is applied.
 
 ---
 
@@ -104,13 +99,23 @@ Edit `.env` with your values:
 | `AZURE_CLIENT_SECRET` | Yes | Service principal secret |
 | `DATABASE_URL` | Yes | PostgreSQL DSN for audit records |
 | `SOURCE_BASE_ABFSS_URI` | Yes | Base path of raw Delta tables to anonymize |
-| `TARGET_BASE_ABFSS_URI` | Yes | Base path where anonymized output is written |
+| `TARGET_BASE_ABFSS_URI` | Yes | Target Lakehouse Tables root where anonymized Delta tables are written. Must end with `<lakehouse>.Lakehouse/Tables`; do not use `Files/...` if the output should appear as Fabric tables. |
+| `READ_LOOKBACK_DAYS` | No (default `365`) | Number of recent days to read from each source table. Delta reads are filtered through DuckDB before DataFrame materialization; SQL shortcut reads push the same cutoff into T-SQL. Tables with no temporal column are logged and read fully because the pipeline cannot infer row age. |
+| `MAX_TABLE_WORKERS` | No (default `1`) | Number of tables to process concurrently. Increase only when the host has enough CPU and memory for concurrent NLP work. |
+| `MAX_UPLOAD_WORKERS` | No (default `4`) | Bounded concurrent uploads for Delta data files; `_delta_log` files are uploaded after data files. |
 | `K_ANONYMITY_MIN` | No (default `5`) | Minimum group size for quasi-identifier suppression |
 | `KEY_VAULT_URL` | If identifier columns exist | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
 | `KEY_VAULT_RSA_KEY_NAME` | If identifier columns exist | RSA key name used to derive pseudonyms; the latest enabled version is always used and never leaves the HSM |
-| `GPS_PRECISION` | No (default `1`) | Decimal places for GPS rounding (1 ≈ 11 km) |
+| `GPS_PRECISION` | No (default `2`) | Decimal places for GPS rounding (2 is about 1 km) |
 | `SQL_ENDPOINT_URL` | No | Fabric SQL Analytics Endpoint — enables shortcut discovery |
 | `SQL_DATABASE` | No | Database name on the SQL endpoint |
+| `ENABLE_COLUMN_POLICY` | No (default `1`) | Master switch for the column-policy layer (Purview → presidio-structured → spaCy similarity). Set to `0` to fall back to row-by-row Presidio only. |
+| `ENABLE_PRESIDIO_STRUCTURED` | No (default `1`) | Tier B1 toggle — value-sampling column classification via `presidio-structured`. Disable if your dataset has very small column heights and the votes become unreliable. |
+| `COLUMN_SIMILARITY_THRESHOLD` | No (default `0.55`) | Tier B2 cosine threshold for spaCy embedding similarity between a column name and `CONCEPT_SEEDS`. Lower → more aggressive name-based classification; higher → more conservative. |
+| `SEMANTIC_SIMILARITY_THRESHOLD` | No (default `0.55`) | Token-level cosine threshold for the semantic Art. 9 / Art. 10 recognizer. |
+| `ENABLE_FUZZY_TYPO_MATCH` | No (default `0`) | Opt-in rapidfuzz fuzzy matcher for any remaining deny-list recognizers. The semantic recognizer has its own fuzzy fallback (always on) — this flag is only relevant if you re-introduce deny-list-based custom recognizers. |
+| `ANONYMIZATION_REGIONS` | No (default `all`) | Comma-separated regions to enable national-ID detection for (`us`, `eu`, `uk`). `eu` drops US-only entities. |
+| `SPACY_MODEL_EN` / `_FR` / `_DE` / `_LB` | No | Per-language spaCy model overrides. Default is `en_core_web_lg`, `fr_core_news_lg`, `de_core_news_lg`, `de_core_news_lg` (Luxembourgish uses the German model — no dedicated `_lg` exists). Override with smaller `_sm` or `_md` for low-resource environments. |
 
 OneLake URI format:
 ```
@@ -149,3 +154,26 @@ uv run pytest -m "not requires_spacy"         # skip spaCy-dependent tests
 ```
 
 `uv sync` recreates `.venv` deterministically from `uv.lock`. When you change a dependency in `pyproject.toml`, run `uv lock` (or `make lock`) to refresh the lock file and commit the result — the Dockerfile uses `uv sync --frozen` and will fail the build if `uv.lock` is stale.
+
+---
+
+## Learn more
+
+GPS-trajectory aggregation, how to extend detection coverage for new entity categories, and the locked-test contract are documented separately — see [`docs/learn_more.md`](docs/learn_more.md).
+
+---
+
+## ⚠️ Known limitations — human verification is required
+
+**Statistical / NLP-based anonymisation is not a guarantee.** This pipeline reduces residual-PII risk by stacking multiple imperfect detectors (Purview metadata, Presidio value sampling, spaCy embedding similarity, regex + Luhn/IBAN/IPv6 validators, rapidfuzz typo tolerance, a residual safety net) but it can — and will — let edge cases through. Categories of leak this codebase has observed at least once and that cannot be ruled out without human review:
+
+- **Bare given names in short cells.** Single-token names like `Jimmy` or `Anna` in a `notes`-style column do not always trigger PERSON per-cell; the column-policy layer compensates for known-PII columns, but a free-text column that occasionally contains a name can still leak.
+- **OOV / minority-language tokens.** Luxembourgish forms (`Lëtzebuerger`, `Kriibs`, `Prisongstrof`) and other rare surface variants are zero-vector in the spaCy models we load. The semantic recognizer falls back to rapidfuzz, but Levenshtein-distance-2 won't catch every misspelling, OCR artefact, or transliteration.
+- **Language mis-routing.** `langdetect` is probabilistic on short cells. A French sentence misclassified as English (or vice-versa) routes to the wrong language's NLP pipeline; the union-seed strategy mitigates this for Art. 9 / Art. 10 detection but doesn't fix every case.
+- **Custom recognizers and the `0.4` threshold.** Context-driven recognizers (NATIONAL_TAX_ID, BOOKING_REF, POSTAL_CODE, CONTRACT_NUMBER, SWIFT_BIC, …) only fire when a context keyword is nearby. A document that strips labels (e.g. a database export with header-less rows) will lose those boosts.
+- **False positives.** Conversely, the embedding/fuzzy layers occasionally flag legitimate non-PII (a product description, a SKU, a hex colour). The pipeline errs on the side of masking, which can damage analytics value.
+- **Categories not modelled.** Behavioural data, genetic information, location traces below `GPS_PRECISION`, and free-text quotations from real people are not exhaustively covered.
+
+**Before publishing the anonymised output, share it with someone who knows the source data.** The `column_policy` audit entry in PostgreSQL is the right starting point — it lists every column the pipeline classified, the action taken (hash / tokenise / bin / scan), and the source tier. Any column tagged `fallback` (Tier C) deserves a manual eyeball pass; any column tagged `presidio_structured` or `embedding_similarity` should be sanity-checked against the source values for unexpected behaviour.
+
+Human verification is the final layer of defence. The code below it is best-effort.

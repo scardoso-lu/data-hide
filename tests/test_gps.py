@@ -1,8 +1,10 @@
 """Tests for GPS coordinate detection and spatial rounding anonymization."""
 
+from decimal import Decimal
+from datetime import datetime, timezone
+
 import pandas as pd
 import pytest
-from datetime import datetime, timezone
 
 from app.classification import detect_gps_columns, detect_timestamp_columns
 from app.anonymization import anonymize_gps_columns, bin_timestamp_columns, _round_wkt
@@ -28,6 +30,19 @@ class TestDetectGpsColumns:
         assert "lat" in cols
         assert "lon" in cols
 
+    def test_detects_string_decimal_lat_lon_by_name(self):
+        df = pd.DataFrame({"latitude": ["49.611234", "49.620000"], "longitude": ["6.131987", "6.140000"]})
+        cols = detect_gps_columns(df)
+        assert set(cols) == {"latitude", "longitude"}
+
+    def test_detects_decimal_object_lat_lon_by_name(self):
+        df = pd.DataFrame({
+            "lat": [Decimal("49.611234"), Decimal("49.620000")],
+            "lon": [Decimal("6.131987"), Decimal("6.140000")],
+        })
+        cols = detect_gps_columns(df)
+        assert set(cols) == {"lat", "lon"}
+
     def test_detects_lng_abbreviation(self):
         df = pd.DataFrame({"lng": [6.1319, 6.1400]})
         assert "lng" in detect_gps_columns(df)
@@ -52,6 +67,10 @@ class TestDetectGpsColumns:
 
     def test_non_gps_string_column_excluded(self):
         df = pd.DataFrame({"notes": ["hello world", "another note"]})
+        assert detect_gps_columns(df) == []
+
+    def test_decimal_values_without_gps_name_excluded(self):
+        df = pd.DataFrame({"amount": ["49.611234", "49.620000"]})
         assert detect_gps_columns(df) == []
 
     def test_out_of_range_values_not_detected(self):
@@ -113,6 +132,24 @@ class TestAnonymizeGpsColumns:
         assert list(result["lat"]) == [49.61, 49.77]
         assert list(result["lon"]) == [6.13, 6.23]
         assert set(anonymized) == {"lat", "lon"}
+
+    def test_default_precision_is_about_one_kilometer(self):
+        df = pd.DataFrame({"lat": [49.6112345], "lon": [6.1319876]})
+        result, _ = anonymize_gps_columns(df, ["lat", "lon"])
+        assert list(result["lat"]) == [49.61]
+        assert list(result["lon"]) == [6.13]
+
+    def test_string_decimal_coordinates_are_rounded(self):
+        df = pd.DataFrame({"latitude": ["49.611234"], "longitude": ["6.131987"]})
+        result, _ = anonymize_gps_columns(df, ["latitude", "longitude"], precision=2)
+        assert list(result["latitude"]) == [49.61]
+        assert list(result["longitude"]) == [6.13]
+
+    def test_decimal_object_coordinates_are_rounded(self):
+        df = pd.DataFrame({"lat": [Decimal("49.611234")], "lon": [Decimal("6.131987")]})
+        result, _ = anonymize_gps_columns(df, ["lat", "lon"], precision=2)
+        assert list(result["lat"]) == [49.61]
+        assert list(result["lon"]) == [6.13]
 
     def test_precision_3_decimal_places(self):
         df = pd.DataFrame({"latitude": [49.611234]})

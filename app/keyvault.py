@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 
@@ -62,7 +62,7 @@ class KeyVaultPseudonymizer:
         *,
         credential: Any = None,
         crypto_client: Any = None,
-        key_version: Optional[str] = None,
+        key_version: str | None = None,
     ) -> None:
         if not vault_url or not key_name:
             raise ValueError("vault_url and key_name are required")
@@ -85,7 +85,7 @@ class KeyVaultPseudonymizer:
     @staticmethod
     def _build_crypto_client(
         vault_url: str, key_name: str, credential: Any,
-    ) -> tuple[Any, Optional[str]]:
+    ) -> tuple[Any, str | None]:
         from azure.identity import DefaultAzureCredential
         from azure.keyvault.keys import KeyClient
         from azure.keyvault.keys.crypto import CryptographyClient
@@ -125,9 +125,9 @@ class KeyVaultPseudonymizer:
 
 
 def build_pseudonymizer_from_env(
-    vault_url: Optional[str],
-    key_name: Optional[str],
-) -> Optional[KeyVaultPseudonymizer]:
+    vault_url: str | None,
+    key_name: str | None,
+) -> KeyVaultPseudonymizer | None:
     if not vault_url and not key_name:
         return None
     if not (vault_url and key_name):

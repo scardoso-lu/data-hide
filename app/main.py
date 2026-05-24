@@ -17,7 +17,6 @@ from .anonymization import (
     EntityRegistry,
     _anonymize_json,
     _anonymize_text,
-    _scan_json_for_pii,
     anonymize_dataframe,
     anonymize_gps_columns,
     bin_numeric_columns,
@@ -35,7 +34,6 @@ from .classification import (
     detect_quasi_identifiers,
     detect_timestamp_columns,
     flag_free_text_columns,
-    sanitize_column_names,
 )
 from .repository import (
     PIPELINE_VERSION,
@@ -47,13 +45,13 @@ from .repository import (
     _account_name,
     _fresh_opts,
     _storage_opts,
+    acquire_cached_token,
     acquire_token,
     connect_audit_db,
     discover_table_mappings,
     read_delta,
     read_sql_table,
     write_delta,
-    write_deltalake,
 )
 from .service import PipelineConfig, record_alert, resolve_table_mappings, run_pipeline, run_table
 
@@ -65,6 +63,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+
+# Quiet third-party loggers that dump every HTTP request/response or every
+# spaCy inference at INFO level.  Their WARNING+ output is still surfaced.
+#
+# * Azure SDK HTTP policy: would otherwise log every Delta upload's HEAD
+#   probe — those routinely return 404 (BlobNotFound) on first write because
+#   we replace-on-write the table directory, which is expected behaviour.
+# * Presidio analyzer: noisy DEBUG/INFO during recognizer initialisation.
+for noisy_logger in (
+    "azure.core.pipeline.policies.http_logging_policy",
+    "azure.identity",
+    "azure.storage",
+):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +125,6 @@ def build_engines():
 def main() -> None:
     _repository.DefaultAzureCredential = DefaultAzureCredential
     _repository.DeltaTable = DeltaTable
-    _repository.write_deltalake = write_deltalake
     _service.connect_audit_db = connect_audit_db
     _service.discover_table_mappings = discover_table_mappings
     _service.read_delta = read_delta
@@ -123,21 +134,17 @@ def main() -> None:
     _service.build_engines = build_engines
     _service.anonymize_dataframe = anonymize_dataframe
     _service.validate_residual_pii = validate_residual_pii
-    _service.sanitize_column_names = sanitize_column_names
-    _service.flag_free_text_columns = flag_free_text_columns
-    _service.detect_quasi_identifiers = detect_quasi_identifiers
     _service.detect_speed_column = detect_speed_column
     _service.aggregate_gps_table = aggregate_gps_table
+    _service.classify_columns = classify_columns
     _service.detect_gps_columns = detect_gps_columns
     _service.anonymize_gps_columns = anonymize_gps_columns
     _service.detect_timestamp_columns = detect_timestamp_columns
     _service.bin_numeric_columns = bin_numeric_columns
     _service.bin_timestamp_columns = bin_timestamp_columns
-    _service.detect_identifier_columns = detect_identifier_columns
     _service.pseudonymize_identifier_columns = pseudonymize_identifier_columns
     _service.build_pseudonymizer_from_env = build_pseudonymizer_from_env
     _service.enforce_k_anonymity = enforce_k_anonymity
-    _service.record_alert = record_alert
     run_pipeline(PipelineConfig.from_env())
 
 
@@ -145,13 +152,16 @@ def run_purview_check(source_uri: str, df_columns: list[str], purview_account: s
     """Compatibility wrapper that keeps old tests patching main.* working."""
     original_client = _repository.PurviewClient
     original_token = _repository.acquire_token
+    original_cached_token = _repository.acquire_cached_token
     try:
         _repository.PurviewClient = PurviewClient
         _repository.acquire_token = acquire_token
+        _repository.acquire_cached_token = acquire_cached_token if acquire_token is original_token else acquire_token
         return _repository.run_purview_check(source_uri, df_columns, purview_account)
     finally:
         _repository.PurviewClient = original_client
         _repository.acquire_token = original_token
+        _repository.acquire_cached_token = original_cached_token
 
 
 if __name__ == "__main__":

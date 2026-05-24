@@ -30,6 +30,11 @@ dependencies = [
     # Microsoft Presidio — PII detection (anonymizer not needed; tokens applied inline)
     "presidio-analyzer>=2.2.354,<3.0.0",
 
+    # Microsoft Presidio structured — column-level PII classification via
+    # value sampling (Tier B1 of the column-policy classifier).  Beta status
+    # accepted; usage is feature-flagged behind ENABLE_PRESIDIO_STRUCTURED.
+    "presidio-structured>=0.0.3,<1.0.0",
+
     # spaCy NLP runtime (models downloaded separately by the pipeline at startup)
     "spacy>=3.7.4,<4.0.0",
 
@@ -42,8 +47,16 @@ dependencies = [
     # SQL Analytics Endpoint reads (Fabric shortcuts via T-SQL)
     "pyodbc>=5.0.0,<6.0.0",
 
+    # Local Delta table creation before upload to OneLake
+    "duckdb>=1.1.0,<2.0.0",
+
     # HTTP client — Purview catalog API + webhook alerts
     "requests>=2.31.0,<3.0.0",
+
+    # Optional fuzzy matcher (opt-in via ENABLE_FUZZY_TYPO_MATCH=1).  Catches
+    # typo'd Art. 9/10 keywords beyond the hand-curated variants in the deny
+    # lists; default off so detection stays deterministic.
+    "rapidfuzz>=3.0.0,<4.0.0",
 ]
 
 [dependency-groups]
