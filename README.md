@@ -104,8 +104,10 @@ Edit `.env` with your values:
 | `MAX_TABLE_WORKERS` | No (default `1`) | Number of tables to process concurrently. Increase only when the host has enough CPU and memory for concurrent NLP work. |
 | `MAX_UPLOAD_WORKERS` | No (default `4`) | Bounded concurrent uploads for Delta data files; `_delta_log` files are uploaded after data files. |
 | `K_ANONYMITY_MIN` | No (default `5`) | Minimum group size for quasi-identifier suppression |
-| `KEY_VAULT_URL` | If identifier columns exist | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
-| `KEY_VAULT_RSA_KEY_NAME` | If identifier columns exist | RSA key name used to derive pseudonyms; the latest enabled version is always used and never leaves the HSM |
+| `ENABLE_KEY_VAULT` | No (default `1`) | Set to `0` to disable Azure Key Vault and use a local HMAC-SHA256 hash instead. Useful for development/testing when no Key Vault is available. When `0`, `KEY_VAULT_URL` and `KEY_VAULT_RSA_KEY_NAME` are ignored. |
+| `HASH_SALT` | If `ENABLE_KEY_VAULT=0` | Secret salt for the local hash pseudonymizer. If omitted a fixed default is used — deterministic but not secret, so only suitable for local development. |
+| `KEY_VAULT_URL` | If identifier columns exist and `ENABLE_KEY_VAULT=1` | Azure Key Vault URL (e.g. `https://my-vault.vault.azure.net/`) |
+| `KEY_VAULT_RSA_KEY_NAME` | If identifier columns exist and `ENABLE_KEY_VAULT=1` | RSA key name used to derive pseudonyms; the latest enabled version is always used and never leaves the HSM |
 | `GPS_PRECISION` | No (default `2`) | Decimal places for GPS rounding (2 is about 1 km) |
 | `SQL_ENDPOINT_URL` | No | Fabric SQL Analytics Endpoint — enables shortcut discovery |
 | `SQL_DATABASE` | No | Database name on the SQL endpoint |

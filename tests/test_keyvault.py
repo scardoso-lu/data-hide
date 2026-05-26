@@ -16,7 +16,9 @@ import pytest
 
 from app.keyvault import (
     KeyVaultPseudonymizer,
+    LocalHashPseudonymizer,
     _DERIVATION_CONSTANT,
+    _LOCAL_HASH_DEFAULT_SALT,
     build_pseudonymizer_from_env,
 )
 
@@ -179,3 +181,64 @@ class TestBuildPseudonymizerFromEnv:
             build_pseudonymizer_from_env("https://v.vault.azure.net/", None)
         with pytest.raises(RuntimeError, match="both be set"):
             build_pseudonymizer_from_env(None, "key")
+
+    def test_key_vault_disabled_returns_local_hash(self):
+        result = build_pseudonymizer_from_env(None, None, enable_key_vault=False)
+        assert isinstance(result, LocalHashPseudonymizer)
+
+    def test_key_vault_disabled_ignores_url_and_key(self):
+        """When disabled, Key Vault credentials are ignored — no error raised."""
+        result = build_pseudonymizer_from_env(
+            "https://v.vault.azure.net/", "key", enable_key_vault=False,
+        )
+        assert isinstance(result, LocalHashPseudonymizer)
+
+    def test_key_vault_disabled_passes_salt(self):
+        p = build_pseudonymizer_from_env(None, None, enable_key_vault=False, hash_salt="my-salt")
+        assert isinstance(p, LocalHashPseudonymizer)
+        assert p("EMP001") == LocalHashPseudonymizer("my-salt")("EMP001")
+
+
+class TestLocalHashPseudonymizer:
+
+    def test_returns_24_hex_string(self):
+        p = LocalHashPseudonymizer("test-salt")
+        token = p.pseudonymize("EMP001")
+        assert isinstance(token, str) and len(token) == 24
+        int(token, 16)
+
+    def test_deterministic(self):
+        p = LocalHashPseudonymizer("test-salt")
+        assert p.pseudonymize("EMP001") == p.pseudonymize("EMP001")
+
+    def test_different_values_different_tokens(self):
+        p = LocalHashPseudonymizer("test-salt")
+        assert p.pseudonymize("EMP001") != p.pseudonymize("EMP002")
+
+    def test_different_salts_different_tokens(self):
+        p1 = LocalHashPseudonymizer("salt-a")
+        p2 = LocalHashPseudonymizer("salt-b")
+        assert p1.pseudonymize("EMP001") != p2.pseudonymize("EMP001")
+
+    def test_null_passes_through(self):
+        p = LocalHashPseudonymizer("test-salt")
+        assert p.pseudonymize(None) is None
+        assert pd.isna(p.pseudonymize(pd.NA))
+
+    def test_integer_coerced_to_string(self):
+        p = LocalHashPseudonymizer("test-salt")
+        assert p.pseudonymize(42) == p.pseudonymize("42")
+
+    def test_callable_protocol(self):
+        p = LocalHashPseudonymizer("test-salt")
+        assert p("EMP001") == p.pseudonymize("EMP001")
+
+    def test_key_version_is_none(self):
+        assert LocalHashPseudonymizer("salt").key_version is None
+
+    def test_no_salt_uses_fixed_default(self):
+        import hashlib, hmac as _hmac
+        p = LocalHashPseudonymizer()
+        expected_secret = hashlib.sha256(_LOCAL_HASH_DEFAULT_SALT).digest()
+        expected = _hmac.new(expected_secret, b"EMP001", hashlib.sha256).hexdigest()[:24]
+        assert p.pseudonymize("EMP001") == expected
