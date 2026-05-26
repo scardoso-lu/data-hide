@@ -40,6 +40,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Fixed domain separator used by LocalHashPseudonymizer when no HASH_SALT is set.
+_LOCAL_HASH_DEFAULT_SALT = b"fabric-pii-pipeline:local-hash:v1"
+
 # Fixed constant used as the input to the RSA signing operation.  Changing
 # this string invalidates every pseudonym ever produced — treat as a versioned
 # domain separator.
@@ -124,10 +127,59 @@ class KeyVaultPseudonymizer:
     __call__ = pseudonymize
 
 
+class LocalHashPseudonymizer:
+    """Deterministic pseudonymizer that runs entirely in process — no Key Vault.
+
+    Produces the same 24-hex-character tokens as ``KeyVaultPseudonymizer``.
+    The secret is derived from ``HASH_SALT``; if the salt is not supplied a
+    fixed default is used (tokens are still deterministic, but anyone who
+    knows the default can reverse-look-up short identifiers — only use the
+    default in development / testing environments).
+    """
+
+    key_version: str | None = None  # no Key Vault key material
+
+    def __init__(self, salt: str | None = None) -> None:
+        if salt:
+            self._secret = hashlib.sha256(salt.encode("utf-8")).digest()
+            logger.info("LocalHashPseudonymizer initialised with HASH_SALT")
+        else:
+            self._secret = hashlib.sha256(_LOCAL_HASH_DEFAULT_SALT).digest()
+            logger.warning(
+                "LocalHashPseudonymizer: HASH_SALT is not set — using fixed default. "
+                "Only suitable for development/testing; set HASH_SALT in production."
+            )
+
+    def pseudonymize(self, value: object) -> object:
+        try:
+            if pd.isna(value):
+                return value
+        except (TypeError, ValueError):
+            pass
+        raw = value if isinstance(value, str) else str(value)
+        return hmac.new(self._secret, raw.encode("utf-8"), hashlib.sha256).hexdigest()[
+            :_PSEUDONYM_HEX_LENGTH
+        ]
+
+    __call__ = pseudonymize
+
+
 def build_pseudonymizer_from_env(
     vault_url: str | None,
     key_name: str | None,
-) -> KeyVaultPseudonymizer | None:
+    *,
+    enable_key_vault: bool = True,
+    hash_salt: str | None = None,
+) -> KeyVaultPseudonymizer | LocalHashPseudonymizer | None:
+    """Build a pseudonymizer from environment configuration.
+
+    When *enable_key_vault* is ``False`` a ``LocalHashPseudonymizer`` is
+    returned regardless of *vault_url* / *key_name* — Key Vault is never
+    contacted.  Set ``ENABLE_KEY_VAULT=0`` and optionally ``HASH_SALT`` in
+    ``.env`` to use this mode.
+    """
+    if not enable_key_vault:
+        return LocalHashPseudonymizer(hash_salt)
     if not vault_url and not key_name:
         return None
     if not (vault_url and key_name):

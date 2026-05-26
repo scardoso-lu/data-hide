@@ -68,6 +68,8 @@ class PipelineConfig:
     k_anonymity_min: int
     key_vault_url: str | None = None
     key_vault_rsa_key_name: str | None = None
+    key_vault_enabled: bool = True
+    hash_salt: str | None = None
     quasi_identifier_cols: tuple[str, ...] = ()
     identifier_cols: tuple[str, ...] = ()
     source_base_uri: str | None = None
@@ -85,6 +87,10 @@ class PipelineConfig:
             k_anonymity_min=int(os.environ.get("K_ANONYMITY_MIN", "5")),
             key_vault_url=os.environ.get("KEY_VAULT_URL"),
             key_vault_rsa_key_name=os.environ.get("KEY_VAULT_RSA_KEY_NAME"),
+            key_vault_enabled=os.environ.get("ENABLE_KEY_VAULT", "1").strip().lower() in {
+                "1", "true", "yes", "on",
+            },
+            hash_salt=os.environ.get("HASH_SALT"),
             quasi_identifier_cols=_csv(os.environ.get("QUASI_IDENTIFIER_COLS", "")),
             identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
@@ -283,12 +289,14 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 pseudonymizer = build_pseudonymizer_from_env(
                     config.key_vault_url,
                     config.key_vault_rsa_key_name,
+                    enable_key_vault=config.key_vault_enabled,
+                    hash_salt=config.hash_salt,
                 )
                 if pseudonymizer is None:
                     raise RuntimeError(
                         "Identifier columns detected but Key Vault is not configured. "
-                        "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or restrict "
-                        "IDENTIFIER_COLS so no identifier columns remain."
+                        "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or set "
+                        "ENABLE_KEY_VAULT=0 to use local hashing instead."
                     )
                 df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer)
                 audit["key_vault_key_version"] = pseudonymizer.key_version
@@ -337,7 +345,10 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             policy_pseudonymizer = pseudonymizer if policy_needs_hash else None
             if policy_needs_hash and policy_pseudonymizer is None:
                 policy_pseudonymizer = build_pseudonymizer_from_env(
-                    config.key_vault_url, config.key_vault_rsa_key_name,
+                    config.key_vault_url,
+                    config.key_vault_rsa_key_name,
+                    enable_key_vault=config.key_vault_enabled,
+                    hash_salt=config.hash_salt,
                 )
 
             with timed_stage(audit, "column_policy_mask"):
