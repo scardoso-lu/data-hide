@@ -223,3 +223,58 @@ def test_build_engines_ignores_unmapped_cardinal_spacy_label(monkeypatch):
         }
     ]
     assert captured["nlp_recognizer_added"] is not None
+
+
+class FakeAnalyzerPersonOnly:
+    """Detects PERSON in any value that contains the literal word 'Alice'."""
+
+    def analyze(self, text, entities=None, language=None, score_threshold=None):
+        start = text.find("Alice")
+        if start < 0:
+            return []
+        return [SimpleNamespace(entity_type="PERSON", start=start, end=start + len("Alice"), score=1.0)]
+
+
+class TestAnonymizeDataframeScanColumns:
+    """anonymize_dataframe must respect the scan_columns allow-list."""
+
+    def test_only_listed_columns_are_scanned(self):
+        analyzer = FakeAnalyzerPersonOnly()
+        df = pd.DataFrame({
+            "notes": ["Alice went to Paris"],
+            "status": ["Alice"],
+        })
+        result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=["notes"])
+
+        assert "PERSON_0" in result["notes"].iloc[0]
+        assert result["status"].iloc[0] == "Alice"
+        assert stats["text_columns_scanned"] == ["notes"]
+
+    def test_none_scan_columns_scans_all_text_columns(self):
+        analyzer = FakeAnalyzerPersonOnly()
+        df = pd.DataFrame({
+            "notes": ["Alice went to Paris"],
+            "status": ["Alice"],
+        })
+        result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=None)
+
+        assert "PERSON_0" in result["notes"].iloc[0]
+        assert "PERSON_0" in result["status"].iloc[0]
+        assert set(stats["text_columns_scanned"]) == {"notes", "status"}
+
+    def test_empty_scan_columns_skips_all(self):
+        analyzer = FakeAnalyzerPersonOnly()
+        df = pd.DataFrame({"notes": ["Alice went to Paris"]})
+        result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=[])
+
+        assert result["notes"].iloc[0] == "Alice went to Paris"
+        assert stats["text_columns_scanned"] == []
+
+    def test_nonexistent_scan_column_is_ignored(self):
+        analyzer = FakeAnalyzerPersonOnly()
+        df = pd.DataFrame({"notes": ["Alice went to Paris"]})
+        result, stats = anonymize_dataframe(
+            df, analyzer, EntityRegistry(), scan_columns=["notes", "nonexistent"]
+        )
+        assert "PERSON_0" in result["notes"].iloc[0]
+        assert stats["text_columns_scanned"] == ["notes"]
