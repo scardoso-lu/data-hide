@@ -5,6 +5,15 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from app.classification import (
+    ACTION_BIN,
+    ACTION_HASH,
+    ACTION_SCAN,
+    ColumnPolicy,
+    classify_pii_columns,
+    free_text_columns_from_policies,
+    _tier_c_fallback,
+)
 from app.anonymization import (
     EntityRegistry,
     SPACY_LABELS_TO_IGNORE,
@@ -278,3 +287,51 @@ class TestAnonymizeDataframeScanColumns:
         )
         assert "PERSON_0" in result["notes"].iloc[0]
         assert stats["text_columns_scanned"] == ["notes"]
+
+
+class TestTierCFallback:
+    """_tier_c_fallback must not send short structured columns to row-by-row scan."""
+
+    # A fake analyzer that always returns no findings (Tier B1 must not fire).
+    class _NullAnalyzer:
+        def analyze(self, text, entities=None, language=None, score_threshold=None):
+            return []
+
+    def _classify(self, df: pd.DataFrame) -> dict[str, ColumnPolicy]:
+        return classify_pii_columns(
+            df,
+            analyzer=self._NullAnalyzer(),
+            similarity_models={},   # skip Tier B2
+        )
+
+    def test_free_text_column_gets_action_scan(self):
+        long_values = [
+            "Customer called to report a problem with their recent order and requested a refund.",
+            "Follow-up needed: the delivery was delayed by three days due to a warehouse issue.",
+            "Agent noted the account has been flagged for unusual login activity in the past week.",
+        ]
+        df = pd.DataFrame({"notes": long_values})
+        policies = self._classify(df)
+
+        assert "notes" in policies
+        assert policies["notes"].action == ACTION_SCAN
+        assert "notes" in free_text_columns_from_policies(policies)
+
+    def test_short_structured_column_gets_action_bin(self):
+        df = pd.DataFrame({"status": ["Active", "Inactive", "Pending"]})
+        policies = self._classify(df)
+
+        assert "status" in policies
+        assert policies["status"].action == ACTION_BIN
+        assert "status" not in free_text_columns_from_policies(policies)
+
+    def test_already_classified_column_not_overwritten(self):
+        df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
+        existing = ColumnPolicy(
+            column="email", entity_type="EMAIL_ADDRESS",
+            action=ACTION_HASH, source="presidio_structured", score=0.9,
+        )
+        policies: dict[str, ColumnPolicy] = {"email": existing}
+        _tier_c_fallback(df, policies)
+
+        assert policies["email"] is existing
