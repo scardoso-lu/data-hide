@@ -682,13 +682,24 @@ def _tier_b2_embedding(
 
 
 def _tier_c_fallback(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
-    """Unclassified text columns drop to a FREE_TEXT policy → action=SCAN,
-    which keeps the existing row-by-row Presidio scan as the backstop."""
+    """Unclassified text columns get a FREE_TEXT fallback policy.
+
+    Columns whose sampled values look like free text (long strings, many
+    words, or JSON blobs) get ACTION_SCAN so the row-by-row Presidio pass
+    covers them.  Short structured columns (codes, categories, flags) get
+    ACTION_BIN, which skips both the column-policy masking layer and the
+    row-by-row scan — Presidio would find nothing useful there anyway.
+    """
     for column in df.columns:
         if column in policies or not _is_text_column(df[column].dtype):
             continue
-        policies[column] = _make_policy(
-            column, FREE_TEXT, source="fallback", score=0.0,
+        action = ACTION_SCAN if _looks_like_free_text(_sample(df[column])) else ACTION_BIN
+        policies[column] = ColumnPolicy(
+            column=column,
+            entity_type=FREE_TEXT,
+            action=action,
+            source="fallback",
+            score=0.0,
         )
 
 

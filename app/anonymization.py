@@ -434,12 +434,16 @@ def anonymize_dataframe(
     df: pd.DataFrame,
     analyzer: Any,
     registry: EntityRegistry | None = None,
+    scan_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     if registry is None:
         registry = EntityRegistry()
 
     df = df.copy()
-    text_cols = [c for c in df.columns if _is_text_column(df[c].dtype)]
+    if scan_columns is not None:
+        text_cols = [c for c in scan_columns if c in df.columns and _is_text_column(df[c].dtype)]
+    else:
+        text_cols = [c for c in df.columns if _is_text_column(df[c].dtype)]
     entity_counts: dict[str, int] = {}
     cols_hit: list[str] = []
     column_stats: list[dict] = []

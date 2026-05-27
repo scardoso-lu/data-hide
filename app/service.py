@@ -35,6 +35,7 @@ from .classification import (
     classify_pii_columns,
     detect_gps_columns,
     detect_timestamp_columns,
+    free_text_columns_from_policies,
 )
 from .keyvault import build_pseudonymizer_from_env
 from .repository import (
@@ -333,6 +334,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         # Hash/tokenise classified columns BEFORE row-by-row Presidio scans.
         # Failures here are non-fatal — the existing per-cell scan remains
         # the backstop.
+        scan_columns: list[str] | None = None
         if _column_policy_enabled():
             with timed_stage(audit, "column_policy_classification"):
                 try:
@@ -367,9 +369,10 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                     col: pol.source for col, pol in policies.items()
                 },
             }
+            scan_columns = free_text_columns_from_policies(policies)
 
         with timed_stage(audit, "anonymization"):
-            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry)
+            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry, scan_columns=scan_columns)
         _apply_anonymization_audit(audit, stats, registry)
 
         if db and stats["column_stats"]:
