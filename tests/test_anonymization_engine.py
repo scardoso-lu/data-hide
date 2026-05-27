@@ -10,8 +10,10 @@ from app.classification import (
     ACTION_HASH,
     ACTION_SCAN,
     ColumnPolicy,
+    FREE_TEXT,
     classify_pii_columns,
     free_text_columns_from_policies,
+    _looks_like_free_text,
     _tier_c_fallback,
 )
 from app.anonymization import (
@@ -289,10 +291,65 @@ class TestAnonymizeDataframeScanColumns:
         assert stats["text_columns_scanned"] == ["notes"]
 
 
-class TestTierCFallback:
-    """_tier_c_fallback must not send short structured columns to row-by-row scan."""
+class TestLooksLikeFreeText:
+    """Boundary conditions for the _looks_like_free_text heuristic."""
 
-    # A fake analyzer that always returns no findings (Tier B1 must not fire).
+    # ── avg_len >= 32 ────────────────────────────────────────────────────────
+
+    def test_avg_len_at_threshold_is_free_text(self):
+        assert _looks_like_free_text(["x" * 32]) is True
+
+    def test_avg_len_below_threshold_alone_is_not(self):
+        # 31 chars, 1 word, not JSON → all three checks miss
+        assert _looks_like_free_text(["x" * 31]) is False
+
+    def test_avg_len_across_multiple_values(self):
+        # average is (40 + 24) / 2 = 32 → True
+        assert _looks_like_free_text(["x" * 40, "y" * 24]) is True
+
+    # ── avg_words >= 5 ───────────────────────────────────────────────────────
+
+    def test_exactly_five_words_is_free_text(self):
+        assert _looks_like_free_text(["one two three four five"]) is True
+
+    def test_four_words_is_not_free_text(self):
+        assert _looks_like_free_text(["one two three four"]) is False
+
+    def test_avg_words_across_multiple_values(self):
+        # (6 + 4) / 2 = 5.0 → True
+        assert _looks_like_free_text(["a b c d e f", "w x y z"]) is True
+
+    # ── jsonish >= 0.5 ───────────────────────────────────────────────────────
+
+    def test_half_json_values_is_free_text(self):
+        assert _looks_like_free_text(['{"a": 1}', "plain"]) is True
+
+    def test_array_json_values_is_free_text(self):
+        assert _looks_like_free_text(['["x", "y"]', "plain"]) is True
+
+    def test_less_than_half_json_is_not(self):
+        # 1 out of 3 → 0.33 < 0.5
+        assert _looks_like_free_text(['{"a": 1}', "plain", "also plain"]) is False
+
+    # ── edge cases ───────────────────────────────────────────────────────────
+
+    def test_empty_list_returns_false(self):
+        assert _looks_like_free_text([]) is False
+
+    def test_all_non_string_values_returns_false(self):
+        assert _looks_like_free_text([None, 42, True, 3.14]) is False
+
+    def test_blank_strings_ignored(self):
+        assert _looks_like_free_text(["", "   ", None]) is False
+
+    def test_non_string_values_are_filtered_out(self):
+        # only the one real string; it's short and one word → False
+        assert _looks_like_free_text([None, 42, "short"]) is False
+
+
+class TestTierCFallback:
+    """_tier_c_fallback gates row-by-row scanning to genuinely free-text columns."""
+
     class _NullAnalyzer:
         def analyze(self, text, entities=None, language=None, score_threshold=None):
             return []
@@ -304,7 +361,9 @@ class TestTierCFallback:
             similarity_models={},   # skip Tier B2
         )
 
-    def test_free_text_column_gets_action_scan(self):
+    # ── ACTION_SCAN paths ────────────────────────────────────────────────────
+
+    def test_long_text_column_gets_action_scan(self):
         long_values = [
             "Customer called to report a problem with their recent order and requested a refund.",
             "Follow-up needed: the delivery was delayed by three days due to a warehouse issue.",
@@ -317,6 +376,24 @@ class TestTierCFallback:
         assert policies["notes"].action == ACTION_SCAN
         assert "notes" in free_text_columns_from_policies(policies)
 
+    def test_many_words_column_gets_action_scan(self):
+        # avg_words >= 5 path
+        df = pd.DataFrame({"remarks": ["one two three four five six", "a b c d e f g"]})
+        policies = self._classify(df)
+
+        assert "remarks" in policies
+        assert policies["remarks"].action == ACTION_SCAN
+
+    def test_json_blob_column_gets_action_scan(self):
+        # jsonish >= 0.5 path
+        df = pd.DataFrame({"payload": ['{"event": "click", "user": "u1"}', '{"event": "view"}']})
+        policies = self._classify(df)
+
+        assert "payload" in policies
+        assert policies["payload"].action == ACTION_SCAN
+
+    # ── ACTION_BIN paths ─────────────────────────────────────────────────────
+
     def test_short_structured_column_gets_action_bin(self):
         df = pd.DataFrame({"status": ["Active", "Inactive", "Pending"]})
         policies = self._classify(df)
@@ -324,6 +401,37 @@ class TestTierCFallback:
         assert "status" in policies
         assert policies["status"].action == ACTION_BIN
         assert "status" not in free_text_columns_from_policies(policies)
+
+    def test_single_word_enum_column_gets_action_bin(self):
+        df = pd.DataFrame({"type": ["A", "B", "C", "D"]})
+        policies = self._classify(df)
+
+        assert "type" in policies
+        assert policies["type"].action == ACTION_BIN
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+
+    def test_fallback_policy_source_is_fallback(self):
+        df = pd.DataFrame({"notes": ["short"]})
+        policies = self._classify(df)
+
+        assert policies["notes"].source == "fallback"
+
+    def test_fallback_policy_entity_type_is_free_text(self):
+        df = pd.DataFrame({"notes": ["short"]})
+        policies = self._classify(df)
+
+        assert policies["notes"].entity_type == FREE_TEXT
+
+    # ── Non-text columns skipped ─────────────────────────────────────────────
+
+    def test_numeric_column_not_added_to_policies(self):
+        df = pd.DataFrame({"age": [25, 30, 35]})
+        policies = self._classify(df)
+
+        assert "age" not in policies
+
+    # ── Pre-classified columns not overwritten ───────────────────────────────
 
     def test_already_classified_column_not_overwritten(self):
         df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
@@ -335,3 +443,46 @@ class TestTierCFallback:
         _tier_c_fallback(df, policies)
 
         assert policies["email"] is existing
+
+
+class TestScanColumnsIntegration:
+    """End-to-end: classify → free_text_columns_from_policies → anonymize_dataframe.
+
+    Verifies that only free-text columns are passed to the row-by-row scanner
+    and that structured columns are left untouched.
+    """
+
+    class _PersonInNotes:
+        """Finds PERSON in any string containing 'Alice'."""
+        def analyze(self, text, entities=None, language=None, score_threshold=None):
+            start = text.find("Alice")
+            if start < 0:
+                return []
+            return [SimpleNamespace(entity_type="PERSON", start=start, end=start + len("Alice"), score=1.0)]
+
+    def test_only_free_text_columns_scanned(self):
+        free_text = [
+            "Alice contacted support about a billing issue with her account last Tuesday.",
+            "The customer Alice reported that her order was missing two items from the shipment.",
+        ]
+        df = pd.DataFrame({
+            "notes": free_text,
+            "status": ["Open", "Closed"],          # short structured → ACTION_BIN
+        })
+
+        analyzer = self._PersonInNotes()
+        policies = classify_pii_columns(df, analyzer=analyzer, similarity_models={})
+        scan_cols = free_text_columns_from_policies(policies)
+
+        assert "notes" in scan_cols
+        assert "status" not in scan_cols
+
+        result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=scan_cols)
+
+        # notes column: Alice must be masked
+        for val in result["notes"]:
+            assert "Alice" not in val
+
+        # status column: unchanged — not scanned
+        assert list(result["status"]) == ["Open", "Closed"]
+        assert "status" not in stats["text_columns_scanned"]
