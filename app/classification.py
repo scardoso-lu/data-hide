@@ -646,10 +646,14 @@ def _tier_b1_presidio_structured(
     ]
     if not candidate_cols:
         return
+    # A few hundred rows is sufficient to determine dominant entity types per
+    # column; scanning the full table here is pure waste since the same rows
+    # get a second Presidio pass during anonymization.
+    _TIER_B1_SAMPLE_ROWS = 500
     try:
         from presidio_structured import PandasAnalysisBuilder
         builder = PandasAnalysisBuilder(analyzer=analyzer)
-        analysis = builder.generate_analysis(df[candidate_cols])
+        analysis = builder.generate_analysis(df[candidate_cols].head(_TIER_B1_SAMPLE_ROWS))
     except Exception:
         return  # log path — caller wraps this in a logger.warning if desired
     for column, entity in (analysis.entity_mapping or {}).items():
@@ -770,6 +774,7 @@ def apply_column_policies(
     *,
     registry: Any | None = None,
     pseudonymizer: Any | None = None,
+    inplace: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Apply each `ColumnPolicy`'s action to every non-null cell in its column.
 
@@ -793,8 +798,10 @@ def apply_column_policies(
     which classifier tier acted on which column.
 
     The DataFrame is copied before mutation so callers can keep the original.
+    Pass ``inplace=True`` to skip the copy when the caller transfers ownership.
     """
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
     stats = {
         "columns_processed": [],
         "actions_applied": {},
