@@ -21,6 +21,9 @@ from app.anonymization import (
     SPACY_LABELS_TO_IGNORE,
     SPACY_TO_PRESIDIO_ENTITY_MAPPING,
     SUPPORTED_LANGUAGES,
+    _analyze,
+    _detect_column_language,
+    _detect_language,
     _resolve_overlapping_findings,
     anonymize_dataframe,
     build_engines,
@@ -501,3 +504,147 @@ class TestScanColumnsIntegration:
         # status column: unchanged — not scanned
         assert list(result["status"]) == ["Open", "Closed"]
         assert "status" not in stats["text_columns_scanned"]
+
+
+class TestDetectColumnLanguage:
+    """_detect_column_language must return the majority language from a sample."""
+
+    def test_english_column_returns_en(self):
+        series = pd.Series([
+            "The customer placed an order yesterday.",
+            "Please contact support for further assistance.",
+            "Your invoice has been processed successfully.",
+        ])
+        assert _detect_column_language(series) == "en"
+
+    def test_french_column_returns_fr(self):
+        series = pd.Series([
+            "Le client a passé une commande hier.",
+            "Veuillez contacter le support pour obtenir de l'aide.",
+            "Votre facture a été traitée avec succès.",
+        ])
+        assert _detect_column_language(series) == "fr"
+
+    def test_empty_series_returns_en(self):
+        assert _detect_column_language(pd.Series([], dtype="object")) == "en"
+
+    def test_all_null_series_returns_en(self):
+        assert _detect_column_language(pd.Series([None, None])) == "en"
+
+    def test_all_blank_strings_returns_en(self):
+        assert _detect_column_language(pd.Series(["", "   "])) == "en"
+
+    def test_non_string_values_ignored(self):
+        series = pd.Series([42, None, True])
+        assert _detect_column_language(series) == "en"
+
+    def test_homogeneous_majority_returns_language(self):
+        series = pd.Series([
+            "English sentence one.",
+            "English sentence two.",
+            "English sentence three.",
+            "English sentence four.",
+            "Le client a passé une commande.",   # one French value out of 5
+        ])
+        # 4/5 = 80 % English → threshold met → "en"
+        assert _detect_column_language(series) == "en"
+
+    def test_mixed_language_column_returns_none(self):
+        # Luxembourg-style comment column: en / fr / de / lb all present
+        series = pd.Series([
+            "The customer placed an order yesterday.",
+            "Le client a passé une commande hier.",
+            "Der Kunde hat gestern eine Bestellung aufgegeben.",
+            "Den Client huet gëschter eng Bestellung gemaach.",
+        ])
+        # No single language reaches 80 % → None (per-value fallback)
+        result = _detect_column_language(series)
+        assert result is None
+
+    def test_samples_at_most_n_samples(self):
+        # 100 rows; with n_samples=5, only 5 calls should be made.
+        # We use a counting wrapper around _detect_language.
+        calls = []
+        original = _detect_language.__wrapped__  # unwrap lru_cache
+        series = pd.Series([f"English text row {i}" for i in range(100)])
+
+        import app.anonymization as anon_mod
+        original_fn = anon_mod._detect_language
+
+        def counting_detect(text):
+            calls.append(text)
+            return original_fn(text)
+
+        import unittest.mock as mock
+        with mock.patch("app.anonymization._detect_language", side_effect=counting_detect):
+            _detect_column_language(series, n_samples=5)
+
+        assert len(calls) <= 5
+
+
+class TestAnalyzeLanguageFastPath:
+    """_analyze skips per-value detection when language is passed explicitly."""
+
+    def test_none_language_triggers_per_value_detection(self):
+        received = []
+
+        class FakeAnalyzer:
+            def analyze(self, text, entities=None, language=None, score_threshold=None):
+                received.append(language)
+                return []
+
+        # language=None → _detect_language resolves it per value
+        _analyze("hello world", FakeAnalyzer(), language=None)
+        assert received[0] in ("en", "fr", "de", "lb")
+
+    def test_explicit_language_bypasses_detection(self):
+        received = []
+
+        class FakeAnalyzer:
+            def analyze(self, text, entities=None, language=None, score_threshold=None):
+                received.append(language)
+                return []
+
+        _analyze("bonjour", FakeAnalyzer(), language="en")
+        assert received == ["en"]
+
+    def test_homogeneous_column_uses_single_language_for_all_rows(self):
+        received_languages = []
+
+        class TrackingAnalyzer:
+            def analyze(self, text, entities=None, language=None, score_threshold=None):
+                received_languages.append(language)
+                return []
+
+        df = pd.DataFrame({"notes": [
+            "The customer placed an order yesterday.",
+            "Please contact support for further assistance.",
+            "Your invoice has been processed successfully.",
+        ]})
+        anonymize_dataframe(df, TrackingAnalyzer(), scan_columns=["notes"])
+
+        # All rows get the same column-level language (detected once)
+        assert len(received_languages) == 3
+        assert len(set(received_languages)) == 1
+        assert received_languages[0] in ("en", "fr", "de", "lb")
+
+    def test_mixed_language_column_uses_per_value_detection(self):
+        received_languages = []
+
+        class TrackingAnalyzer:
+            def analyze(self, text, entities=None, language=None, score_threshold=None):
+                received_languages.append(language)
+                return []
+
+        # Four rows, each in a different language → column returns None → per-value
+        df = pd.DataFrame({"comments": [
+            "The customer placed an order yesterday.",
+            "Le client a passé une commande hier.",
+            "Der Kunde hat gestern eine Bestellung aufgegeben.",
+            "Den Client huet gëschter eng Bestellung gemaach.",
+        ]})
+        anonymize_dataframe(df, TrackingAnalyzer(), scan_columns=["comments"])
+
+        # Languages may differ across rows (each value detected individually)
+        assert len(received_languages) == 4
+        assert all(lang in ("en", "fr", "de", "lb") for lang in received_languages)

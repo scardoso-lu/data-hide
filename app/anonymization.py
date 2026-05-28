@@ -214,7 +214,37 @@ def _detect_language(text: str) -> str:
         return "en"
 
 
-def _analyze(text: str, analyzer: Any):
+_COLUMN_LANGUAGE_HOMOGENEITY_THRESHOLD = 0.8
+
+
+def _detect_column_language(series: pd.Series, n_samples: int = 20) -> str | None:
+    """Sample up to *n_samples* non-null strings from *series* and return the
+    dominant language if ≥ 80 % of the sample agrees, otherwise ``None``.
+
+    ``None`` signals that the column is multilingual (e.g. a Luxembourg comment
+    column mixing en/fr/de/lb) and the caller should fall back to per-value
+    detection so no row's language is misidentified.
+
+    A homogeneous column (all English, all French, …) detects its language
+    in O(n_samples) calls instead of O(unique_values) calls, eliminating the
+    dominant langdetect cost for large free-text columns.
+    """
+    strings = [v for v in series if isinstance(v, str) and v.strip()]
+    if not strings:
+        return "en"
+    step = max(1, len(strings) // n_samples)
+    sample = strings[::step][:n_samples]
+    counts: dict[str, int] = {}
+    for s in sample:
+        lang = _detect_language(s)
+        counts[lang] = counts.get(lang, 0) + 1
+    top_lang = max(counts, key=counts.__getitem__)
+    if counts[top_lang] / len(sample) >= _COLUMN_LANGUAGE_HOMOGENEITY_THRESHOLD:
+        return top_lang
+    return None  # mixed-language column — caller will detect per value
+
+
+def _analyze(text: str, analyzer: Any, language: str | None = None) -> list:
     # Pass the minimum threshold across all entity-specific thresholds to
     # Presidio so it can short-circuit obvious non-matches, then apply the
     # per-entity threshold ourselves.  This keeps high-precision entities
@@ -223,7 +253,11 @@ def _analyze(text: str, analyzer: Any):
         [DEFAULT_SCORE_THRESHOLD, *PRESIDIO_SCORE_THRESHOLDS.values()],
         default=DEFAULT_SCORE_THRESHOLD,
     )
-    language = _detect_language(text)
+    # When language is None (direct callers, e.g. tests), detect per-value.
+    # When called from anonymize_dataframe it is pre-resolved at column level,
+    # so detection is skipped for all values in that column.
+    if language is None:
+        language = _detect_language(text)
     findings = analyzer.analyze(
         text=text,
         entities=_entities_supported_in(analyzer, language),
@@ -416,8 +450,8 @@ def _resolve_overlapping_findings(findings: list) -> list:
     return sorted(kept, key=lambda f: f.start)
 
 
-def _anonymize_text(text: str, analyzer: Any, registry: EntityRegistry) -> tuple[str, list]:
-    findings = _resolve_overlapping_findings(_analyze(text, analyzer))
+def _anonymize_text(text: str, analyzer: Any, registry: EntityRegistry, language: str | None = None) -> tuple[str, list]:
+    findings = _resolve_overlapping_findings(_analyze(text, analyzer, language))
     if not findings:
         return text, []
     result = text
@@ -451,11 +485,12 @@ def anonymize_dataframe(
     cache: dict[object, tuple[object, list]] = {}
 
     for col in text_cols:
+        language = _detect_column_language(df[col])
         col_detections = 0
         col_entity_counts: dict[str, int] = {}
         new_values: list = []
         for val in df[col]:
-            anon_val, all_findings = _anonymize_value_cached(val, analyzer, registry, cache)
+            anon_val, all_findings = _anonymize_value_cached(val, analyzer, registry, cache, language)
             new_values.append(anon_val)
 
             for f in all_findings:
@@ -482,12 +517,14 @@ def _anonymize_value_cached(
     analyzer: Any,
     registry: EntityRegistry,
     cache: dict[object, tuple[object, list]],
+    language: str | None = None,
 ) -> tuple[object, list]:
-    key = _cache_key(val)
+    raw_key = _cache_key(val)
+    key = (raw_key, language) if raw_key is not None else None
     if key is not None and key in cache:
         return cache[key]
 
-    result = _anonymize_value(val, analyzer, registry)
+    result = _anonymize_value(val, analyzer, registry, language)
     if key is not None:
         cache[key] = result
     return result
@@ -504,20 +541,20 @@ def _cache_key(val: object) -> object | None:
     return None
 
 
-def _anonymize_value(val: object, analyzer: Any, registry: EntityRegistry) -> tuple[object, list]:
+def _anonymize_value(val: object, analyzer: Any, registry: EntityRegistry, language: str | None = None) -> tuple[object, list]:
     if isinstance(val, (dict, list)):
-        return _anonymize_json(val, analyzer, registry)
+        return _anonymize_json(val, analyzer, registry, language)
     if isinstance(val, str):
         if _looks_like_json(val):
             try:
                 parsed = json.loads(val)
                 if isinstance(parsed, (dict, list)):
-                    anon_obj, all_findings = _anonymize_json(parsed, analyzer, registry)
+                    anon_obj, all_findings = _anonymize_json(parsed, analyzer, registry, language)
                     return json.dumps(anon_obj, ensure_ascii=False), all_findings
                 raise ValueError("JSON primitive")
             except (json.JSONDecodeError, ValueError):
                 pass
-        return _anonymize_text(val, analyzer, registry)
+        return _anonymize_text(val, analyzer, registry, language)
     return val, []
 
 
@@ -561,13 +598,13 @@ def pseudonymize_identifier_columns(
     return df, pseudonymized
 
 
-def _anonymize_json(obj: object, analyzer: Any, registry: EntityRegistry) -> tuple[object, list]:
+def _anonymize_json(obj: object, analyzer: Any, registry: EntityRegistry, language: str | None = None) -> tuple[object, list]:
     if isinstance(obj, dict):
         result: dict = {}
         all_findings: list = []
         for k, v in obj.items():
-            anon_k, key_findings = _anonymize_text(k, analyzer, registry) if isinstance(k, str) else (k, [])
-            anon_v, f = _anonymize_json(v, analyzer, registry)
+            anon_k, key_findings = _anonymize_text(k, analyzer, registry, language) if isinstance(k, str) else (k, [])
+            anon_v, f = _anonymize_json(v, analyzer, registry, language)
             result[anon_k] = anon_v
             all_findings.extend(key_findings)
             all_findings.extend(f)
@@ -576,12 +613,12 @@ def _anonymize_json(obj: object, analyzer: Any, registry: EntityRegistry) -> tup
         result_list: list = []
         all_findings = []
         for item in obj:
-            anon_item, f = _anonymize_json(item, analyzer, registry)
+            anon_item, f = _anonymize_json(item, analyzer, registry, language)
             result_list.append(anon_item)
             all_findings.extend(f)
         return result_list, all_findings
     if isinstance(obj, str):
-        return _anonymize_text(obj, analyzer, registry)
+        return _anonymize_text(obj, analyzer, registry, language)
     return obj, []
 
 
