@@ -291,7 +291,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                         "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or set "
                         "ENABLE_KEY_VAULT=0 to use local hashing instead."
                     )
-                df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer)
+                df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer, inplace=True)
                 audit["key_vault_key_version"] = pseudonymizer.key_version
             else:
                 pseudonymized = []
@@ -348,6 +348,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 df_raw, policies,
                 registry=registry,
                 pseudonymizer=policy_pseudonymizer,
+                inplace=True,
             )
         audit["column_policy"] = {
             "columns_processed": policy_stats["columns_processed"],
@@ -362,7 +363,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         scan_columns = free_text_columns_from_policies(policies)
 
         with timed_stage(audit, "anonymization"):
-            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry, scan_columns=scan_columns)
+            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry, scan_columns=scan_columns, inplace=True)
         _apply_anonymization_audit(audit, stats, registry)
 
         if db and stats["column_stats"]:

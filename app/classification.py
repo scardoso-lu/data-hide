@@ -774,6 +774,7 @@ def apply_column_policies(
     *,
     registry: Any | None = None,
     pseudonymizer: Any | None = None,
+    inplace: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Apply each `ColumnPolicy`'s action to every non-null cell in its column.
 
@@ -797,8 +798,10 @@ def apply_column_policies(
     which classifier tier acted on which column.
 
     The DataFrame is copied before mutation so callers can keep the original.
+    Pass ``inplace=True`` to skip the copy when the caller transfers ownership.
     """
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
     stats = {
         "columns_processed": [],
         "actions_applied": {},

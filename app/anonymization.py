@@ -471,11 +471,13 @@ def anonymize_dataframe(
     analyzer: Any,
     registry: EntityRegistry | None = None,
     scan_columns: list[str] | None = None,
+    inplace: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     if registry is None:
         registry = EntityRegistry()
 
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
     if scan_columns is not None:
         text_cols = [c for c in scan_columns if c in df.columns and _is_text_column(df[c].dtype)]
     else:
@@ -582,6 +584,7 @@ def pseudonymize_identifier_columns(
     df: pd.DataFrame,
     id_cols: list[str],
     pseudonymizer: Callable[[object], object],
+    inplace: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Replace identifier values with Key Vault-bound pseudonym tokens.
 
@@ -597,7 +600,8 @@ def pseudonymize_identifier_columns(
             "pseudonymizer is required to anonymize identifier columns; "
             "configure KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME."
         )
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
     pseudonymized: list[str] = []
     for col in id_cols:
         if col not in df.columns:
