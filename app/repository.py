@@ -444,7 +444,13 @@ def read_delta(uri: str, storage_options: dict) -> pd.DataFrame:
         if not temporal_columns:
             return conn.execute('SELECT * FROM "_source_rows"').df()
 
-        return conn.execute(_duckdb_temporal_filter_sql(temporal_columns), [cutoff] * len(temporal_columns)).df()
+        df = conn.execute(_duckdb_temporal_filter_sql(temporal_columns), [cutoff] * len(temporal_columns)).df()
+        if df.empty:
+            logger.warning(
+                "365-day filter returned 0 rows for '%s'; table is too small or old — reading all rows", uri,
+            )
+            df = conn.execute('SELECT * FROM "_source_rows"').df()
+        return df
     finally:
         conn.close()
 
@@ -593,10 +599,18 @@ def read_sql_table(table_name: str, sql_endpoint: str, database: str, schema: st
         table_ref = f"{_quote_tsql_ident(schema)}.{_quote_tsql_ident(table_name)}"
         if temporal_columns:
             cursor.execute(_tsql_temporal_filter_sql(table_ref, temporal_columns), *([sql_cutoff] * len(temporal_columns)))
+            rows = cursor.fetchall()
+            if not rows:
+                logger.warning(
+                    "365-day filter returned 0 rows for '%s.%s'; table is too small or old — reading all rows",
+                    schema, table_name,
+                )
+                cursor.execute(f"SELECT * FROM {table_ref}")
+                rows = cursor.fetchall()
         else:
             logger.warning("No temporal columns found in SQL table '%s.%s'; reading all rows", schema, table_name)
             cursor.execute(f"SELECT * FROM {table_ref}")
-        rows = cursor.fetchall()
+            rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
         return pd.DataFrame.from_records(rows, columns=columns)
     finally:

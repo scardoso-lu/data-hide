@@ -267,6 +267,7 @@ def _entities_supported_in(analyzer: Any, language: str) -> list[str] | None:
     return [entity for entity in GDPR_ENTITIES if entity in supported]
 
 
+@lru_cache(maxsize=1)
 def build_engines() -> Any:
     from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
     from presidio_analyzer.nlp_engine import NlpEngineProvider
