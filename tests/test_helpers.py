@@ -174,6 +174,118 @@ class TestReadDeltaLookback:
 
         assert list(df["id"]) == [2]
 
+    def test_delta_read_falls_back_to_all_rows_when_filter_returns_empty(self, monkeypatch, mocker):
+        """A small or old table where every row pre-dates the cutoff must not
+        be silently discarded — the pipeline should fall back to a full read."""
+        import pyarrow as pa
+        import app.repository as repo
+
+        class FakeDeltaTable:
+            def __init__(self, uri, storage_options=None):
+                pass
+
+            def to_pyarrow_dataset(self):
+                return pa.table({
+                    "id": [1, 2],
+                    # both rows are from 2020 — far older than the 365-day cutoff
+                    "created_at": [
+                        datetime(2020, 1, 1, tzinfo=timezone.utc),
+                        datetime(2020, 6, 1, tzinfo=timezone.utc),
+                    ],
+                })
+
+        monkeypatch.setattr(repo, "DeltaTable", FakeDeltaTable)
+        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
+
+        # fallback must return both rows, not an empty DataFrame
+        assert len(df) == 2
+        assert set(df["id"]) == {1, 2}
+
+
+class TestReadSqlTableLookback:
+    """read_sql_table must fall back to a full read when the 365-day filter
+    returns no rows (table is too small or entirely pre-dates the cutoff)."""
+
+    def _make_cursor(self, filtered_rows, all_rows, columns):
+        """Return a fake cursor whose first execute() returns filtered_rows
+        and whose second execute() (fallback) returns all_rows."""
+
+        class FakeCursor:
+            def __init__(self):
+                self._calls = 0
+                self._filtered = filtered_rows
+                self._all = all_rows
+                self.description = [(c,) for c in columns]
+
+            def execute(self, sql, *args):
+                self._calls += 1
+                if self._calls == 1:
+                    self._rows = self._filtered
+                else:
+                    self._rows = self._all
+
+            def fetchall(self):
+                return self._rows
+
+        return FakeCursor()
+
+    def _make_conn(self, cursor):
+        class FakeConn:
+            def __init__(self, cur):
+                self._cursor = cur
+
+            def cursor(self):
+                return self._cursor
+
+            def close(self):
+                pass
+
+        return FakeConn(cursor)
+
+    def test_sql_read_falls_back_when_filter_returns_empty(self, monkeypatch, mocker):
+        from app.repository import read_sql_table, _sql_temporal_columns
+        import app.repository as repo
+
+        columns = ["id", "event_date"]
+        # Filtered result is empty; full table has two rows
+        cur = self._make_cursor(
+            filtered_rows=[],
+            all_rows=[(1, "2020-01-01"), (2, "2020-06-01")],
+            columns=columns,
+        )
+
+        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        monkeypatch.setattr(repo, "_sql_connection", lambda *a, **kw: self._make_conn(cur))
+        monkeypatch.setattr(repo, "_sql_temporal_columns", lambda *a, **kw: ["event_date"])
+
+        df = read_sql_table("events", "fake-endpoint", "fake-db")
+
+        assert len(df) == 2
+        assert set(df["id"]) == {1, 2}
+        assert cur._calls == 2   # filtered query + fallback query
+
+    def test_sql_read_does_not_fall_back_when_filter_has_rows(self, monkeypatch, mocker):
+        from app.repository import read_sql_table
+        import app.repository as repo
+
+        columns = ["id", "event_date"]
+        cur = self._make_cursor(
+            filtered_rows=[(3, "2024-03-01")],
+            all_rows=[(1, "2020-01-01"), (2, "2020-06-01"), (3, "2024-03-01")],
+            columns=columns,
+        )
+
+        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        monkeypatch.setattr(repo, "_sql_connection", lambda *a, **kw: self._make_conn(cur))
+        monkeypatch.setattr(repo, "_sql_temporal_columns", lambda *a, **kw: ["event_date"])
+
+        df = read_sql_table("events", "fake-endpoint", "fake-db")
+
+        assert len(df) == 1
+        assert cur._calls == 1   # only the filtered query
+
 
 class TestWriteDelta:
 

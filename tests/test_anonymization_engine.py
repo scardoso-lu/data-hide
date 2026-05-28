@@ -142,7 +142,21 @@ def test_residual_validation_still_blocks_explicit_structured_pii_columns():
     assert "iban.IBAN_CODE=1" in message
 
 
+def test_build_engines_returns_same_object_on_repeated_calls():
+    # lru_cache must prevent the expensive Presidio + spaCy rebuild.
+    # If the cache works, both calls return the identical object.
+    build_engines.cache_clear()
+    try:
+        first = build_engines()
+        second = build_engines()
+        assert first is second
+    finally:
+        build_engines.cache_clear()
+
+
 def test_build_engines_ignores_unmapped_cardinal_spacy_label(monkeypatch):
+    # Clear the cache so the monkeypatched modules are actually invoked.
+    build_engines.cache_clear()
     captured = {}
 
     class FakeNlpEngineProvider:
@@ -234,6 +248,7 @@ def test_build_engines_ignores_unmapped_cardinal_spacy_label(monkeypatch):
         }
     ]
     assert captured["nlp_recognizer_added"] is not None
+    build_engines.cache_clear()
 
 
 class FakeAnalyzerPersonOnly:
