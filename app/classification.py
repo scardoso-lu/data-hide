@@ -646,10 +646,14 @@ def _tier_b1_presidio_structured(
     ]
     if not candidate_cols:
         return
+    # A few hundred rows is sufficient to determine dominant entity types per
+    # column; scanning the full table here is pure waste since the same rows
+    # get a second Presidio pass during anonymization.
+    _TIER_B1_SAMPLE_ROWS = 500
     try:
         from presidio_structured import PandasAnalysisBuilder
         builder = PandasAnalysisBuilder(analyzer=analyzer)
-        analysis = builder.generate_analysis(df[candidate_cols])
+        analysis = builder.generate_analysis(df[candidate_cols].head(_TIER_B1_SAMPLE_ROWS))
     except Exception:
         return  # log path — caller wraps this in a logger.warning if desired
     for column, entity in (analysis.entity_mapping or {}).items():
