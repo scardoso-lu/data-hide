@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import os
 from decimal import Decimal
@@ -479,7 +480,7 @@ def anonymize_dataframe(
         text_cols = [c for c in scan_columns if c in df.columns and _is_text_column(df[c].dtype)]
     else:
         text_cols = [c for c in df.columns if _is_text_column(df[c].dtype)]
-    entity_counts: dict[str, int] = {}
+    entity_counts: collections.Counter[str] = collections.Counter()
     cols_hit: list[str] = []
     column_stats: list[dict] = []
     cache: dict[object, tuple[object, list]] = {}
@@ -487,7 +488,7 @@ def anonymize_dataframe(
     for col in text_cols:
         language = _detect_column_language(df[col])
         col_detections = 0
-        col_entity_counts: dict[str, int] = {}
+        col_entity_counts: collections.Counter[str] = collections.Counter()
         new_values: list = []
         for val in df[col]:
             anon_val, all_findings = _anonymize_value_cached(val, analyzer, registry, cache, language)
@@ -495,8 +496,8 @@ def anonymize_dataframe(
 
             for f in all_findings:
                 col_detections += 1
-                entity_counts[f.entity_type] = entity_counts.get(f.entity_type, 0) + 1
-                col_entity_counts[f.entity_type] = col_entity_counts.get(f.entity_type, 0) + 1
+                entity_counts[f.entity_type] += 1
+                col_entity_counts[f.entity_type] += 1
 
         df[col] = new_values
         if col_detections:
@@ -541,19 +542,27 @@ def _cache_key(val: object) -> object | None:
     return None
 
 
+def _try_parse_json_collection(val: str) -> dict | list | None:
+    """Return the parsed dict/list if val is a JSON object or array, else None."""
+    if not _looks_like_json(val):
+        return None
+    try:
+        parsed = json.loads(val)
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 def _anonymize_value(val: object, analyzer: Any, registry: EntityRegistry, language: str | None = None) -> tuple[object, list]:
     if isinstance(val, (dict, list)):
         return _anonymize_json(val, analyzer, registry, language)
     if isinstance(val, str):
-        if _looks_like_json(val):
-            try:
-                parsed = json.loads(val)
-                if isinstance(parsed, (dict, list)):
-                    anon_obj, all_findings = _anonymize_json(parsed, analyzer, registry, language)
-                    return json.dumps(anon_obj, ensure_ascii=False), all_findings
-                raise ValueError("JSON primitive")
-            except (json.JSONDecodeError, ValueError):
-                pass
+        parsed = _try_parse_json_collection(val)
+        if parsed is not None:
+            anon_obj, all_findings = _anonymize_json(parsed, analyzer, registry, language)
+            return json.dumps(anon_obj, ensure_ascii=False), all_findings
         return _anonymize_text(val, analyzer, registry, language)
     return val, []
 
@@ -636,15 +645,11 @@ def residual_pii_findings(df: pd.DataFrame) -> list[dict]:
             if isinstance(val, (dict, list)):
                 findings.extend(_scan_json_for_residuals(val, column=col, path="$"))
             elif isinstance(val, str):
-                if _looks_like_json(val):
-                    try:
-                        parsed = json.loads(val)
-                        if isinstance(parsed, (dict, list)):
-                            findings.extend(_scan_json_for_residuals(parsed, column=col, path="$"))
-                            continue
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                findings.extend(_structured_residuals(col, None, val))
+                parsed = _try_parse_json_collection(val)
+                if parsed is not None:
+                    findings.extend(_scan_json_for_residuals(parsed, column=col, path="$"))
+                else:
+                    findings.extend(_structured_residuals(col, None, val))
     return findings
 
 

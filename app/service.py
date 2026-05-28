@@ -53,14 +53,6 @@ from .repository import (
 logger = logging.getLogger(__name__)
 
 
-def _column_policy_enabled() -> bool:
-    """`ENABLE_COLUMN_POLICY=0` disables the column-policy layer entirely
-    (operator escape hatch in case the value-sampling tier behaves badly on
-    an unusual dataset).  Default: enabled."""
-    return os.environ.get("ENABLE_COLUMN_POLICY", "1").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -334,42 +326,40 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         # Hash/tokenise classified columns BEFORE row-by-row Presidio scans.
         # Failures here are non-fatal — the existing per-cell scan remains
         # the backstop.
-        scan_columns: list[str] | None = None
-        if _column_policy_enabled():
-            with timed_stage(audit, "column_policy_classification"):
-                try:
-                    policies = classify_pii_columns(df_raw, analyzer=analyzer)
-                except Exception as exc:
-                    logger.warning("Column-policy classification failed (non-fatal): %s", exc)
-                    policies = {}
+        with timed_stage(audit, "column_policy_classification"):
+            try:
+                policies = classify_pii_columns(df_raw, analyzer=analyzer)
+            except Exception as exc:
+                logger.warning("Column-policy classification failed (non-fatal): %s", exc)
+                policies = {}
 
-            policy_needs_hash = any(p.action == ACTION_HASH for p in policies.values())
-            policy_pseudonymizer = pseudonymizer if policy_needs_hash else None
-            if policy_needs_hash and policy_pseudonymizer is None:
-                policy_pseudonymizer = build_pseudonymizer_from_env(
-                    config.key_vault_url,
-                    config.key_vault_rsa_key_name,
-                    enable_key_vault=config.key_vault_enabled,
-                    hash_salt=config.hash_salt,
-                )
+        policy_needs_hash = any(p.action == ACTION_HASH for p in policies.values())
+        policy_pseudonymizer = pseudonymizer if policy_needs_hash else None
+        if policy_needs_hash and policy_pseudonymizer is None:
+            policy_pseudonymizer = build_pseudonymizer_from_env(
+                config.key_vault_url,
+                config.key_vault_rsa_key_name,
+                enable_key_vault=config.key_vault_enabled,
+                hash_salt=config.hash_salt,
+            )
 
-            with timed_stage(audit, "column_policy_mask"):
-                df_raw, policy_stats = apply_column_policies(
-                    df_raw, policies,
-                    registry=registry,
-                    pseudonymizer=policy_pseudonymizer,
-                )
-            audit["column_policy"] = {
-                "columns_processed": policy_stats["columns_processed"],
-                "actions_applied": policy_stats["actions_applied"],
-                "entity_types": policy_stats["entity_types"],
-                "values_masked": policy_stats["values_masked"],
-                "skipped_columns": policy_stats["skipped_columns"],
-                "sources": {
-                    col: pol.source for col, pol in policies.items()
-                },
-            }
-            scan_columns = free_text_columns_from_policies(policies)
+        with timed_stage(audit, "column_policy_mask"):
+            df_raw, policy_stats = apply_column_policies(
+                df_raw, policies,
+                registry=registry,
+                pseudonymizer=policy_pseudonymizer,
+            )
+        audit["column_policy"] = {
+            "columns_processed": policy_stats["columns_processed"],
+            "actions_applied": policy_stats["actions_applied"],
+            "entity_types": policy_stats["entity_types"],
+            "values_masked": policy_stats["values_masked"],
+            "skipped_columns": policy_stats["skipped_columns"],
+            "sources": {
+                col: pol.source for col, pol in policies.items()
+            },
+        }
+        scan_columns = free_text_columns_from_policies(policies)
 
         with timed_stage(audit, "anonymization"):
             df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry, scan_columns=scan_columns)
