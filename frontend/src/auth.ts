@@ -107,6 +107,11 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     signIn: "/login",
   },
 
+  session: {
+    // Limit admin sessions to 8 hours (A07 — authentication failures)
+    maxAge: 8 * 60 * 60,
+  },
+
   callbacks: {
     /**
      * jwt — fires on every sign-in and token refresh.

@@ -4,10 +4,11 @@ import { revalidatePath } from "next/cache"
 import { auth } from "@/auth"
 import { addExclusion, deleteExclusion } from "@/lib/queries/exclusions"
 
-async function requireAccess(): Promise<void> {
+async function requireAccess(): Promise<string> {
   const session = await auth()
   const allowed = (session as typeof session & { allowedAccess?: boolean })?.allowedAccess
   if (!session?.user || !allowed) throw new Error("Unauthorized")
+  return session.user.email ?? "unknown"
 }
 
 // Allow letters, digits, underscores, and dots (schema.table notation).
@@ -23,7 +24,7 @@ function validateIdentifier(name: string, label: string): void {
 }
 
 export async function addExclusionAction(formData: FormData): Promise<void> {
-  await requireAccess()
+  const actor = await requireAccess()
   const tableName  = (formData.get("table_name")  as string | null)?.trim() ?? ""
   const columnName = (formData.get("column_name") as string | null)?.trim() ?? ""
   const reason     = (formData.get("reason")      as string | null)?.trim() || null
@@ -34,6 +35,7 @@ export async function addExclusionAction(formData: FormData): Promise<void> {
     throw new Error("Reason exceeds 500-character limit")
 
   await addExclusion(tableName, columnName, reason)
+  console.log(`[audit] exclusion.add table=${tableName} column=${columnName} actor=${actor}`)
   revalidatePath("/dashboard/exclusions")
 }
 
@@ -41,9 +43,10 @@ export async function deleteExclusionAction(
   tableName: string,
   columnName: string,
 ): Promise<void> {
-  await requireAccess()
+  const actor = await requireAccess()
   validateIdentifier(tableName,  "table_name")
   validateIdentifier(columnName, "column_name")
   await deleteExclusion(tableName, columnName)
+  console.log(`[audit] exclusion.delete table=${tableName} column=${columnName} actor=${actor}`)
   revalidatePath("/dashboard/exclusions")
 }
