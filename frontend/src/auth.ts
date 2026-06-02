@@ -105,6 +105,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
   pages: {
     signIn: "/login",
+    // Redirect all OAuth/callback errors to the login page so the default
+    // NextAuth error page (which exposes error-type names) is never shown.
+    error: "/login",
   },
 
   session: {
