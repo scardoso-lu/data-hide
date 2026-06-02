@@ -94,7 +94,8 @@ class TestSchemaInit:
     def test_expected_ddl_statements(self, mock_psycopg2):
         _, _, cur = mock_psycopg2
         AuditDB("postgresql://test")
-        assert cur.execute.call_count == 5
+        # 6 CREATE TABLE statements + 2 ALTER TABLE migrations
+        assert cur.execute.call_count == 8
 
     def test_connection_committed(self, mock_psycopg2):
         _, conn, _ = mock_psycopg2
@@ -408,6 +409,53 @@ class TestCloseRun:
 # ─────────────────────────────────────────────────────────────────────────────
 # connect_audit_db factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestLoadTableTargets:
+
+    def test_returns_empty_list_when_no_rows(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+        cur.fetchall.return_value = []
+
+        result = db.load_table_targets()
+
+        assert result == []
+
+    def test_returns_table_mappings_for_enabled_rows(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+        cur.fetchall.return_value = [
+            (SOURCE_URI, TARGET_URI, "orders"),
+            ("abfss://ws@onelake.dfs.fabric.microsoft.com/A.Lakehouse/Tables/raw",
+             "abfss://ws@onelake.dfs.fabric.microsoft.com/B.Lakehouse/Tables/clean",
+             None),
+        ]
+
+        result = db.load_table_targets()
+
+        assert len(result) == 2
+        assert result[0] == TableMapping(SOURCE_URI, TARGET_URI, "orders")
+        assert result[1].table_name is None
+
+    def test_query_filters_enabled(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        db = AuditDB("postgresql://test")
+        cur.execute.reset_mock()
+        cur.fetchall.return_value = []
+
+        db.load_table_targets()
+
+        sql = cur.execute.call_args.args[0]
+        assert "enabled" in sql.lower()
+
+    def test_creates_table_targets_ddl(self, mock_psycopg2):
+        _, _, cur = mock_psycopg2
+        AuditDB("postgresql://test")
+        sqls = [c.args[0] for c in cur.execute.call_args_list]
+        assert any("pii_table_targets" in s for s in sqls)
+
 
 class TestConnectAuditDB:
 

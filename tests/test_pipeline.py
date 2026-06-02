@@ -473,6 +473,113 @@ class TestPipelineConfigValidation:
             PipelineConfig.from_env()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime table targets (pii_table_targets)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SOURCE2 = "abfss://ws@onelake.dfs.fabric.microsoft.com/A.Lakehouse/Tables/raw"
+TARGET2 = "abfss://ws@onelake.dfs.fabric.microsoft.com/B.Lakehouse/Tables/clean"
+
+
+class TestRuntimeTableTargets:
+
+    def test_resolve_uses_db_targets_when_present(self, monkeypatch):
+        from main import PipelineConfig, TableMapping, resolve_table_mappings
+
+        monkeypatch.delenv("SOURCE_BASE_ABFSS_URI", raising=False)
+        monkeypatch.delenv("TARGET_BASE_ABFSS_URI", raising=False)
+        t1 = TableMapping(SOURCE_URI, TARGET_URI, "orders")
+        t2 = TableMapping(SOURCE2, TARGET2, "customers")
+        config = PipelineConfig.from_env(table_targets=(t1, t2))
+
+        result = resolve_table_mappings(config)
+
+        assert result == [t1, t2]
+
+    def test_resolve_skips_auto_discovery_when_targets_present(self, monkeypatch, mocker):
+        from main import PipelineConfig, TableMapping, resolve_table_mappings
+
+        monkeypatch.setenv("SOURCE_BASE_ABFSS_URI", BASE_SOURCE_URI)
+        monkeypatch.setenv("TARGET_BASE_ABFSS_URI", BASE_TARGET_URI)
+        mock_discover = mocker.patch("main.discover_table_mappings")
+        config = PipelineConfig.from_env(
+            table_targets=(TableMapping(SOURCE_URI, TARGET_URI, "t"),)
+        )
+
+        resolve_table_mappings(config)
+
+        mock_discover.assert_not_called()
+
+    def test_resolve_falls_back_to_discovery_when_targets_empty(self, monkeypatch, mocker):
+        from main import PipelineConfig, TableMapping, resolve_table_mappings
+
+        monkeypatch.setenv("SOURCE_BASE_ABFSS_URI", BASE_SOURCE_URI)
+        monkeypatch.setenv("TARGET_BASE_ABFSS_URI", BASE_TARGET_URI)
+        expected = [TableMapping(SOURCE_URI, TARGET_URI, "t")]
+        # patch inside the pipeline module where resolve_table_mappings lives
+        mock_discover = mocker.patch(
+            "app.application.pipeline.discover_table_mappings", return_value=expected
+        )
+        config = PipelineConfig.from_env()
+
+        result = resolve_table_mappings(config)
+
+        mock_discover.assert_called_once()
+        assert result == expected
+
+    def test_resolve_raises_without_base_uris_and_no_targets(self, monkeypatch):
+        from main import PipelineConfig, resolve_table_mappings
+
+        monkeypatch.delenv("SOURCE_BASE_ABFSS_URI", raising=False)
+        monkeypatch.delenv("TARGET_BASE_ABFSS_URI", raising=False)
+        config = PipelineConfig.from_env()
+
+        with pytest.raises(RuntimeError, match="pii_table_targets"):
+            resolve_table_mappings(config)
+
+    def test_from_env_and_db_loads_targets(self, mocker):
+        from main import PipelineConfig, TableMapping
+
+        t = TableMapping(SOURCE_URI, TARGET_URI, "orders")
+        db = mocker.MagicMock()
+        db.load_runtime_config.return_value = {}
+        db.load_column_exclusions.return_value = {}
+        db.load_table_targets.return_value = [t]
+
+        config = PipelineConfig.from_env_and_db(db)
+
+        assert config.table_targets == (t,)
+
+    def test_from_env_and_db_targets_empty_on_db_error(self, mocker):
+        from main import PipelineConfig
+
+        db = mocker.MagicMock()
+        db.load_runtime_config.return_value = {}
+        db.load_column_exclusions.return_value = {}
+        db.load_table_targets.side_effect = Exception("table does not exist")
+
+        config = PipelineConfig.from_env_and_db(db)
+
+        assert config.table_targets == ()
+
+    def test_pipeline_runs_with_db_targets_no_base_uris(
+        self, monkeypatch, mock_delta, mock_auth, mock_anonymize,
+        mock_engines, mock_validate, mock_classify, mock_hash, mocker,
+    ):
+        monkeypatch.delenv("SOURCE_BASE_ABFSS_URI", raising=False)
+        monkeypatch.delenv("TARGET_BASE_ABFSS_URI", raising=False)
+        from main import TableMapping
+
+        db = mocker.MagicMock()
+        db.load_runtime_config.return_value = {}
+        db.load_column_exclusions.return_value = {}
+        db.load_table_targets.return_value = [TableMapping(SOURCE_URI, TARGET_URI, "orders")]
+        mocker.patch("main.connect_audit_db", return_value=db)
+
+        from main import main
+        main()
+
+
 class TestEndToEndAnonymization:
 
     def test_emails_anonymized_in_written_dataframe(
