@@ -16,6 +16,7 @@ const CSP = [
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
+  "upgrade-insecure-requests",
 ].join("; ")
 
 const securityHeaders = [
@@ -27,8 +28,8 @@ const securityHeaders = [
   { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
   // Limit referrer leakage
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-  // Disable unnecessary browser features
-  { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=()" },
+  // Disable all browser features that this admin panel does not use
+  { key: "Permissions-Policy", value: "accelerometer=(), autoplay=(), camera=(), cross-origin-isolated=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), interest-cohort=(), browsing-topics=()" },
   { key: "Content-Security-Policy", value: CSP },
   // Disable legacy XSS auditor (causes information leakage in older browsers)
   { key: "X-XSS-Protection", value: "0" },
@@ -49,8 +50,9 @@ const nextConfig: NextConfig = {
         headers: securityHeaders,
       },
       {
-        // Prevent authenticated pages from being cached by proxies or shared caches
-        source: "/dashboard/(.*)",
+        // Prevent authenticated pages from being cached by proxies or shared caches.
+        // /dashboard(.*) matches both /dashboard and /dashboard/<any-sub-path>.
+        source: "/dashboard(.*)",
         headers: [
           { key: "Cache-Control", value: "no-store" },
         ],
