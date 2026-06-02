@@ -26,7 +26,7 @@ interface Props {
 }
 
 export default async function AuditPage({ searchParams }: Props) {
-  const page = Math.max(1, parseInt(searchParams.page ?? "1", 10))
+  const page = Math.min(10_000, Math.max(1, parseInt(searchParams.page ?? "1", 10)))
   const offset = (page - 1) * PAGE_SIZE
 
   const [runs, total] = await Promise.all([

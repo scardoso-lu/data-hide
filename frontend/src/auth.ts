@@ -1,6 +1,18 @@
 import NextAuth from "next-auth"
 import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id"
 
+// Fail fast at module load time so a misconfigured container never serves traffic.
+if (
+  process.env.NODE_ENV === "production" &&
+  (!process.env.AUTH_SECRET ||
+    process.env.AUTH_SECRET === "build-placeholder")
+) {
+  throw new Error(
+    "AUTH_SECRET must be set to a cryptographically random value in production. " +
+      "Generate one with: openssl rand -base64 32",
+  )
+}
+
 // ── Allowed groups ────────────────────────────────────────────────────────────
 // Comma-separated Azure AD group Object IDs.
 // Leave empty (or unset) to allow every authenticated user in.

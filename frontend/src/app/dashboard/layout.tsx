@@ -9,9 +9,11 @@ export default async function DashboardLayout({
   children: React.ReactNode
 }) {
   const session = await auth()
-  // Middleware handles unauthenticated redirects, but double-check here so
-  // TypeScript knows session is non-null for the rest of this component.
   if (!session) redirect("/login")
+  const hasAccess =
+    (session as typeof session & { allowedAccess?: boolean })?.allowedAccess ??
+    false
+  if (!hasAccess) redirect("/unauthorized")
 
   return (
     <div className="min-h-screen bg-base-200">
