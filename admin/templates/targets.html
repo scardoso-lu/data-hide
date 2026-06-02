@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Table Targets — PII Pipeline Admin{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">Table Targets <span class="badge bg-secondary">{{ targets|length }}</span></h4>
+  <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addModal">+ Add target</button>
+</div>
+
+<p class="text-secondary small">
+  Each row is an explicit <strong>source → target</strong> URI pair processed on the next pipeline run.
+  When this table has enabled rows, auto-discovery under <code>SOURCE_BASE_ABFSS_URI</code> is skipped.
+</p>
+
+{% if targets %}
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>#</th>
+        <th>Table name</th>
+        <th>Source URI</th>
+        <th>Target URI</th>
+        <th>Enabled</th>
+        <th>Created</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in targets %}
+      <tr class="{% if not t.enabled %}text-secondary{% endif %}">
+        <td class="mono">{{ t.id }}</td>
+        <td class="mono">{{ t.table_name or '—' }}</td>
+        <td><span class="mono truncate d-inline-block" title="{{ t.source_uri }}">{{ t.source_uri }}</span></td>
+        <td><span class="mono truncate d-inline-block" title="{{ t.target_uri }}">{{ t.target_uri }}</span></td>
+        <td>
+          {% if t.enabled %}
+            <span class="badge bg-success">enabled</span>
+          {% else %}
+            <span class="badge bg-secondary">disabled</span>
+          {% endif %}
+        </td>
+        <td class="mono small">{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '—' }}</td>
+        <td class="text-end text-nowrap">
+          <form method="post" action="/targets/{{ t.id }}/toggle" class="d-inline">
+            <button class="btn btn-sm btn-outline-secondary">
+              {{ 'Disable' if t.enabled else 'Enable' }}
+            </button>
+          </form>
+          <form method="post" action="/targets/{{ t.id }}/delete" class="d-inline"
+                onsubmit="return confirm('Delete this target?')">
+            <button class="btn btn-sm btn-outline-danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="alert alert-info">No table targets defined. Add one to run against specific tables.</div>
+{% endif %}
+
+<!-- Add modal -->
+<div class="modal fade" id="addModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <form method="post" action="/targets/add" class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Add Table Target</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">Table name <span class="text-secondary">(optional)</span></label>
+          <input name="table_name" class="form-control mono" placeholder="e.g. orders">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Source URI <span class="text-danger">*</span></label>
+          <input name="source_uri" class="form-control mono" required
+            placeholder="abfss://workspace@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Target URI <span class="text-danger">*</span></label>
+          <input name="target_uri" class="form-control mono" required
+            placeholder="abfss://workspace@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

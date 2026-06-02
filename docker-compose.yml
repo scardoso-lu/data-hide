@@ -68,6 +68,19 @@ services:
         condition: service_healthy
     restart: unless-stopped   # keep the admin UI always available
 
+  # ── Python admin UI (Flask + SQLAlchemy) ─────────────────────────────────────
+  admin:
+    build: ./admin
+    ports:
+      - "5001:5001"
+    environment:
+      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
+      FLASK_SECRET_KEY: "${FLASK_SECRET_KEY:-change-me-in-production}"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pg_data:
   spacy_models:

@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Column Exclusions — PII Pipeline Admin{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">Column Exclusions <span class="badge bg-secondary">{{ rows|length }}</span></h4>
+  <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addModal">+ Exclude column</button>
+</div>
+
+<p class="text-secondary small">
+  Columns listed here pass through the pipeline <strong>untouched</strong> regardless of what
+  PII classification finds. Use this to protect columns that are legitimately non-sensitive
+  despite containing patterns that trigger detection (e.g. SKUs, order codes).
+</p>
+
+{% if rows %}
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead class="table-dark">
+      <tr><th>Table</th><th>Column</th><th>Reason</th><th>Added</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="mono">{{ r.table_name }}</td>
+        <td class="mono">{{ r.column_name }}</td>
+        <td class="text-secondary small">{{ r.reason or '—' }}</td>
+        <td class="mono small">{{ r.created_at.strftime('%Y-%m-%d') if r.created_at else '—' }}</td>
+        <td class="text-end">
+          <form method="post" action="/exclusions/delete"
+                onsubmit="return confirm('Remove exclusion {{ r.table_name }}.{{ r.column_name }}?')">
+            <input type="hidden" name="table_name" value="{{ r.table_name }}">
+            <input type="hidden" name="column_name" value="{{ r.column_name }}">
+            <button class="btn btn-sm btn-outline-danger">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="alert alert-info">No column exclusions. All columns are subject to PII classification.</div>
+{% endif %}
+
+<!-- Add modal -->
+<div class="modal fade" id="addModal" tabindex="-1">
+  <div class="modal-dialog">
+    <form method="post" action="/exclusions/add" class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Exclude Column</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">Table name <span class="text-danger">*</span></label>
+          <input name="table_name" class="form-control mono" required placeholder="e.g. orders">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Column name <span class="text-danger">*</span></label>
+          <input name="column_name" class="form-control mono" required placeholder="e.g. product_sku">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Reason <span class="text-secondary">(optional)</span></label>
+          <input name="reason" class="form-control" placeholder="e.g. SKU — triggers tax-ID regex, not PII">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add exclusion</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
