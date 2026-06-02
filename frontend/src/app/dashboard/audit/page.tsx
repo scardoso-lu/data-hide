@@ -27,7 +27,10 @@ interface Props {
 
 export default async function AuditPage({ searchParams }: Props) {
   const { page: pageParam } = await searchParams
-  const page = Math.min(10_000, Math.max(1, parseInt(pageParam ?? "1", 10)))
+  const rawPage = parseInt(pageParam ?? "1", 10)
+  // parseInt returns NaN for non-numeric input; NaN propagates through Math.min/max
+  // and would reach the DB as OFFSET NaN, causing a query error. Clamp to 1 instead.
+  const page = Number.isFinite(rawPage) ? Math.min(10_000, Math.max(1, rawPage)) : 1
   const offset = (page - 1) * PAGE_SIZE
 
   const [runs, total] = await Promise.all([
