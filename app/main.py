@@ -9,10 +9,10 @@ import sys
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
-from . import repository as _repository
-from . import service as _service
-from .aggregation import aggregate_gps_table, detect_speed_column
-from .anonymization import (
+from .infrastructure import repository as _repository
+from .application import pipeline as _service
+from .domain.aggregation import aggregate_gps_table, detect_speed_column
+from .domain.anonymization import (
     SPACY_MODELS,
     EntityRegistry,
     _anonymize_json,
@@ -26,8 +26,8 @@ from .anonymization import (
     pseudonymize_identifier_columns,
     validate_residual_pii,
 )
-from .keyvault import KeyVaultPseudonymizer, build_pseudonymizer_from_env
-from .classification import (
+from .infrastructure.keyvault import KeyVaultPseudonymizer, build_pseudonymizer_from_env
+from .domain.classification import (
     classify_columns,
     detect_gps_columns,
     detect_identifier_columns,
@@ -35,7 +35,7 @@ from .classification import (
     detect_timestamp_columns,
     flag_free_text_columns,
 )
-from .repository import (
+from .infrastructure.repository import (
     PIPELINE_VERSION,
     AuditDB,
     DefaultAzureCredential,
@@ -53,7 +53,7 @@ from .repository import (
     read_sql_table,
     write_delta,
 )
-from .service import PipelineConfig, record_alert, resolve_table_mappings, run_pipeline, run_table
+from .application.pipeline import PipelineConfig, record_alert, resolve_table_mappings, run_pipeline, run_table
 
 psycopg2 = _repository.psycopg2
 
@@ -145,23 +145,19 @@ def main() -> None:
     _service.pseudonymize_identifier_columns = pseudonymize_identifier_columns
     _service.build_pseudonymizer_from_env = build_pseudonymizer_from_env
     _service.enforce_k_anonymity = enforce_k_anonymity
-    run_pipeline(PipelineConfig.from_env())
+    run_pipeline()  # connects to DB first, then calls PipelineConfig.from_env_and_db()
 
 
 def run_purview_check(source_uri: str, df_columns: list[str], purview_account: str | None) -> dict:
-    """Compatibility wrapper that keeps old tests patching main.* working."""
+    """Wrapper that ensures the real PurviewClient (SDK-backed) is used at
+    runtime while still allowing tests to patch ``main.PurviewClient``."""
     original_client = _repository.PurviewClient
-    original_token = _repository.acquire_token
-    original_cached_token = _repository.acquire_cached_token
     try:
         _repository.PurviewClient = PurviewClient
-        _repository.acquire_token = acquire_token
-        _repository.acquire_cached_token = acquire_cached_token if acquire_token is original_token else acquire_token
         return _repository.run_purview_check(source_uri, df_columns, purview_account)
     finally:
         _repository.PurviewClient = original_client
-        _repository.acquire_token = original_token
-        _repository.acquire_cached_token = original_cached_token
+
 
 
 if __name__ == "__main__":

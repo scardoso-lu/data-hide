@@ -1,6 +1,6 @@
-"""Tests for PostgreSQL-backed alert records."""
+﻿"""Tests for PostgreSQL-backed alert records."""
 
-from app.service import record_alert
+from app.application.pipeline import record_alert
 
 
 class TestRecordAlert:

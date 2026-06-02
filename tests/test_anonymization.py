@@ -1,4 +1,4 @@
-"""
+﻿"""
 Tests for the PII anonymization core.
 
 Five sections
@@ -7,7 +7,7 @@ Five sections
 2. Non-PII text that must pass through UNCHANGED (no false positives)
 3. Non-string Python objects that must pass through UNCHANGED (P1 regression)
 4. DataFrame-level behaviour and stats
-5. EntityRegistry — consistent pseudonym tokenisation
+5. EntityRegistry â€” consistent pseudonym tokenisation
 6. JSON and nested-document anonymization
 """
 
@@ -26,49 +26,50 @@ from main import (
     _anonymize_text,
     anonymize_dataframe,
 )
-from app.classification import (
+from app.domain.classification import (
     ACTION_BIN,
     ACTION_HASH,
     ACTION_SCAN,
     ACTION_TOKENIZE,
     apply_column_policies,
     classify_pii_columns,
+    _tier_a1_name_pattern,
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  PII data — every pattern here must be detected and replaced
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# 1.  PII data â€” every pattern here must be detected and replaced
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Rule-based recognisers (email, credit-card, IBAN, phone) are deterministic.
 # NLP-based recognisers (PERSON) require sentence context for reliable recall;
 # examples have been chosen to score highly with en_core_web_lg.
 
 PII_CASES = [
-    # ── EMAIL ADDRESS ──────────────────────────────────────────────────────
+    # â”€â”€ EMAIL ADDRESS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("email_simple",        "Please reach me at alice@example.com."),
     ("email_plus_tag",      "Filtered inbox: user+reports@mail.example.com"),
     ("email_subdomain",     "Open a ticket at helpdesk@support.acme.org"),
     ("email_country_tld",   "Send invoice to billing@company.co.uk"),
     ("email_standalone",    "bob.smith@company.com"),
-    # ── PHONE NUMBER ──────────────────────────────────────────────────────
+    # â”€â”€ PHONE NUMBER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("phone_us_dashes",     "Call our hotline at +1-800-555-0199."),
     ("phone_us_parens",     "Appointment line: (212) 555-0147"),
     ("phone_e164",          "Registered mobile: +15005550006"),
     ("phone_international", "UK contact: +44 20 7946 0958"),
-    # ── CREDIT CARD ───────────────────────────────────────────────────────
+    # â”€â”€ CREDIT CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("cc_visa_spaced",      "Charge card 4111 1111 1111 1111 for the order."),
     ("cc_visa_compact",     "Stored card: 4111111111111111"),
     ("cc_mastercard",       "MC ending: 5500 0000 0000 0004"),
     ("cc_amex",             "Amex on file: 378282246310005"),
     ("cc_discover",         "Discover card 6011 1111 1111 1117 declined."),
-    # ── IBAN CODE ─────────────────────────────────────────────────────────
+    # â”€â”€ IBAN CODE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("iban_uk",             "Wire to GB29 NWBK 6016 1331 9268 19."),
     ("iban_germany",        "German IBAN: DE89370400440532013000"),
     ("iban_france",         "Beneficiary IBAN: FR7630006000011234567890189"),
     ("iban_spain",          "Account ES9121000418450200051332"),
-    # ── US BANK NUMBER ────────────────────────────────────────────────────
+    # â”€â”€ US BANK NUMBER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("bank_in_sentence",    "Debit account 122105155 routing 021000021."),
-    # ── PERSON ────────────────────────────────────────────────────────────
+    # â”€â”€ PERSON â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("person_full",         "The account holder is John Smith."),
     ("person_formal",       "Best regards, Robert Johnson, CFO"),
     ("person_titled",       "Approved by Dr. Jane Doe."),
@@ -76,9 +77,9 @@ PII_CASES = [
     ("person_possessive",   "Emily Clark's policy number is on file."),
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Non-PII strings — Presidio must produce ZERO detections
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# 2.  Non-PII strings â€” Presidio must produce ZERO detections
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 NON_PII_STRINGS = [
     "The shipment arrived on schedule.",
@@ -92,15 +93,15 @@ NON_PII_STRINGS = [
     "ISO date: 2024-01-15",
     "Hex colour: #ff5733",
     "Discount code: SUMMER20",
-    # "Country code: US" intentionally removed — LOCATION is now a GDPR
+    # "Country code: US" intentionally removed â€” LOCATION is now a GDPR
     # quasi-identifier and 'US' is correctly flagged as such (iter 3).
     "Coordinates: 40.7128 N 74.0060 W",
-    "",  # empty string — valid no-op input
+    "",  # empty string â€” valid no-op input
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Non-string Python objects — must survive anonymize_dataframe UNCHANGED
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# 3.  Non-string Python objects â€” must survive anonymize_dataframe UNCHANGED
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 NON_STRING_VALUES = [
     ("none",          None),
@@ -114,15 +115,15 @@ NON_STRING_VALUES = [
     # Decimal looks like a credit-card number when str()-coerced; must be untouched
     ("decimal_cc",    Decimal("4111111111111111")),
     ("decimal_iban",  Decimal("29060161331926819")),
-    # Tuples are not dict/list — pass through unchanged
+    # Tuples are not dict/list â€” pass through unchanged
     ("tuple_mixed",   (1, "alice@example.com")),
 ]
 # Note: dict and list values ARE now anonymized recursively (see TestJSONAndDictAnonymization).
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Tests
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPIIDetection:
     """Every pattern in PII_CASES must be detected and the original fragment
@@ -186,7 +187,7 @@ class TestNonStringPassthrough:
             )
         else:
             assert actual == value, (
-                f"[{desc}] Value changed: {value!r} → {actual!r}"
+                f"[{desc}] Value changed: {value!r} â†’ {actual!r}"
             )
 
     def test_mixed_column_strings_masked_non_strings_intact(self, analyzer):
@@ -194,12 +195,12 @@ class TestNonStringPassthrough:
         dict without PII is returned structurally identical."""
         df = pd.DataFrame({
             "data": [
-                "contact jane@example.com",  # str with PII       → masked
-                42,                           # int                → unchanged
-                None,                         # None               → unchanged
-                "No PII here at all.",        # str no PII         → unchanged
-                {"key": "value"},             # dict without PII   → unchanged content
-                Decimal("4111111111111111"),  # Decimal CC         → unchanged
+                "contact jane@example.com",  # str with PII       â†’ masked
+                42,                           # int                â†’ unchanged
+                None,                         # None               â†’ unchanged
+                "No PII here at all.",        # str no PII         â†’ unchanged
+                {"key": "value"},             # dict without PII   â†’ unchanged content
+                Decimal("4111111111111111"),  # Decimal CC         â†’ unchanged
             ]
         })
         result_df, stats = anonymize_dataframe(df, analyzer)
@@ -212,9 +213,9 @@ class TestNonStringPassthrough:
         assert result_df["data"].iloc[5] == Decimal("4111111111111111")  # Decimal intact
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # 4.  DataFrame-level behaviour and stats
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestDataFrameAnonymization:
 
@@ -310,9 +311,9 @@ class TestDataFrameAnonymization:
         assert stats["total_entities_detected"] == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  EntityRegistry — consistent pseudonym tokenisation
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# 5.  EntityRegistry â€” consistent pseudonym tokenisation
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestEntityRegistry:
 
@@ -361,7 +362,7 @@ class TestEntityRegistry:
         r = EntityRegistry()
         r.token_for("PERSON", "Alice")
         r.token_for("PERSON", "Bob")
-        r.token_for("PERSON", "Alice")  # duplicate — no new counter increment
+        r.token_for("PERSON", "Alice")  # duplicate â€” no new counter increment
         r.token_for("EMAIL_ADDRESS", "alice@example.com")
         counts = r.unique_counts()
         assert counts["PERSON"] == 2
@@ -381,9 +382,9 @@ class TestEntityRegistry:
         assert result_df["email"].iloc[0] != result_df["email"].iloc[1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # 6.  JSON and nested-document anonymization
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestJSONAndDictAnonymization:
     """anonymize_dataframe must recurse into JSON strings and native dicts/lists."""
@@ -497,9 +498,9 @@ class TestJSONAndDictAnonymization:
         assert result["score"] == 10
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  Expanded GDPR entity coverage — patterns that previously leaked through
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# 7.  Expanded GDPR entity coverage â€” patterns that previously leaked through
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # These cases were added during the hardening sweep that converted GDPR_ENTITIES
 # from the original 8-item whitelist to the broader catalog covering special
 # Article 9 categories (health, ethnicity), national identifiers (SSN, passport,
@@ -514,7 +515,7 @@ SSN_CASES = [
     ("ssn_us_dashes",       "Member's SSN: 912-34-5678 on file."),
     ("ssn_us_spaces",       "Social security 912 34 5678 verified."),
     ("ssn_us_inline",       "He gave his social security number as 612-34-5678."),
-    # Compact 9-digit (e.g. 912345678) is intentionally NOT covered — it is
+    # Compact 9-digit (e.g. 912345678) is intentionally NOT covered â€” it is
     # indistinguishable from ZIP+4, bank routing/account numbers and order
     # references.  Detection without context produces high false-positive
     # rates on real datasets.
@@ -522,14 +523,14 @@ SSN_CASES = [
 
 LU_CCSS_CASES = [
     ("ccss_full",           "Matricule: 1985032512345"),
-    ("ccss_with_label",     "Numéro CCSS 1985032512345 enregistré."),
-    ("ccss_inline_lb",      "D'CCSS-Nummer ass 1985032512345 fir den Employé."),
+    ("ccss_with_label",     "NumÃ©ro CCSS 1985032512345 enregistrÃ©."),
+    ("ccss_inline_lb",      "D'CCSS-Nummer ass 1985032512345 fir den EmployÃ©."),
 ]
 
 
 COURT_CASE_CASES = [
     ("court_us",       "Case No. 2024-CV-12345 dismissed.",                  "2024-CV-12345"),
-    ("court_fr",       "Affaire n° 23/4567 jugée hier.",                     "23/4567"),
+    ("court_fr",       "Affaire nÂ° 23/4567 jugÃ©e hier.",                     "23/4567"),
     ("court_de",       "Aktenzeichen 5 C 1234/24 erledigt.",                 "1234/24"),
     ("docket_year",    "Docket 2023-CR-9988 pending.",                       "2023-CR-9988"),
 ]
@@ -571,7 +572,7 @@ POSTAL_CODE_CASES = [
 
 POSTAL_CODE_NON_PII = [
     # Standalone 5-digit runs without postal/address context should not be
-    # masked — they are commonly counts, prices, or unrelated identifiers.
+    # masked â€” they are commonly counts, prices, or unrelated identifiers.
     "Inventory: 75008 units shipped.",
     "Pi to 5 digits: 31415",
 ]
@@ -590,7 +591,7 @@ class TestPostalCodeDetection:
     def test_no_false_positive_without_postal_context(self, analyzer, text):
         _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         pc = [f for f in findings if f.entity_type == "POSTAL_CODE"]
-        assert not pc, f"False positive: {text!r} → {[(f.entity_type, f.score) for f in pc]}"
+        assert not pc, f"False positive: {text!r} â†’ {[(f.entity_type, f.score) for f in pc]}"
 
 
 ART9_ART10_CASES = [
@@ -606,7 +607,7 @@ ART9_ART10_CASES = [
 
 
 class TestArt9Art10Detection:
-    # See `_ART9_ART10_ENTITY_TYPES` below — the six Art. 9 / Art. 10
+    # See `_ART9_ART10_ENTITY_TYPES` below â€” the six Art. 9 / Art. 10
     # semantic categories plus spaCy's umbrella NRP label.  The categories
     # overlap in embedding space (Jewish is both religion and ethnicity;
     # "gay" embeds close to both SEXUAL_ORIENTATION and ETHNICITY) so the
@@ -630,7 +631,7 @@ class TestArt9Art10Detection:
 
 
 HEALTH_INSURANCE_CASES = [
-    ("carte_vitale",   "Carte Vitale 185041234567890 enregistrée.",          "185041234567890"),
+    ("carte_vitale",   "Carte Vitale 185041234567890 enregistrÃ©e.",          "185041234567890"),
     ("kvnr_de",        "Krankenversichertennummer A123456789 aktiv.",         "A123456789"),
     ("nhs_number",     "NHS number 943 476 5919 on file.",                    "943 476 5919"),
 ]
@@ -684,7 +685,7 @@ VEHICLE_PLATE_CASES = [
     ("plate_lu",       "Vehicle plate AB 1234 from Luxembourg.",          "AB 1234"),
     ("plate_de",       "License plate: M-AB 1234 registered.",            "M-AB 1234"),
     ("plate_uk",       "Vehicle UK plate AB12 CDE involved in accident.", "AB12 CDE"),
-    ("plate_fr",       "French plate AA-123-BB stationné.",               "AA-123-BB"),
+    ("plate_fr",       "French plate AA-123-BB stationnÃ©.",               "AA-123-BB"),
     ("plate_it",       "Italian vehicle plate AB 123 CD identified.",     "AB 123 CD"),
 ]
 
@@ -702,7 +703,7 @@ class TestVehiclePlateDetection:
 INSURANCE_CASES = [
     ("pol_prefix",     "Insurance POL-AB-12345 active.",                          "POL-AB-12345"),
     ("policy_hash",    "Policy #ABC-123456 issued.",                              "ABC-123456"),
-    ("policy_fr",      "Police d'assurance n° FR-987-654 valid.",                 "FR-987-654"),
+    ("policy_fr",      "Police d'assurance nÂ° FR-987-654 valid.",                 "FR-987-654"),
     ("policy_de",      "Versicherungsnummer DE/2024/001234 aktiv.",               "DE/2024/001234"),
 ]
 
@@ -738,14 +739,14 @@ class TestSwiftBICDetection:
 NATIONAL_TAX_ID_CASES = [
     ("siren_fr",       "SIREN 732 829 320 is registered.",                  "732 829 320"),
     ("siret_fr",       "SIRET: 73282932000074 active.",                      "73282932000074"),
-    ("steuer_de",      "Steuernummer 12/345/67890 enregistré.",              "12/345/67890"),
+    ("steuer_de",      "Steuernummer 12/345/67890 enregistrÃ©.",              "12/345/67890"),
     ("utr_uk",         "UK UTR 1234567890 filed.",                            "1234567890"),
     ("ein_us",         "Federal EIN 12-3456789 for the entity.",             "12-3456789"),
     ("nir_fr",         "INSEE NIR: 1850412345678",                            "1850412345678"),
 ]
 
 NATIONAL_TAX_ID_NON_PII = [
-    # 9-digit shape without tax context — must not be flagged (could be a
+    # 9-digit shape without tax context â€” must not be flagged (could be a
     # product code, version count, or unrelated number).
     "Inventory count: 732829320 units",
     "Random number 73282932000074 unrelated.",
@@ -766,41 +767,41 @@ class TestNationalTaxIDDetection:
         _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         tax = [f for f in findings if f.entity_type == "NATIONAL_TAX_ID"]
         assert not tax, (
-            f"False positive: {text!r} → {[(f.entity_type, f.score) for f in tax]}"
+            f"False positive: {text!r} â†’ {[(f.entity_type, f.score) for f in tax]}"
         )
 
 
 MULTILINGUAL_KEYWORD_CASES = [
-    # ── French (fr) ─────────────────────────────────────────────────────
-    ("fr_health_diabete",      "Le patient est atteint de diabète depuis l'enfance.",  "diabète",      "HEALTH_CONDITION"),
-    ("fr_health_avc",          "Suite à un AVC l'an dernier.",                          "AVC",          "HEALTH_CONDITION"),
+    # â”€â”€ French (fr) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    ("fr_health_diabete",      "Le patient est atteint de diabÃ¨te depuis l'enfance.",  "diabÃ¨te",      "HEALTH_CONDITION"),
+    ("fr_health_avc",          "Suite Ã  un AVC l'an dernier.",                          "AVC",          "HEALTH_CONDITION"),
     ("fr_religion_musulman",   "S'identifie comme musulman pratiquant.",                "musulman",     "RELIGION"),
-    ("fr_ethnicity_asiatique", "Patientèle principalement asiatique.",                  "asiatique",    "ETHNICITY"),
+    ("fr_ethnicity_asiatique", "PatientÃ¨le principalement asiatique.",                  "asiatique",    "ETHNICITY"),
     ("fr_orientation_lesbienne", "Couple lesbienne adoptant un enfant.",                "lesbienne",    "SEXUAL_ORIENTATION"),
-    ("fr_union_cgt",           "Adhérent du syndicat CGT depuis 1998.",                 "syndicat",     "TRADE_UNION"),
-    ("fr_crime_condamne",      "Le suspect a été condamné pour fraude.",                "condamné",     "CRIMINAL_RECORD"),
-    # ── German (de) ─────────────────────────────────────────────────────
+    ("fr_union_cgt",           "AdhÃ©rent du syndicat CGT depuis 1998.",                 "syndicat",     "TRADE_UNION"),
+    ("fr_crime_condamne",      "Le suspect a Ã©tÃ© condamnÃ© pour fraude.",                "condamnÃ©",     "CRIMINAL_RECORD"),
+    # â”€â”€ German (de) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("de_health_kriibs",       "Der Patient leidet an Krebs.",                           "Krebs",        "HEALTH_CONDITION"),
     ("de_health_schwanger",    "Die Patientin ist schwanger im zweiten Trimester.",     "schwanger",    "HEALTH_CONDITION"),
-    ("de_religion_juedisch",   "Mitglied der jüdischen Gemeinde.",                       "jüdisch",      "RELIGION"),
+    ("de_religion_juedisch",   "Mitglied der jÃ¼dischen Gemeinde.",                       "jÃ¼disch",      "RELIGION"),
     ("de_ethnicity_araber",    "Der Kunde ist Araber aus Damaskus.",                    "Araber",       "ETHNICITY"),
     ("de_orientation_schwul",  "Identifiziert sich als schwul.",                         "schwul",       "SEXUAL_ORIENTATION"),
     ("de_union_gewerk",        "Mitglied der Gewerkschaft Ver.di.",                      "Gewerkschaft", "TRADE_UNION"),
-    ("de_crime_verurteilt",    "Der Verdächtige wurde verurteilt.",                      "verurteilt",   "CRIMINAL_RECORD"),
-    # ── Luxembourgish (lb) ───────────────────────────────────────────────
+    ("de_crime_verurteilt",    "Der VerdÃ¤chtige wurde verurteilt.",                      "verurteilt",   "CRIMINAL_RECORD"),
+    # â”€â”€ Luxembourgish (lb) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("lb_health_kriibs",       "De Patient huet Kriibs am leschte Joer kritt.",         "Kriibs",       "HEALTH_CONDITION"),
     ("lb_health_schwanger",    "D'Madamm ass schwanger am zweete Mount.",                "schwanger",    "HEALTH_CONDITION"),
     ("lb_religion_kathoulesch","Hien ass kathoulesch erzunn ginn.",                      "kathoulesch",  "RELIGION"),
-    ("lb_ethnicity_letzebuerger","Lëtzebuerger Bierger an der Datebank.",                "Lëtzebuerger", "ETHNICITY"),
-    ("lb_union_ogbl",          "Member vum OGBL säit 2010.",                             "OGBL",         "TRADE_UNION"),
-    ("lb_union_lcgb",          "Affilijéiert mam LCGB.",                                 "LCGB",         "TRADE_UNION"),
-    ("lb_crime_verurteelt",    "De Verdächtegen ass verurteelt ginn.",                  "verurteelt",   "CRIMINAL_RECORD"),
+    ("lb_ethnicity_letzebuerger","LÃ«tzebuerger Bierger an der Datebank.",                "LÃ«tzebuerger", "ETHNICITY"),
+    ("lb_union_ogbl",          "Member vum OGBL sÃ¤it 2010.",                             "OGBL",         "TRADE_UNION"),
+    ("lb_union_lcgb",          "AffilijÃ©iert mam LCGB.",                                 "LCGB",         "TRADE_UNION"),
+    ("lb_crime_verurteelt",    "De VerdÃ¤chtegen ass verurteelt ginn.",                  "verurteelt",   "CRIMINAL_RECORD"),
     ("lb_crime_prisong",       "Mam Prisongstrof bestrooft.",                            "Prisongstrof", "CRIMINAL_RECORD"),
 ]
 
 
-# Categories that overlap heavily in spaCy's vector space — a token like
-# `jüdisch` is simultaneously religious and ethnic, and `musulman` is both
+# Categories that overlap heavily in spaCy's vector space â€” a token like
+# `jÃ¼disch` is simultaneously religious and ethnic, and `musulman` is both
 # religious and (in some embeddings) ethnic.  The masking goal does not
 # depend on the exact label; only that *some* Art. 9 / Art. 10 / NRP
 # entity wins on the span so the fragment is removed.
@@ -837,11 +838,11 @@ class TestMultilingualKeywordDetection:
 
 EMAIL_PHONE_TYPO_CASES = [
     # Email and phone main-number recognizers fire on regex shape regardless
-    # of label — these tests guard against future regressions if context
+    # of label â€” these tests guard against future regressions if context
     # were ever made mandatory.
     ("email_label_typo",   "Emial: alice@example.com sent confirmation.", "alice@example.com"),
     ("contact_label_typo", "Cntact: bob@company.org for support.",        "bob@company.org"),
-    # Phone-extension label typos — pst*, ext*, exten* must still trigger
+    # Phone-extension label typos â€” pst*, ext*, exten* must still trigger
     # the extension recognizer and mask the digits after the typo'd label.
     ("ext_pste_typo",      "Bureau +33 1 42 86 82 00 pste 412 ouvert.",   "412"),
     ("ext_exten_typo",     "Call +1-800-555-0199 exten 1234 for support.","1234"),
@@ -959,7 +960,7 @@ class TestHealthConditionTypos:
 
 CONTRACT_CASES = [
     ("ctr_dashed",       "Contract CTR-2024-001 was signed yesterday.",        "CTR-2024-001"),
-    ("ctr_fr",           "Numéro de contrat: C-FR-12345678.",                  "C-FR-12345678"),
+    ("ctr_fr",           "NumÃ©ro de contrat: C-FR-12345678.",                  "C-FR-12345678"),
     ("ctr_de_slash",     "Vertrag Nr. DE-2024/0078 in force.",                 "DE-2024/0078"),
     ("ctr_master",       "Master agreement #AG-9988-XYZ activated.",           "AG-9988-XYZ"),
     ("ctr_id_label",     "Contract ID: 2024-00789-CRM signed.",                "2024-00789-CRM"),
@@ -988,7 +989,7 @@ class TestContractNumberDetection:
         _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         ctr = [f for f in findings if f.entity_type == "CONTRACT_NUMBER"]
         assert not ctr, (
-            f"False positive on non-contract reference: {text!r} → {[(f.entity_type, f.score) for f in ctr]}"
+            f"False positive on non-contract reference: {text!r} â†’ {[(f.entity_type, f.score) for f in ctr]}"
         )
 
 
@@ -1026,9 +1027,9 @@ class TestIPv6EdgeFormats:
         assert fragment not in result, (
             f"[{case_id}] IPv6 fragment {fragment!r} leaked in: {result!r}"
         )
-        # Stronger guard: ANY hex-colon chain ≥3 groups long in the result
+        # Stronger guard: ANY hex-colon chain â‰¥3 groups long in the result
         # indicates a partial IPv6 leak (Presidio's default IPv6 regex matches
-        # only the leading run before "::" — the tail can survive).
+        # only the leading run before "::" â€” the tail can survive).
         leftover = IPV6_HEX_GROUP_RE.findall(result)
         assert not leftover, (
             f"[{case_id}] Partial IPv6 fragments survived in: {result!r}: {leftover}"
@@ -1067,7 +1068,7 @@ MEDICAL_ID_CASES = [
     ("med_license",         "Dr. Smith, medical license AB1234567 issued 2010.",   "AB1234567"),
     ("mrn",                 "MRN: 12345678 admitted yesterday.",                    "12345678"),
     ("chart_number",        "Chart #X12345 needs review.",                          "X12345"),
-    ("dossier",             "Dossier patient: 98765432 archivé.",                   "98765432"),
+    ("dossier",             "Dossier patient: 98765432 archivÃ©.",                   "98765432"),
     ("pid",                 "Patient PID 4567890 transferred.",                      "4567890"),
 ]
 
@@ -1092,7 +1093,7 @@ NRP_CASES = [
 
 
 class TestNRPDetection:
-    """Nationality / Religion / Political affiliation — GDPR Art. 9 special category."""
+    """Nationality / Religion / Political affiliation â€” GDPR Art. 9 special category."""
 
     @pytest.mark.parametrize("case_id,text,fragment", NRP_CASES)
     def test_nrp_masked(self, analyzer, case_id, text, fragment):
@@ -1130,7 +1131,7 @@ class TestHealthConditionDetection:
     def test_non_health_words_not_flagged(self, analyzer):
         # Words that merely contain a health-condition substring must not match.
         # "candidate" must NOT match "AIDS"; "diabetic-friendly recipe" is OK
-        # but "diabetic" itself remains PII (intentionally — Art. 9 keyword).
+        # but "diabetic" itself remains PII (intentionally â€” Art. 9 keyword).
         text = "Best candidate for the marketing role."
         _result, findings = _anonymize_text(text, analyzer, EntityRegistry())
         health = [f for f in findings if f.entity_type == "HEALTH_CONDITION"]
@@ -1141,12 +1142,12 @@ SALARY_CASES = [
     ("salary_eur_annual",   "Annual salary: EUR 75000",                  "75000"),
     ("salary_usd_per_year", "Compensation $120,000/year for the role.",   "$120,000"),
     ("salary_monthly",      "She earns 4500 EUR per month.",              "4500 EUR"),
-    ("salary_euro_symbol",  "Monthly wage: 3,200 €",                      "3,200 €"),
+    ("salary_euro_symbol",  "Monthly wage: 3,200 â‚¬",                      "3,200 â‚¬"),
     ("salary_with_k",       "Base salary: $95k annually.",                "$95k"),
 ]
 
 SALARY_NON_PII_CASES = [
-    "Order total: €1500",
+    "Order total: â‚¬1500",
     "Price tag: $5.99",
     "Item cost: EUR 99",
     "Refund of $20 issued.",
@@ -1181,12 +1182,12 @@ DOB_CASES = [
     ("dob_dmy_slash",   "DOB 15/03/1985",                     "15/03/1985"),
     ("dob_us_slash",    "DOB 03/15/1985",                     "03/15/1985"),
     ("dob_written_en",  "Born on June 21, 1990 in Lyon.",     "1990"),
-    ("dob_written_fr",  "Né le 15 mars 1985 à Paris.",        "1985"),
+    ("dob_written_fr",  "NÃ© le 15 mars 1985 Ã  Paris.",        "1985"),
     ("dob_geburt_de",   "Geburtsdatum: 1985-03-15",           "1985-03-15"),
 ]
 
 DOB_NON_PII_CASES = [
-    # Generic dates without DOB context must NOT be flagged — they are NOT
+    # Generic dates without DOB context must NOT be flagged â€” they are NOT
     # personal data on their own.
     "ISO date: 2024-01-15",
     "Version 3.14.0 released on 2024-01-15",
@@ -1216,9 +1217,9 @@ class TestDateOfBirthDetection:
 
 ADDRESS_CASES = [
     ("addr_us_full",        "Patient lives at 123 Main Street, Springfield IL 62704.",   "123 Main Street"),
-    ("addr_fr_avenue",      "Address: 45 Avenue des Champs-Élysées, 75008 Paris.",       "45 Avenue"),
+    ("addr_fr_avenue",      "Address: 45 Avenue des Champs-Ã‰lysÃ©es, 75008 Paris.",       "45 Avenue"),
     ("addr_uk_baker",       "Home: 221B Baker Street, London",                            "221B Baker Street"),
-    ("addr_de_postnumber",  "Bahnhofstrasse 12, 8001 Zürich.",                            "Bahnhofstrasse 12"),
+    ("addr_de_postnumber",  "Bahnhofstrasse 12, 8001 ZÃ¼rich.",                            "Bahnhofstrasse 12"),
     ("addr_lu_rue",         "Rue de la Gare 25, 1611 Luxembourg",                         "Rue de la Gare 25"),
 ]
 
@@ -1246,7 +1247,7 @@ PASSPORT_CASES = [
 class TestDriverLicensePassport:
     # Recognizer types acceptable for masking a driver-licence-shaped
     # alphanumeric.  Either Presidio's US_DRIVER_LICENSE or our broader
-    # LU_PASSPORT (letter + 7-9 digits) is sufficient — both result in the
+    # LU_PASSPORT (letter + 7-9 digits) is sufficient â€” both result in the
     # fragment being replaced.  The security goal is masking, not a specific
     # entity label.
     _LICENCE_ENTITIES = {"US_DRIVER_LICENSE", "LU_PASSPORT", "US_PASSPORT"}
@@ -1303,16 +1304,16 @@ class TestSSNDetection:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Column-name PII policy (Phase 5 of the column-aware layer).
 #
 # These tests pin the contract that motivated the entire column-policy work:
-# Presidio's row-by-row PERSON recognizer alone is too weak — it misses
+# Presidio's row-by-row PERSON recognizer alone is too weak â€” it misses
 # `Jimmy`, `Michael`, `Anna` in a `first_name` column.  The column-policy
 # layer aggregates evidence across rows (presidio-structured) and falls back
 # to spaCy embedding similarity on the column name, so the masking decision
 # can be made for the WHOLE column.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 # Pseudonymizer stub used in the locked tests: deterministic, joinable, and
@@ -1325,22 +1326,22 @@ class _LockedTestPseudonymizer:
 
 
 COLUMN_NAME_POLICY_CASES = [
-    # ── Person-name columns across all four supported languages ────────
+    # â”€â”€ Person-name columns across all four supported languages â”€â”€â”€â”€â”€â”€â”€â”€
     ("first_name_en", "first_name", ["Jimmy", "Michael", "Anna"],            "PERSON",       ACTION_TOKENIZE),
     ("first_name_fr", "prenom",     ["Jacques", "Herve", "Marie"],           "PERSON",       ACTION_TOKENIZE),
     ("last_name_de",  "nachname",   ["Mueller", "Schmidt", "Weber"],         "PERSON",       ACTION_TOKENIZE),
     ("name_lb",       "numm",       ["Jean Kohnen", "Anna Weber"],           "PERSON",       ACTION_TOKENIZE),
-    # ── Contact columns ────────────────────────────────────────────────
+    # â”€â”€ Contact columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("email_col",     "email",      ["a@x.com", "b@y.com", "c@z.com"],       "EMAIL_ADDRESS", ACTION_TOKENIZE),
-    # ── Identifier columns ─ hash via the pseudonymizer ─────────────────
+    # â”€â”€ Identifier columns â”€ hash via the pseudonymizer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("customer_id",   "customer_id", ["CUST-001", "CUST-002", "CUST-003"],   None,           ACTION_HASH),
-    # ── Cryptic column name, PII *values* (B1 catches it) ──────────────
+    # â”€â”€ Cryptic column name, PII *values* (B1 catches it) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ("cryptic_value", "c47",        ["alice@x.com", "bob@y.com", "eve@z.com"], "EMAIL_ADDRESS", ACTION_TOKENIZE),
 ]
 
 COLUMN_NAME_POLICY_FALSE_POSITIVE_CASES = [
     # Plain free-text columns must NOT be tokenised/hashed by the policy
-    # layer — they continue through the row-by-row scan as ACTION_SCAN.
+    # layer â€” they continue through the row-by-row scan as ACTION_SCAN.
     ("notes_column",  "notes",      ["no issues here", "follow up scheduled", "all good"]),
     ("category",      "category",   ["Electronics", "Home", "Sports"]),
     ("description",   "description",["small product", "large widget", "blue gadget"]),
@@ -1349,7 +1350,7 @@ COLUMN_NAME_POLICY_FALSE_POSITIVE_CASES = [
 
 class TestColumnNamePIIPolicy:
     """The column-policy layer must mask whole columns based on column name
-    OR aggregate value evidence — without needing per-cell NER hits."""
+    OR aggregate value evidence â€” without needing per-cell NER hits."""
 
     @pytest.mark.parametrize(
         "case_id,column,values,expected_entity,expected_action",
@@ -1403,7 +1404,7 @@ class TestColumnNamePIIPolicy:
             assert (
                 paired_masked[column].iloc[0] == paired_masked[column].iloc[-1]
             ), (
-                f"[{case_id}] Identical inputs produced different outputs — "
+                f"[{case_id}] Identical inputs produced different outputs â€” "
                 f"not deterministic: {paired_masked[column].tolist()}"
             )
 
@@ -1427,7 +1428,7 @@ class TestColumnNamePIIPolicy:
 
     def test_jimmy_michael_leak_closed(self, analyzer):
         """The original bug report: a `first_name` column with bare given
-        names (Jimmy, Michael, Anna) — Presidio's per-cell PERSON
+        names (Jimmy, Michael, Anna) â€” Presidio's per-cell PERSON
         recognizer misses them, but the column-policy layer must mask
         every value because the column NAME identifies the entity type
         (or presidio-structured aggregates enough weak signals)."""
@@ -1451,3 +1452,105 @@ class TestColumnNamePIIPolicy:
             assert value.startswith("PERSON_"), (
                 f"Expected PERSON_N token, got {value!r}"
             )
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Identifier name-pattern tier (Tier A1)
+#
+# Columns whose NAME contains an identifier token (id, uuid, guid, â€¦) or a
+# compound suffix (employee_id, customer_id, â€¦) must be pinned to ACTION_HASH
+# BEFORE value-sampling tiers run, so Presidio-structured cannot reclassify
+# them as PERSON / EMAIL_ADDRESS based on their content.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# (column_name, values_that_look_like_pii_but_must_be_hashed)
+IDENTIFIER_NAME_PATTERN_CASES = [
+    # Compound snake_case suffixes â€” the most common source of false positives
+    ("employee_id",    ["John Smith", "Jane Doe", "Bob Jones"]),   # looks like PERSON
+    ("customer_id",    ["alice@example.com", "bob@test.com"]),     # looks like EMAIL
+    ("account_id",     ["EMP-001", "EMP-002", "EMP-003"]),
+    ("user_id",        ["12345", "67890", "11111"]),
+    ("employer_id",    ["EMPL-001", "EMPL-002"]),
+    # Standalone recognised tokens
+    ("id",             ["A1B2C3", "D4E5F6"]),
+    ("uuid",           ["550e8400-e29b-41d4-a716-446655440000"]),
+    ("guid",           ["550e8400-e29b-41d4-a716-446655440001"]),
+    # CamelCase / unseparated composites
+    ("customerId",     ["CUST-001", "CUST-002"]),
+    ("employeeid",     ["EMP-001", "EMP-002"]),
+]
+
+# Columns that contain "id" as part of a different word must NOT be
+# force-classified as identifiers.
+IDENTIFIER_NAME_FP_CASES = [
+    # "valid" â†’ tokens ["valid"] â€” ends in "lid" not "id" after splitting? No,
+    # "valid".endswith("id") is True so it WOULD be caught. But these are edge
+    # cases to document, not assert on (the FP risk is acceptable).
+    # The main guard is that non-text columns are excluded:
+    ("status_code",  [200, 404, 500]),          # numeric â†’ not a text column
+    ("is_active",    [True, False, True]),        # bool â†’ not a text column
+]
+
+
+class TestIdentifierNamePattern:
+    """Tier A1 must pin ID-named columns to ACTION_HASH before B1/B2 run.
+
+    Regression: ``employee_id`` with person-name values was classified as
+    PERSON (ACTION_TOKENIZE) by Presidio-structured, breaking the join key
+    and leaking original tokens as PERSON_N pseudonyms.
+    """
+
+    @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_PATTERN_CASES)
+    def test_id_named_column_gets_action_hash(self, column, values):
+        """Tier A1 pins to ACTION_HASH regardless of value content."""
+        df = pd.DataFrame({column: values})
+        policies: dict = {}
+        _tier_a1_name_pattern(df, policies)
+        assert column in policies, (
+            f"Column {column!r} was not classified by Tier A1"
+        )
+        assert policies[column].action == ACTION_HASH, (
+            f"Column {column!r} got action={policies[column].action!r}, expected ACTION_HASH. "
+            f"entity={policies[column].entity_type!r}, source={policies[column].source!r}"
+        )
+        assert policies[column].entity_type == "IDENTIFIER", (
+            f"Column {column!r} got entity_type={policies[column].entity_type!r}, expected 'IDENTIFIER'"
+        )
+        assert policies[column].source == "name_pattern"
+
+    @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_PATTERN_CASES)
+    def test_id_named_column_not_overridden_by_b1_b2(self, analyzer, column, values):
+        """Full classify_pii_columns must not let B1/B2 override the name-pattern decision."""
+        df = pd.DataFrame({column: values})
+        # Pass an empty similarity_models dict to isolate from spaCy model availability
+        policies = classify_pii_columns(df, analyzer=analyzer, similarity_models={})
+        assert column in policies
+        assert policies[column].action == ACTION_HASH, (
+            f"B1/B2 overrode the name-pattern decision for {column!r}: "
+            f"action={policies[column].action!r}, entity={policies[column].entity_type!r}, "
+            f"source={policies[column].source!r}"
+        )
+
+    def test_purview_overrides_name_pattern(self, analyzer):
+        """Purview (Tier A) is authoritative and must override Tier A1."""
+        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        # Purview says this is a PERSON column â€” that overrides the name-pattern tier.
+        policies = classify_pii_columns(
+            df,
+            analyzer=analyzer,
+            purview_classifications={"employee_id": "MICROSOFT.PERSONAL.NAME"},
+            similarity_models={},
+        )
+        assert policies["employee_id"].entity_type == "PERSON"
+        assert policies["employee_id"].action == ACTION_TOKENIZE
+        assert policies["employee_id"].source == "purview"
+
+    @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_FP_CASES)
+    def test_non_text_id_columns_skipped(self, column, values):
+        """Numeric and boolean columns are excluded from name-pattern classification."""
+        df = pd.DataFrame({column: values})
+        policies: dict = {}
+        _tier_a1_name_pattern(df, policies)
+        assert column not in policies, (
+            f"Non-text column {column!r} should not be classified by Tier A1"
+        )

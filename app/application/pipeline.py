@@ -1,10 +1,15 @@
-"""Pipeline orchestration service."""
+"""Pipeline orchestration — application layer.
+
+Coordinates the domain logic (classification, anonymization, aggregation) with
+the infrastructure adapters (repository, key vault) to execute the full
+read → classify → anonymize → write pipeline for every discovered table.
+"""
 
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
@@ -13,8 +18,8 @@ import uuid
 
 import pandas as pd
 
-from .aggregation import aggregate_gps_table, detect_speed_column
-from .anonymization import (
+from ..domain.aggregation import aggregate_gps_table, detect_speed_column
+from ..domain.anonymization import (
     EntityRegistry,
     anonymize_dataframe,
     anonymize_gps_columns,
@@ -25,7 +30,7 @@ from .anonymization import (
     pseudonymize_identifier_columns,
     validate_residual_pii,
 )
-from .classification import (
+from ..domain.classification import (
     ACTION_HASH,
     FREE_TEXT,
     IDENTIFIER,
@@ -37,8 +42,8 @@ from .classification import (
     detect_timestamp_columns,
     free_text_columns_from_policies,
 )
-from .keyvault import build_pseudonymizer_from_env
-from .repository import (
+from ..infrastructure.keyvault import LocalHashPseudonymizer, build_pseudonymizer_from_env
+from ..infrastructure.repository import (
     AuditDB,
     TableMapping,
     _fresh_opts,
@@ -63,40 +68,154 @@ class PipelineConfig:
     key_vault_rsa_key_name: str | None = None
     key_vault_enabled: bool = True
     hash_salt: str | None = None
-    quasi_identifier_cols: tuple[str, ...] = ()
+    # Tables on which k-anonymity is enabled.
+    # Lowercase names parsed from K_ANONYMITY_TABLES=table1,table2.
+    # K-anonymity is skipped for every table NOT in this set.
+    k_anonymity_tables: frozenset[str] = field(default_factory=frozenset)
+    # Per-table quasi-identifier columns.
+    # Keys are lowercase table names; values are the column tuples.
+    # Configured via QUASI_IDENTIFIER_COLS__<table_name>=col1,col2.
+    quasi_identifier_cols_by_table: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Per-table columns excluded from anonymization entirely.
+    # Loaded from pii_column_exclusions in PostgreSQL.
+    excluded_columns_by_table: dict[str, frozenset[str]] = field(default_factory=dict)
     identifier_cols: tuple[str, ...] = ()
     source_base_uri: str | None = None
     target_base_uri: str | None = None
     sql_endpoint: str | None = None
     sql_database: str | None = None
-    gps_precision: int = 2
+    gps_precision: int = 1
     max_table_workers: int = 1
 
     @classmethod
-    def from_env(cls) -> "PipelineConfig":
+    def from_env(
+        cls,
+        config_overrides: "dict[str, str] | None" = None,
+        excluded_columns: "dict[str, frozenset[str]] | None" = None,
+    ) -> "PipelineConfig":
+        """Build from environment variables, optionally overlaid with DB overrides.
+
+        ``config_overrides`` is a ``{key: value}`` dict loaded from
+        ``pii_pipeline_config`` — values here win over the corresponding env
+        vars for every runtime-tunable parameter.
+
+        Secrets and connectivity settings are **always** read from the
+        environment and cannot be overridden via the database:
+        ``DATABASE_URL``, ``AZURE_*``, ``KEY_VAULT_URL``,
+        ``KEY_VAULT_RSA_KEY_NAME``, ``HASH_SALT``,
+        ``SOURCE_BASE_ABFSS_URI``, ``TARGET_BASE_ABFSS_URI``.
+        """
+        overrides = config_overrides or {}
+
+        def _get(key: str, default: str = "") -> str:
+            return overrides.get(key, default)
+
+        def _int_at_least(key: str, default: int, minimum: int) -> int:
+            raw = _get(key, str(default))
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{key} must be an integer, got {raw!r}") from None
+            if value < minimum:
+                raise ValueError(f"{key} must be {minimum} or greater")
+            return value
+
         return cls(
+            # ── secrets / connectivity: always from env, never from DB ────────
             database_url=os.environ.get("DATABASE_URL"),
-            purview_account_name=os.environ.get("PURVIEW_ACCOUNT_NAME"),
-            k_anonymity_min=int(os.environ.get("K_ANONYMITY_MIN", "5")),
             key_vault_url=os.environ.get("KEY_VAULT_URL"),
             key_vault_rsa_key_name=os.environ.get("KEY_VAULT_RSA_KEY_NAME"),
-            key_vault_enabled=os.environ.get("ENABLE_KEY_VAULT", "1").strip().lower() in {
-                "1", "true", "yes", "on",
-            },
             hash_salt=os.environ.get("HASH_SALT"),
-            quasi_identifier_cols=_csv(os.environ.get("QUASI_IDENTIFIER_COLS", "")),
-            identifier_cols=_csv(os.environ.get("IDENTIFIER_COLS", "")),
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
-            sql_endpoint=os.environ.get("SQL_ENDPOINT_URL"),
-            sql_database=os.environ.get("SQL_DATABASE"),
-            gps_precision=int(os.environ.get("GPS_PRECISION", "2")),
-            max_table_workers=_env_int_at_least("MAX_TABLE_WORKERS", 1, 1),
+            # ── runtime-tunable: DB wins over env ─────────────────────────────
+            purview_account_name=_get("PURVIEW_ACCOUNT_NAME") or None,
+            k_anonymity_min=_int_at_least("K_ANONYMITY_MIN", 5, 1),
+            key_vault_enabled=_get("ENABLE_KEY_VAULT", "1").strip().lower() in {
+                "1", "true", "yes", "on",
+            },
+            k_anonymity_tables=_parse_k_anonymity_tables(_get("K_ANONYMITY_TABLES", "")),
+            quasi_identifier_cols_by_table=_parse_table_qi_cols(overrides),
+            identifier_cols=_csv(_get("IDENTIFIER_COLS", "")),
+            sql_endpoint=_get("SQL_ENDPOINT_URL") or None,
+            sql_database=_get("SQL_DATABASE") or None,
+            gps_precision=_int_at_least("GPS_PRECISION", 1, 0),
+            max_table_workers=_int_at_least("MAX_TABLE_WORKERS", 1, 1),
+            # ── loaded from pii_column_exclusions table ────────────────────────
+            excluded_columns_by_table=excluded_columns or {},
         )
+
+    @classmethod
+    def from_env_and_db(cls, db: "AuditDB | None") -> "PipelineConfig":
+        """Build config from environment variables, overlaid with runtime values
+        from ``pii_pipeline_config`` and column exclusions from
+        ``pii_column_exclusions`` in PostgreSQL.
+
+        Falls back gracefully to env-only when the DB is unavailable or
+        when either table query fails.
+        """
+        if db is None:
+            return cls.from_env()
+        overrides: dict[str, str] = {}
+        exclusions: dict[str, frozenset[str]] = {}
+        try:
+            overrides = db.load_runtime_config()
+        except Exception as exc:
+            logger.warning("Could not load runtime config from DB (using env only): %s", exc)
+        try:
+            exclusions = db.load_column_exclusions()
+        except Exception as exc:
+            logger.warning("Could not load column exclusions from DB (none applied): %s", exc)
+        return cls.from_env(config_overrides=overrides, excluded_columns=exclusions)
 
 
 def _csv(value: str) -> tuple[str, ...]:
     return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
+def _parse_k_anonymity_tables(raw: str = "") -> frozenset[str]:
+    """Parse a comma-separated list of table names into a frozenset of lowercase names.
+
+    K-anonymity runs only for tables whose name appears in this set.
+    An empty string means k-anonymity is disabled for every table.
+    Called by ``PipelineConfig.from_env()`` with the resolved value of
+    ``K_ANONYMITY_TABLES`` (DB override wins over env var).
+    """
+    raw = raw.strip()
+    if not raw:
+        return frozenset()
+    return frozenset(t.strip().lower() for t in raw.split(",") if t.strip())
+
+
+_QI_PREFIX = "QUASI_IDENTIFIER_COLS__"
+
+
+def _parse_table_qi_cols(overrides: "dict[str, str] | None" = None) -> dict[str, tuple[str, ...]]:
+    """Parse QUASI_IDENTIFIER_COLS__<table_name>=col1,col2,… from env and DB overrides.
+
+    Env vars are loaded first; DB override rows with the same key win per-table.
+    Keys are lowercased table names so lookups are case-insensitive.
+
+    Configure in ``pii_pipeline_config``::
+
+        key = 'QUASI_IDENTIFIER_COLS__gps_trips',  value = 'lat,lon,recorded_at'
+        key = 'QUASI_IDENTIFIER_COLS__network_logs', value = 'source_ip,dest_ip,event_time'
+    """
+    result: dict[str, tuple[str, ...]] = {}
+    prefix_upper = _QI_PREFIX.upper()
+    # Env first
+    for key, value in os.environ.items():
+        if key.upper().startswith(prefix_upper) and value.strip():
+            table = key[len(_QI_PREFIX):].lower()
+            if table:
+                result[table] = _csv(value)
+    # DB overrides win per-table
+    for key, value in (overrides or {}).items():
+        if key.upper().startswith(prefix_upper) and value.strip():
+            table = key[len(_QI_PREFIX):].lower()
+            if table:
+                result[table] = _csv(value)
+    return result
 
 
 def _env_int_at_least(name: str, default: int, minimum: int) -> int:
@@ -253,6 +372,12 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             df_raw = _read_source_table(config, mapping)
         audit["total_rows_processed"] = len(df_raw)
         audit["total_columns_in_table"] = len(df_raw.columns)
+        logger.info(
+            "Table '%s': read %d row(s), %d column(s)",
+            mapping.table_name or mapping.source_uri,
+            len(df_raw),
+            len(df_raw.columns),
+        )
 
         with timed_stage(audit, "gps_detection_and_transform"):
             gps_anonymized: list[str] = []
@@ -286,11 +411,14 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                     hash_salt=config.hash_salt,
                 )
                 if pseudonymizer is None:
-                    raise RuntimeError(
-                        "Identifier columns detected but Key Vault is not configured. "
-                        "Set KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME, or set "
-                        "ENABLE_KEY_VAULT=0 to use local hashing instead."
+                    logger.warning(
+                        "Key Vault not configured and ENABLE_KEY_VAULT is not "
+                        "explicitly set to '0' — falling back to local HMAC "
+                        "hashing for identifier columns.  Set KEY_VAULT_URL + "
+                        "KEY_VAULT_RSA_KEY_NAME for HSM-bound pseudonymization, "
+                        "or add ENABLE_KEY_VAULT=0 to .env to suppress this warning."
                     )
+                    pseudonymizer = LocalHashPseudonymizer(config.hash_salt)
                 df_raw, pseudonymized = pseudonymize_identifier_columns(df_raw, id_cols, pseudonymizer, inplace=True)
                 audit["key_vault_key_version"] = pseudonymizer.key_version
             else:
@@ -303,9 +431,18 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             pv = run_purview_check(mapping.source_uri, list(df_raw.columns), config.purview_account_name)
         _apply_purview_audit(audit, pv)
 
+        # Lowercase table name used by both k-anonymity and column-exclusion
+        # lookups below — computed once here to avoid repetition.
+        _table_key = (mapping.table_name or "").lower()
+
         with timed_stage(audit, "k_anonymity"):
-            if not is_trajectory:
-                qi_cols = _configured_or_profiled_columns(config.quasi_identifier_cols, column_profiles, QUASI_IDENTIFIER, df_raw)
+            # K-anonymity runs only for tables explicitly listed in
+            # K_ANONYMITY_TABLES.  All other tables are skipped so that
+            # business tables (HR, finance, absence, …) are never silently
+            # suppressed without an explicit operator decision.
+            _table_qi_cols = config.quasi_identifier_cols_by_table.get(_table_key, ())
+            if not is_trajectory and _table_key in config.k_anonymity_tables:
+                qi_cols = _configured_or_profiled_columns(_table_qi_cols, column_profiles, QUASI_IDENTIFIER, df_raw)
                 qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
                 audit["quasi_columns"] = qi_cols
                 numeric_qi = [c for c in qi_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
@@ -315,6 +452,12 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 if qi_cols:
                     df_raw, k_info = enforce_k_anonymity(df_raw, qi_cols, config.k_anonymity_min)
                     audit["suppressed_rows"] = k_info["suppressed_rows"]
+            else:
+                logger.debug(
+                    "Table '%s': skipping k-anonymity (not listed in K_ANONYMITY_TABLES).",
+                    mapping.table_name or mapping.source_uri,
+                )
+                audit["quasi_columns"] = []
 
         with timed_stage(audit, "build_engines"):
             analyzer = build_engines()
@@ -332,6 +475,20 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             except Exception as exc:
                 logger.warning("Column-policy classification failed (non-fatal): %s", exc)
                 policies = {}
+
+        # Drop columns that the operator explicitly excluded from anonymization
+        # (pii_column_exclusions table in PostgreSQL).  These columns pass
+        # through untouched regardless of what the classification tiers found.
+        _excluded = config.excluded_columns_by_table.get(_table_key, frozenset())
+        if _excluded:
+            before = len(policies)
+            policies = {col: pol for col, pol in policies.items() if col not in _excluded}
+            logger.info(
+                "Table '%s': %d column(s) excluded from anonymization by operator rule: %s",
+                mapping.table_name or mapping.source_uri,
+                before - len(policies),
+                sorted(_excluded),
+            )
 
         policy_needs_hash = any(p.action == ACTION_HASH for p in policies.values())
         policy_pseudonymizer = pseudonymizer if policy_needs_hash else None
@@ -362,8 +519,22 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         }
         scan_columns = free_text_columns_from_policies(policies)
 
+        # TODO: row-by-row Presidio scan disabled — too many false positives,
+        #       to be replaced with a more targeted approach.
+        # with timed_stage(audit, "anonymization"):
+        #     df_clean, stats = anonymize_dataframe(
+        #         df_raw, analyzer, registry, scan_columns=scan_columns, inplace=True,
+        #     )
+        # _apply_anonymization_audit(audit, stats, registry)
         with timed_stage(audit, "anonymization"):
-            df_clean, stats = anonymize_dataframe(df_raw, analyzer, registry, scan_columns=scan_columns, inplace=True)
+            df_clean = df_raw
+            stats = {
+                "text_columns_scanned": [],
+                "columns_with_detections": [],
+                "entity_counts": {},
+                "total_entities_detected": 0,
+                "column_stats": [],
+            }
         _apply_anonymization_audit(audit, stats, registry)
 
         if db and stats["column_stats"]:
@@ -384,12 +555,37 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
             with timed_stage(audit, "residual_validation"):
                 audit["residual_pii_count"] = validate_residual_pii(df_clean)
 
+        rows_out = len(df_clean)
+        if rows_out == 0:
+            logger.warning(
+                "Table '%s': 0 rows remain after processing "
+                "(source=%d, suppressed=%d) — writing empty table.",
+                mapping.table_name or mapping.source_uri,
+                audit["total_rows_processed"],
+                audit["suppressed_rows"],
+            )
+        else:
+            logger.info(
+                "Table '%s': %d → %d row(s) written (%d suppressed by k-anonymity).",
+                mapping.table_name or mapping.source_uri,
+                audit["total_rows_processed"],
+                rows_out,
+                audit["suppressed_rows"],
+            )
+
         with timed_stage(audit, "write"):
             write_delta(df_clean, mapping.target_uri, _fresh_opts(mapping.target_uri))
 
         audit["pipeline_end_ts"] = datetime.now(timezone.utc).isoformat()
         audit["status"] = "success"
-        logger.info("Table '%s' stage timings: %s", mapping.table_name or mapping.source_uri, audit["stage_seconds"])
+        logger.info(
+            "Table '%s' OK — %d→%d rows, %d suppressed. Timings: %s",
+            mapping.table_name or mapping.source_uri,
+            audit["total_rows_processed"],
+            rows_out,
+            audit["suppressed_rows"],
+            audit["stage_seconds"],
+        )
         return audit
     except Exception as exc:
         audit["pipeline_end_ts"] = datetime.now(timezone.utc).isoformat()
@@ -401,8 +597,14 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
 
 
 def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
-    config = config or PipelineConfig.from_env()
-    db = connect_audit_db(config.database_url)
+    if config is None:
+        # Connect to DB first so runtime config and column exclusions can be
+        # loaded before the full PipelineConfig is built.  DATABASE_URL must
+        # come from the environment — it bootstraps the DB connection itself.
+        db = connect_audit_db(os.environ.get("DATABASE_URL"))
+        config = PipelineConfig.from_env_and_db(db)
+    else:
+        db = connect_audit_db(config.database_url)
     mappings = resolve_table_mappings(config)
     if config.max_table_workers <= 1 or len(mappings) <= 1:
         return [run_table(config, mapping, db) for mapping in mappings]

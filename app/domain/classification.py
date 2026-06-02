@@ -356,7 +356,10 @@ class ColumnClassifier:
     @staticmethod
     def _is_identifier_column(tokens: list[str], values: list[object]) -> bool:
         token_set = set(tokens)
-        id_token = bool(token_set & {"id", "ids", "uuid", "guid", "identifier", "key"})
+        id_token = bool(token_set & _ID_NAME_TOKENS)
+        # Composite names like "employeeid" / "customerid" where the suffix "id"
+        # is merged without a separator — require length > 2 so the bare token
+        # "id" (already in _ID_NAME_TOKENS above) is not double-counted.
         id_suffix = any(t.endswith("id") and len(t) > 2 for t in tokens)
         return id_token or id_suffix or _looks_like_identifier_values(values)
 
@@ -400,6 +403,27 @@ def detect_identifier_columns(df: pd.DataFrame, explicit_cols: list[str] | None 
     if explicit_cols:
         return [c for c in explicit_cols if c in df.columns]
     return columns_by_category(df, IDENTIFIER)
+
+
+def has_tracking_columns(df: pd.DataFrame, gps_cols: list[str] | None = None) -> bool:
+    """Return True when the DataFrame looks like a tracking table.
+
+    K-anonymity is only meaningful for tables that contain location or network
+    tracking data — GPS coordinates, IP addresses, or movement records.
+    Applying it to regular business tables (HR, finance, absence records)
+    suppresses legitimate data without a privacy benefit.
+
+    A table is considered a tracking table when:
+    * GPS columns were detected (caller passes ``gps_cols`` if already known), OR
+    * Any column name contains the standalone token ``"ip"`` — covers
+      ``ip_address``, ``source_ip``, ``client_ip``, ``remote_ip``, etc.
+    """
+    if gps_cols:
+        return True
+    for col in df.columns:
+        if "ip" in set(_tokens(str(col))):
+            return True
+    return False
 
 
 def detect_gps_columns(df: pd.DataFrame) -> list[str]:
@@ -494,6 +518,19 @@ def _make_policy(column: str, entity_type: str, *, source: str, score: float) ->
         score=score,
     )
 
+
+# Tokens that unambiguously mark a column as an identifier regardless of its
+# values.  Used by both `ColumnClassifier._is_identifier_column` (the simple
+# classify_columns path) and `_tier_a1_name_pattern` (the PII-column classifier
+# path) so both paths apply exactly the same name-based rule.
+#
+# The set deliberately excludes ambiguous words ("number", "code", "ref") that
+# can appear in non-identifier columns.  Only tokens where the name alone is
+# sufficient evidence that the column holds a join key or primary key are
+# included here.
+_ID_NAME_TOKENS: frozenset[str] = frozenset({
+    "id", "ids", "uuid", "guid", "identifier", "identifiers", "key", "pk", "fk",
+})
 
 _COLUMN_NAME_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
@@ -629,6 +666,50 @@ def _tier_a_purview(
         policies[column] = _make_policy(column, entity, source="purview", score=1.0)
 
 
+def _tier_a1_name_pattern(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
+    """Pin identifier-named columns to ACTION_HASH before value-sampling tiers run.
+
+    Presidio-structured (Tier B1) and spaCy embedding (Tier B2) both look at
+    *values* or *vector similarity*, so a column named ``employee_id`` whose
+    values happen to contain alphanumeric codes can be misclassified as PERSON
+    or another PII entity — leading to tokenisation instead of deterministic
+    hashing and breaking downstream join keys.
+
+    This tier runs AFTER Purview (Tier A, which is authoritative and keeps any
+    Purview-supplied classification) but BEFORE B1/B2, so the name signal takes
+    priority over value-content signals for identifier-named columns.
+
+    Two naming patterns are recognised:
+
+    * **Standalone token** — the column name tokenises to one of ``_ID_NAME_TOKENS``
+      (e.g. ``id``, ``uuid``, ``guid``, ``key``).
+    * **Compound suffix** — the column name ends with an ``_ID_NAME_TOKENS`` token
+      after splitting on non-alphanumeric separators, e.g. ``employee_id``,
+      ``customer_id``, ``employeeid``, ``customerUUID``.
+
+    Only text-typed columns are evaluated; numeric/boolean identifier columns
+    are left to the existing binning layer.
+    """
+    for column in df.columns:
+        if column in policies:
+            continue
+        if not _is_text_column(df[column].dtype):
+            continue
+        tokens = _tokens(str(column))
+        if not tokens:
+            continue
+        token_set = set(tokens)
+        is_id_name = (
+            bool(token_set & _ID_NAME_TOKENS)
+            # Unseparated composites: "employeeid", "customerid"
+            or any(t.endswith("id") and len(t) > 2 for t in tokens)
+        )
+        if is_id_name:
+            policies[column] = _make_policy(
+                column, "IDENTIFIER", source="name_pattern", score=1.0,
+            )
+
+
 def _tier_b1_presidio_structured(
     df: pd.DataFrame,
     analyzer: Any | None,
@@ -716,19 +797,31 @@ def classify_pii_columns(
     similarity_threshold: float | None = None,
     structured_enabled: bool | None = None,
 ) -> dict[str, ColumnPolicy]:
-    """Walk three tiers (Purview → Presidio-structured → spaCy similarity)
-    and return one `ColumnPolicy` per text column.
+    """Walk four tiers and return one `ColumnPolicy` per text column.
+
+    Tier order
+    ----------
+    A.   Purview classifications (authoritative — supplied externally).
+    A1.  Name-pattern pre-classification: columns whose name contains a
+         recognised identifier token (``id``, ``uuid``, ``guid``, ``key``, or
+         a compound suffix like ``employee_id`` / ``customer_id``) are pinned
+         to ``ACTION_HASH`` *before* value-sampling tiers run.  This prevents
+         Presidio-structured and spaCy from misclassifying identifier columns
+         as ``PERSON`` / ``EMAIL_ADDRESS`` etc. based on their *values*.
+    B1.  Presidio-structured value sampling.
+    B2.  spaCy embedding similarity vs ``CONCEPT_SEEDS``.
+    C.   Free-text fallback.
 
     Parameters
     ----------
     df : the source DataFrame.
     purview_classifications : optional ``{column_name: purview_type_name}``
         mapping fetched out-of-band from Microsoft Purview.  Tier A entries
-        bypass downstream tiers (authoritative).
-    analyzer : a Presidio `AnalyzerEngine` (or compatible shim) used by
+        bypass all downstream tiers (authoritative).
+    analyzer : a Presidio ``AnalyzerEngine`` (or compatible shim) used by
         Tier B1 to sample column values.  When None, Tier B1 is skipped.
     similarity_models : pre-loaded ``{lang_code: spacy.nlp}`` dict used by
-        Tier B2.  When None, the function loads the SPACY_MODELS set
+        Tier B2.  When None the function loads the SPACY_MODELS set
         configured in ``app.anonymization``; pass an explicit dict in tests
         to avoid the heavy model load.
     similarity_threshold : cosine cut-off above which a B2 match commits.
@@ -739,12 +832,12 @@ def classify_pii_columns(
     Returns
     -------
     dict[str, ColumnPolicy] keyed by column name.  Non-text columns and
-    columns no tier could place are absent from the result; the caller's
-    pipeline continues to treat them with existing layers (GPS, bin, etc.).
+    columns no tier could place are absent from the result.
     """
     policies: dict[str, ColumnPolicy] = {}
 
     _tier_a_purview(df, purview_classifications, policies)
+    _tier_a1_name_pattern(df, policies)  # pin id-named columns before value-sampling
 
     if structured_enabled is None:
         structured_enabled = _presidio_structured_enabled()

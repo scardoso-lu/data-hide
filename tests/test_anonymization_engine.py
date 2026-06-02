@@ -1,11 +1,11 @@
-import sys
+﻿import sys
 import types
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
-from app.classification import (
+from app.domain.classification import (
     ACTION_BIN,
     ACTION_HASH,
     ACTION_SCAN,
@@ -16,7 +16,7 @@ from app.classification import (
     _looks_like_free_text,
     _tier_c_fallback,
 )
-from app.anonymization import (
+from app.domain.anonymization import (
     EntityRegistry,
     SPACY_LABELS_TO_IGNORE,
     SPACY_TO_PRESIDIO_ENTITY_MAPPING,
@@ -61,7 +61,7 @@ class TestResolveOverlappingFindings:
 
     def test_adjacent_findings_are_not_overlapping(self):
         # Touching at the boundary (end == next.start) must not be treated
-        # as overlap — both spans contribute distinct tokens.
+        # as overlap â€” both spans contribute distinct tokens.
         findings = [_f("PERSON", 0, 10, 0.9), _f("EMAIL_ADDRESS", 10, 25, 1.0)]
         kept = _resolve_overlapping_findings(findings)
         assert len(kept) == 2
@@ -312,20 +312,20 @@ class TestAnonymizeDataframeScanColumns:
 class TestLooksLikeFreeText:
     """Boundary conditions for the _looks_like_free_text heuristic."""
 
-    # ── avg_len >= 32 ────────────────────────────────────────────────────────
+    # â”€â”€ avg_len >= 32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_avg_len_at_threshold_is_free_text(self):
         assert _looks_like_free_text(["x" * 32]) is True
 
     def test_avg_len_below_threshold_alone_is_not(self):
-        # 31 chars, 1 word, not JSON → all three checks miss
+        # 31 chars, 1 word, not JSON â†’ all three checks miss
         assert _looks_like_free_text(["x" * 31]) is False
 
     def test_avg_len_across_multiple_values(self):
-        # average is (40 + 24) / 2 = 32 → True
+        # average is (40 + 24) / 2 = 32 â†’ True
         assert _looks_like_free_text(["x" * 40, "y" * 24]) is True
 
-    # ── avg_words >= 5 ───────────────────────────────────────────────────────
+    # â”€â”€ avg_words >= 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_exactly_five_words_is_free_text(self):
         assert _looks_like_free_text(["one two three four five"]) is True
@@ -334,10 +334,10 @@ class TestLooksLikeFreeText:
         assert _looks_like_free_text(["one two three four"]) is False
 
     def test_avg_words_across_multiple_values(self):
-        # (6 + 4) / 2 = 5.0 → True
+        # (6 + 4) / 2 = 5.0 â†’ True
         assert _looks_like_free_text(["a b c d e f", "w x y z"]) is True
 
-    # ── jsonish >= 0.5 ───────────────────────────────────────────────────────
+    # â”€â”€ jsonish >= 0.5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_half_json_values_is_free_text(self):
         assert _looks_like_free_text(['{"a": 1}', "plain"]) is True
@@ -346,10 +346,10 @@ class TestLooksLikeFreeText:
         assert _looks_like_free_text(['["x", "y"]', "plain"]) is True
 
     def test_less_than_half_json_is_not(self):
-        # 1 out of 3 → 0.33 < 0.5
+        # 1 out of 3 â†’ 0.33 < 0.5
         assert _looks_like_free_text(['{"a": 1}', "plain", "also plain"]) is False
 
-    # ── edge cases ───────────────────────────────────────────────────────────
+    # â”€â”€ edge cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_empty_list_returns_false(self):
         assert _looks_like_free_text([]) is False
@@ -361,7 +361,7 @@ class TestLooksLikeFreeText:
         assert _looks_like_free_text(["", "   ", None]) is False
 
     def test_non_string_values_are_filtered_out(self):
-        # only the one real string; it's short and one word → False
+        # only the one real string; it's short and one word â†’ False
         assert _looks_like_free_text([None, 42, "short"]) is False
 
 
@@ -379,7 +379,7 @@ class TestTierCFallback:
             similarity_models={},   # skip Tier B2
         )
 
-    # ── ACTION_SCAN paths ────────────────────────────────────────────────────
+    # â”€â”€ ACTION_SCAN paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_long_text_column_gets_action_scan(self):
         long_values = [
@@ -410,7 +410,7 @@ class TestTierCFallback:
         assert "payload" in policies
         assert policies["payload"].action == ACTION_SCAN
 
-    # ── ACTION_BIN paths ─────────────────────────────────────────────────────
+    # â”€â”€ ACTION_BIN paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_short_structured_column_gets_action_bin(self):
         df = pd.DataFrame({"status": ["Active", "Inactive", "Pending"]})
@@ -427,7 +427,7 @@ class TestTierCFallback:
         assert "type" in policies
         assert policies["type"].action == ACTION_BIN
 
-    # ── Metadata ─────────────────────────────────────────────────────────────
+    # â”€â”€ Metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_fallback_policy_source_is_fallback(self):
         df = pd.DataFrame({"notes": ["short"]})
@@ -441,7 +441,7 @@ class TestTierCFallback:
 
         assert policies["notes"].entity_type == FREE_TEXT
 
-    # ── Non-text columns skipped ─────────────────────────────────────────────
+    # â”€â”€ Non-text columns skipped â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_numeric_column_not_added_to_policies(self):
         df = pd.DataFrame({"age": [25, 30, 35]})
@@ -449,7 +449,7 @@ class TestTierCFallback:
 
         assert "age" not in policies
 
-    # ── Pre-classified columns not overwritten ───────────────────────────────
+    # â”€â”€ Pre-classified columns not overwritten â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_already_classified_column_not_overwritten(self):
         df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
@@ -464,7 +464,7 @@ class TestTierCFallback:
 
 
 class TestScanColumnsIntegration:
-    """End-to-end: classify → free_text_columns_from_policies → anonymize_dataframe.
+    """End-to-end: classify â†’ free_text_columns_from_policies â†’ anonymize_dataframe.
 
     Verifies that only free-text columns are passed to the row-by-row scanner
     and that structured columns are left untouched.
@@ -485,7 +485,7 @@ class TestScanColumnsIntegration:
         ]
         df = pd.DataFrame({
             "notes": free_text,
-            "status": ["Open", "Closed"],          # short structured → ACTION_BIN
+            "status": ["Open", "Closed"],          # short structured â†’ ACTION_BIN
         })
 
         analyzer = self._PersonInNotes()
@@ -501,7 +501,7 @@ class TestScanColumnsIntegration:
         for val in result["notes"]:
             assert "Alice" not in val
 
-        # status column: unchanged — not scanned
+        # status column: unchanged â€” not scanned
         assert list(result["status"]) == ["Open", "Closed"]
         assert "status" not in stats["text_columns_scanned"]
 
@@ -519,9 +519,9 @@ class TestDetectColumnLanguage:
 
     def test_french_column_returns_fr(self):
         series = pd.Series([
-            "Le client a passé une commande hier.",
+            "Le client a passÃ© une commande hier.",
             "Veuillez contacter le support pour obtenir de l'aide.",
-            "Votre facture a été traitée avec succès.",
+            "Votre facture a Ã©tÃ© traitÃ©e avec succÃ¨s.",
         ])
         assert _detect_column_language(series) == "fr"
 
@@ -544,20 +544,20 @@ class TestDetectColumnLanguage:
             "English sentence two.",
             "English sentence three.",
             "English sentence four.",
-            "Le client a passé une commande.",   # one French value out of 5
+            "Le client a passÃ© une commande.",   # one French value out of 5
         ])
-        # 4/5 = 80 % English → threshold met → "en"
+        # 4/5 = 80 % English â†’ threshold met â†’ "en"
         assert _detect_column_language(series) == "en"
 
     def test_mixed_language_column_returns_none(self):
         # Luxembourg-style comment column: en / fr / de / lb all present
         series = pd.Series([
             "The customer placed an order yesterday.",
-            "Le client a passé une commande hier.",
+            "Le client a passÃ© une commande hier.",
             "Der Kunde hat gestern eine Bestellung aufgegeben.",
-            "Den Client huet gëschter eng Bestellung gemaach.",
+            "Den Client huet gÃ«schter eng Bestellung gemaach.",
         ])
-        # No single language reaches 80 % → None (per-value fallback)
+        # No single language reaches 80 % â†’ None (per-value fallback)
         result = _detect_column_language(series)
         assert result is None
 
@@ -568,7 +568,7 @@ class TestDetectColumnLanguage:
         original = _detect_language.__wrapped__  # unwrap lru_cache
         series = pd.Series([f"English text row {i}" for i in range(100)])
 
-        import app.anonymization as anon_mod
+        import app.domain.anonymization as anon_mod
         original_fn = anon_mod._detect_language
 
         def counting_detect(text):
@@ -576,7 +576,7 @@ class TestDetectColumnLanguage:
             return original_fn(text)
 
         import unittest.mock as mock
-        with mock.patch("app.anonymization._detect_language", side_effect=counting_detect):
+        with mock.patch("app.domain.anonymization._detect_language", side_effect=counting_detect):
             _detect_column_language(series, n_samples=5)
 
         assert len(calls) <= 5
@@ -593,7 +593,7 @@ class TestAnalyzeLanguageFastPath:
                 received.append(language)
                 return []
 
-        # language=None → _detect_language resolves it per value
+        # language=None â†’ _detect_language resolves it per value
         _analyze("hello world", FakeAnalyzer(), language=None)
         assert received[0] in ("en", "fr", "de", "lb")
 
@@ -636,12 +636,12 @@ class TestAnalyzeLanguageFastPath:
                 received_languages.append(language)
                 return []
 
-        # Four rows, each in a different language → column returns None → per-value
+        # Four rows, each in a different language â†’ column returns None â†’ per-value
         df = pd.DataFrame({"comments": [
             "The customer placed an order yesterday.",
-            "Le client a passé une commande hier.",
+            "Le client a passÃ© une commande hier.",
             "Der Kunde hat gestern eine Bestellung aufgegeben.",
-            "Den Client huet gëschter eng Bestellung gemaach.",
+            "Den Client huet gÃ«schter eng Bestellung gemaach.",
         ]})
         anonymize_dataframe(df, TrackingAnalyzer(), scan_columns=["comments"])
 

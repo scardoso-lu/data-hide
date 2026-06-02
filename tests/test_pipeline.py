@@ -1,4 +1,4 @@
-"""
+﻿"""
 Integration-style tests for the main() pipeline orchestration.
 
 All external I/O is mocked:
@@ -18,9 +18,9 @@ the full chain end-to-end.
 import pandas as pd
 import pytest
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Shared test data
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SOURCE_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables/raw"
 TARGET_URI = "abfss://ws@onelake.dfs.fabric.microsoft.com/Tgt.Lakehouse/Tables/clean"
@@ -56,9 +56,9 @@ MOCK_STATS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @pytest.fixture()
 def env(monkeypatch, mocker):
@@ -109,7 +109,7 @@ def mock_engines(mocker):
 
 @pytest.fixture()
 def mock_validate(mocker):
-    """Residual PII validation — always clean in orchestration unit tests."""
+    """Residual PII validation â€” always clean in orchestration unit tests."""
     return mocker.patch("main.validate_residual_pii", return_value=0)
 
 
@@ -120,15 +120,15 @@ def mock_classify(mocker):
 
 @pytest.fixture()
 def mock_hash(mocker):
-    """Mock pseudonymize_identifier_columns — identity transform, no columns pseudonymized."""
+    """Mock pseudonymize_identifier_columns â€” identity transform, no columns pseudonymized."""
     m = mocker.patch("main.pseudonymize_identifier_columns")
     m.side_effect = lambda df, cols, pseudonymizer: (df.copy(), [])
     return m
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Happy path
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPipelineSuccess:
 
@@ -247,9 +247,9 @@ class TestPipelineSuccess:
         mock_classify.assert_called_once()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Failure path
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPipelineFailure:
 
@@ -396,9 +396,9 @@ class TestPipelineFailure:
         mock_write.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Optional features disabled
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestOptionalFeatures:
 
@@ -406,7 +406,7 @@ class TestOptionalFeatures:
         self, env, mock_delta, mock_auth, mock_anonymize, mocker,
         mock_engines, mock_validate, mock_classify, mock_hash,
     ):
-        """No DATABASE_URL → connect_audit_db returns None → pipeline continues."""
+        """No DATABASE_URL â†’ connect_audit_db returns None â†’ pipeline continues."""
         mocker.patch("main.connect_audit_db", return_value=None)
         from main import main
         main()  # must not raise
@@ -440,7 +440,7 @@ class TestOptionalFeatures:
         }
         from main import main
         main()
-        # PURVIEW_ACCOUNT_NAME not set → run_purview_check is still called
+        # PURVIEW_ACCOUNT_NAME not set â†’ run_purview_check is still called
         # but with purview_account=None (the function handles the skip internally)
         mock_purview.assert_called_once()
         assert mock_purview.call_args.args[2] is None
@@ -458,9 +458,9 @@ class TestOptionalFeatures:
         mock_k.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # End-to-end with real Presidio (uses session-scoped engine fixture)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPipelineConfigValidation:
 
@@ -523,9 +523,9 @@ class TestEndToEndAnonymization:
             assert "EMAIL_ADDRESS_" in val, f"Expected EMAIL_ADDRESS token, got: {val!r}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Dynamic 1-to-1 table discovery via SOURCE_BASE_ABFSS_URI
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestDynamicDiscovery:
 
@@ -601,7 +601,7 @@ class TestDynamicDiscovery:
             main()
 
     def test_parallel_tables_use_process_workers(self, base_env, monkeypatch):
-        import app.service as service
+        import app.application.pipeline as service
         from main import TableMapping
 
         mappings = self._two_mappings()
@@ -650,7 +650,7 @@ class TestDynamicDiscovery:
         assert result == [{"table": "customers"}, {"table": "orders"}]
 
     def test_table_worker_opens_its_own_audit_connection(self, monkeypatch):
-        import app.service as service
+        import app.application.pipeline as service
         from main import TableMapping
 
         config = service.PipelineConfig(
@@ -677,9 +677,9 @@ class TestDynamicDiscovery:
         assert calls == [(config, mapping, db)]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# discover_table_mappings — _delta_log filtering (unit-level, mocks ADLS)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# discover_table_mappings â€” _delta_log filtering (unit-level, mocks ADLS)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestDiscoverTableMappingsFiltering:
     """Verify that only directories containing _delta_log are returned."""
@@ -706,13 +706,13 @@ class TestDiscoverTableMappingsFiltering:
         return fs_client
 
     def test_delta_tables_included(self, mocker):
-        from app.repository import discover_table_mappings, DataLakeServiceClient as _orig
+        from app.infrastructure.repository import discover_table_mappings, DataLakeServiceClient as _orig
         items = [self._make_path_item(mocker, "Tables/customers", True)]
         fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
@@ -722,13 +722,13 @@ class TestDiscoverTableMappingsFiltering:
         assert result[0].table_name == "customers"
 
     def test_files_target_base_rejected(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         items = [self._make_path_item(mocker, "Tables/customers", True)]
         fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         with pytest.raises(ValueError, match="Lakehouse Files"):
             discover_table_mappings(
@@ -737,8 +737,9 @@ class TestDiscoverTableMappingsFiltering:
             )
 
     def test_onelake_https_base_uri_is_supported(self, mocker):
-        from app.repository import discover_table_mappings
-        mocker.patch("app.repository._fabric_item_display_name", return_value=None)
+        from app.infrastructure.repository import discover_table_mappings
+        mocker.patch("app.infrastructure.repository._fabric_workspace_guid_for_name", return_value=None)
+        mocker.patch("app.infrastructure.repository._fabric_item_display_name", return_value=None)
         items = [self._make_path_item(mocker, "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers", True)]
         fs_client = self._make_fs_client(
             mocker,
@@ -747,8 +748,8 @@ class TestDiscoverTableMappingsFiltering:
         )
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "https://onelake.dfs.fabric.microsoft.com/ffb5e061-3824-486b-ab7c-aaef61221403/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
@@ -766,7 +767,7 @@ class TestDiscoverTableMappingsFiltering:
         )
 
     def test_onelake_item_id_path_resolves_to_lakehouse_name(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         items = [self._make_path_item(mocker, "SourceLakehouse.Lakehouse/Tables/customers", True)]
         fs_client = self._make_fs_client(
             mocker,
@@ -775,9 +776,13 @@ class TestDiscoverTableMappingsFiltering:
         )
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
-        mocker.patch("app.repository._fabric_item_display_name", return_value="SourceLakehouse")
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch(
+            "app.infrastructure.repository._fabric_workspace_guid_for_name",
+            return_value="ffb5e061-3824-486b-ab7c-aaef61221403",
+        )
+        mocker.patch("app.infrastructure.repository._fabric_item_display_name", return_value="SourceLakehouse")
 
         result = discover_table_mappings(
             "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
@@ -795,7 +800,7 @@ class TestDiscoverTableMappingsFiltering:
         )
 
     def test_guid_workspace_keeps_guid_lakehouse_path(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         items = [self._make_path_item(mocker, "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables/customers", True)]
         fs_client = self._make_fs_client(
             mocker,
@@ -804,15 +809,17 @@ class TestDiscoverTableMappingsFiltering:
         )
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
-        resolver = mocker.patch("app.repository._fabric_item_display_name", return_value="SourceLakehouse")
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
+        ws_resolver = mocker.patch("app.infrastructure.repository._fabric_workspace_guid_for_name", return_value="some-guid")
+        resolver = mocker.patch("app.infrastructure.repository._fabric_item_display_name", return_value="SourceLakehouse")
 
         result = discover_table_mappings(
             "abfss://ffb5e061-3824-486b-ab7c-aaef61221403@onelake.dfs.fabric.microsoft.com/f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
             "abfss://VIBECODING@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Tables",
         )
 
+        ws_resolver.assert_not_called()
         resolver.assert_not_called()
         fs_client.get_paths.assert_any_call(
             path="f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
@@ -820,8 +827,76 @@ class TestDiscoverTableMappingsFiltering:
         )
         assert len(result) == 1
 
+    def test_friendly_workspace_guid_lakehouse_api_success_resolves_name(self, mocker):
+        """Happy path: friendly workspace + GUID lakehouse, Fabric API resolves the name."""
+        from app.infrastructure.repository import discover_table_mappings
+        lakehouse_guid = "f96c5a4c-7777-4fda-aeb9-eb239ed1731c"
+        workspace_guid = "ffb5e061-3824-486b-ab7c-aaef61221403"
+        items = [self._make_path_item(mocker, "SourceLakehouse.Lakehouse/Tables/customers", True)]
+        fs_client = self._make_fs_client(
+            mocker,
+            items,
+            {"SourceLakehouse.Lakehouse/Tables/customers/_delta_log"},
+        )
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch(
+            "app.infrastructure.repository._fabric_workspace_guid_for_name",
+            return_value=workspace_guid,
+        )
+        mocker.patch(
+            "app.infrastructure.repository._fabric_item_display_name",
+            return_value="SourceLakehouse",
+        )
+
+        result = discover_table_mappings(
+            f"abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/{lakehouse_guid}/Tables",
+            "abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Tables",
+        )
+
+        fs_client.get_paths.assert_called_once_with(
+            path="SourceLakehouse.Lakehouse/Tables",
+            recursive=False,
+        )
+        assert len(result) == 1
+        assert "SourceLakehouse.Lakehouse" in result[0].source_uri
+
+    def test_friendly_workspace_guid_lakehouse_api_failure_falls_back_to_root(self, mocker):
+        """Regression: when Fabric API is inaccessible (SP has only storage RBAC),
+        fall back to workspace-root scan instead of failing with FriendlyNameSupportDisabled."""
+        from app.infrastructure.repository import discover_table_mappings
+        lakehouse_guid = "f96c5a4c-7777-4fda-aeb9-eb239ed1731c"
+        # The workspace root listing returns lakehouses by friendly name.
+        items = [self._make_path_item(mocker, "SourceLakehouse.Lakehouse/Tables/customers", True)]
+        fs_client = self._make_fs_client(
+            mocker,
+            items,
+            {"SourceLakehouse.Lakehouse/Tables/customers/_delta_log"},
+        )
+        svc = mocker.MagicMock()
+        svc.get_file_system_client.return_value = fs_client
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
+        # Both Fabric API passes fail.
+        mocker.patch(
+            "app.infrastructure.repository._fabric_item_display_name",
+            side_effect=Exception("403 Forbidden"),
+        )
+        mocker.patch("app.infrastructure.repository._fabric_workspace_guid_for_name", return_value=None)
+
+        result = discover_table_mappings(
+            f"abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/{lakehouse_guid}/Tables",
+            "abfss://MyWorkspace@onelake.dfs.fabric.microsoft.com/DATALAKE.Lakehouse/Tables",
+        )
+
+        # Must have scanned workspace root (path=""), not the GUID path.
+        fs_client.get_paths.assert_called_once_with(path="", recursive=False)
+        assert len(result) == 1
+
     def test_recursive_delta_log_discovery_when_immediate_listing_has_no_tables(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         delta_log = self._make_path_item(mocker, "Lakehouse.Lakehouse/Tables/customers/_delta_log", True)
         fs_client = self._make_fs_client(mocker, [], set())
         fs_client.get_paths.side_effect = [
@@ -830,8 +905,8 @@ class TestDiscoverTableMappingsFiltering:
         ]
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Lakehouse.Lakehouse/Tables",
@@ -843,7 +918,7 @@ class TestDiscoverTableMappingsFiltering:
         assert result[0].table_name == "customers"
 
     def test_recursive_delta_log_discovery_when_immediate_listing_is_large(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
 
         items = [self._make_path_item(mocker, f"Tables/folder_{idx}", True) for idx in range(25)]
         delta_log = self._make_path_item(mocker, "Tables/customers/_delta_log", True)
@@ -854,8 +929,8 @@ class TestDiscoverTableMappingsFiltering:
         ]
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse/Tables",
@@ -868,7 +943,7 @@ class TestDiscoverTableMappingsFiltering:
         assert result[0].table_name == "customers"
 
     def test_non_delta_directories_excluded(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         items = [
             self._make_path_item(mocker, "Tables/customers", True),
             self._make_path_item(mocker, "Tables/_schemas", True),   # schema folder
@@ -877,8 +952,8 @@ class TestDiscoverTableMappingsFiltering:
         fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
@@ -888,7 +963,7 @@ class TestDiscoverTableMappingsFiltering:
         assert result[0].table_name == "customers"
 
     def test_files_excluded(self, mocker):
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         items = [
             self._make_path_item(mocker, "Tables/customers", True),
             self._make_path_item(mocker, "Tables/readme.md", False),  # file, not dir
@@ -896,8 +971,8 @@ class TestDiscoverTableMappingsFiltering:
         fs_client = self._make_fs_client(mocker, items, {"Tables/customers/_delta_log"})
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
         result = discover_table_mappings(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/Src.Lakehouse",
@@ -912,17 +987,17 @@ class TestDiscoverTableMappingsFiltering:
         fs_client = self._make_fs_client(mocker, items, delta_log_dirs)
         svc = mocker.MagicMock()
         svc.get_file_system_client.return_value = fs_client
-        mocker.patch("app.repository.DataLakeServiceClient", return_value=svc)
-        mocker.patch("app.repository._credential_instance", return_value=mocker.MagicMock())
+        mocker.patch("app.infrastructure.repository.DataLakeServiceClient", return_value=svc)
+        mocker.patch("app.infrastructure.repository._credential_instance", return_value=mocker.MagicMock())
 
     def test_sql_shortcuts_included(self, mocker):
         """SQL tables not present in ADLS get read_mode='sql' mappings; schema
         is preserved in both source and target paths so a schema-enabled
         Fabric lakehouse registers the destination table."""
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         self._adls_setup(mocker, ["customers"])
         mocker.patch(
-            "app.repository._discover_sql_table_names",
+            "app.infrastructure.repository._discover_sql_table_names",
             return_value=[("dbo", "customers"), ("dbo", "customer_view")],
         )
 
@@ -944,11 +1019,11 @@ class TestDiscoverTableMappingsFiltering:
 
     def test_delta_table_not_duplicated_by_sql(self, mocker):
         """A schema-less Delta source (Tables/<name>) is the same physical
-        table as the SQL spec (dbo.<name>) — dedup keeps the Delta side."""
-        from app.repository import discover_table_mappings
+        table as the SQL spec (dbo.<name>) â€” dedup keeps the Delta side."""
+        from app.infrastructure.repository import discover_table_mappings
         self._adls_setup(mocker, ["customers", "orders"])
         mocker.patch(
-            "app.repository._discover_sql_table_names",
+            "app.infrastructure.repository._discover_sql_table_names",
             return_value=[("dbo", "customers"), ("dbo", "orders")],
         )
 
@@ -964,10 +1039,10 @@ class TestDiscoverTableMappingsFiltering:
 
     def test_sql_discovery_failure_is_non_fatal(self, mocker):
         """A SQL endpoint error is logged and does not abort ADLS discovery."""
-        from app.repository import discover_table_mappings
+        from app.infrastructure.repository import discover_table_mappings
         self._adls_setup(mocker, ["customers"])
         mocker.patch(
-            "app.repository._discover_sql_table_names",
+            "app.infrastructure.repository._discover_sql_table_names",
             side_effect=Exception("connection refused"),
         )
 
@@ -982,9 +1057,9 @@ class TestDiscoverTableMappingsFiltering:
         assert result[0].table_name == "customers"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # SQL shortcut read routing
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestSQLShortcutRouting:
     """Verify that run_table reads SQL mappings via read_sql_table, not Delta read."""

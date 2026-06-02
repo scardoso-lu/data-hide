@@ -1,4 +1,4 @@
-"""
+﻿"""
 Unit tests for URI helpers, storage options, the optional Purview check,
 free-text column flagging, quasi-identifier detection, k-anonymity enforcement,
 and residual PII validation.
@@ -23,7 +23,14 @@ from main import (
     validate_residual_pii,
     write_delta,
 )
-from app.repository import AuditDB, _parse_abfss_uri, read_delta
+from app.infrastructure.repository import (
+    AuditDB,
+    _coerce_null_columns,
+    _fabric_workspace_guid_for_name,
+    _parse_abfss_uri,
+    _resolve_onelake_item_id_path,
+    read_delta,
+)
 
 
 class _FakePseudonymizer:
@@ -104,6 +111,132 @@ class TestStorageOpts:
         assert _storage_opts(uri_b, "tok")["account_name"] == "accountB"
 
 
+class TestFabricWorkspaceGuidForName:
+    """Tests for workspace friendly-name â†’ GUID resolution via the Fabric REST API."""
+
+    def _mock_requests_get(self, mocker, pages):
+        """Patch requests.get to return paginated workspace list responses."""
+        import app.infrastructure.repository as repo
+
+        responses = []
+        for i, workspaces in enumerate(pages):
+            body = {"value": workspaces}
+            if i < len(pages) - 1:
+                body["continuationUri"] = f"https://api.fabric.microsoft.com/v1/workspaces?cont={i+1}"
+            mock_resp = mocker.MagicMock()
+            mock_resp.json.return_value = body
+            responses.append(mock_resp)
+
+        mocker.patch("app.infrastructure.repository.requests.get", side_effect=responses)
+        mocker.patch("app.infrastructure.repository.acquire_cached_token", return_value="fake-token")
+        # Clear the cache before each test.
+        repo._fabric_workspace_id_cache.clear()
+
+    def test_returns_guid_for_known_workspace(self, mocker):
+        self._mock_requests_get(mocker, [[
+            {"displayName": "MyWorkspace", "id": "ffb5e061-3824-486b-ab7c-aaef61221403"},
+            {"displayName": "OtherWorkspace", "id": "aaaabbbb-cccc-dddd-eeee-ffffffffffff"},
+        ]])
+        assert _fabric_workspace_guid_for_name("MyWorkspace") == "ffb5e061-3824-486b-ab7c-aaef61221403"
+
+    def test_returns_none_for_unknown_workspace(self, mocker):
+        self._mock_requests_get(mocker, [[
+            {"displayName": "OtherWorkspace", "id": "aaaabbbb-cccc-dddd-eeee-ffffffffffff"},
+        ]])
+        assert _fabric_workspace_guid_for_name("MyWorkspace") is None
+
+    def test_consumes_all_pages(self, mocker):
+        self._mock_requests_get(mocker, [
+            [{"displayName": "Page1WS", "id": "11111111-1111-1111-1111-111111111111"}],
+            [{"displayName": "MyWorkspace", "id": "ffb5e061-3824-486b-ab7c-aaef61221403"}],
+        ])
+        assert _fabric_workspace_guid_for_name("MyWorkspace") == "ffb5e061-3824-486b-ab7c-aaef61221403"
+
+    def test_result_is_cached(self, mocker):
+        import app.infrastructure.repository as repo
+        self._mock_requests_get(mocker, [[
+            {"displayName": "MyWorkspace", "id": "ffb5e061-3824-486b-ab7c-aaef61221403"},
+        ]])
+        _fabric_workspace_guid_for_name("MyWorkspace")
+        _fabric_workspace_guid_for_name("MyWorkspace")
+        # requests.get should have been called only once (first call); second uses cache.
+        assert repo.requests.get.call_count == 1
+
+
+class TestResolveOnelakeItemIdPath:
+    """Tests for the two-step workspace-name â†’ GUID â†’ lakehouse-name resolution."""
+
+    def test_non_onelake_host_unchanged(self):
+        path = "container/Tables"
+        assert _resolve_onelake_item_id_path("ws", "storage.dfs.core.windows.net", path) == path
+
+    def test_already_friendly_lakehouse_unchanged(self):
+        path = "MyLakehouse.Lakehouse/Tables"
+        assert _resolve_onelake_item_id_path("MyWorkspace", "onelake.dfs.fabric.microsoft.com", path) == path
+
+    def test_guid_workspace_guid_lakehouse_unchanged(self):
+        path = "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables"
+        result = _resolve_onelake_item_id_path(
+            "ffb5e061-3824-486b-ab7c-aaef61221403",
+            "onelake.dfs.fabric.microsoft.com",
+            path,
+        )
+        assert result == path
+
+    def test_friendly_workspace_guid_lakehouse_resolved(self, mocker):
+        """The root cause of FriendlyNameSupportDisabled: workspace is a name but
+        lakehouse is a GUID. Resolution must use the workspace GUID for the API call."""
+        import app.infrastructure.repository as repo
+        repo._fabric_workspace_id_cache.clear()
+        repo._fabric_item_name_cache.clear()
+        mocker.patch(
+            "app.infrastructure.repository._fabric_workspace_guid_for_name",
+            return_value="ffb5e061-3824-486b-ab7c-aaef61221403",
+        )
+        mocker.patch(
+            "app.infrastructure.repository._fabric_item_display_name",
+            return_value="SourceLakehouse",
+        )
+        result = _resolve_onelake_item_id_path(
+            "MyWorkspace",
+            "onelake.dfs.fabric.microsoft.com",
+            "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+        )
+        assert result == "SourceLakehouse.Lakehouse/Tables"
+
+    def test_workspace_resolution_failure_returns_none(self, mocker):
+        """If both resolution passes fail, return None so discover_table_mappings
+        can fall back to workspace-root scanning without any Fabric API access."""
+        mocker.patch(
+            "app.infrastructure.repository._fabric_item_display_name",
+            side_effect=Exception("403 Forbidden"),
+        )
+        mocker.patch("app.infrastructure.repository._fabric_workspace_guid_for_name", return_value=None)
+        result = _resolve_onelake_item_id_path(
+            "MyWorkspace",
+            "onelake.dfs.fabric.microsoft.com",
+            "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+        )
+        assert result is None
+
+    def test_pass1_success_skips_workspace_resolution(self, mocker):
+        """If the items API accepts the workspace name directly, no workspace GUID lookup is needed."""
+        import app.infrastructure.repository as repo
+        repo._fabric_item_name_cache.clear()
+        mocker.patch(
+            "app.infrastructure.repository._fabric_item_display_name",
+            return_value="SourceLakehouse",
+        )
+        ws_resolver = mocker.patch("app.infrastructure.repository._fabric_workspace_guid_for_name")
+        result = _resolve_onelake_item_id_path(
+            "MyWorkspace",
+            "onelake.dfs.fabric.microsoft.com",
+            "f96c5a4c-7777-4fda-aeb9-eb239ed1731c/Tables",
+        )
+        assert result == "SourceLakehouse.Lakehouse/Tables"
+        ws_resolver.assert_not_called()
+
+
 class TestStorageUriParser:
 
     def test_parses_abfss_uri(self):
@@ -144,10 +277,10 @@ class TestReadDeltaLookback:
             })
 
     def test_delta_read_uses_duckdb_cutoff_before_dataframe_materialization(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         monkeypatch.setattr(repo, "DeltaTable", self._FakeDeltaTable)
-        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        mocker.patch("app.infrastructure.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
         df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
 
@@ -155,7 +288,7 @@ class TestReadDeltaLookback:
 
     def test_delta_read_filters_string_temporal_columns_by_name(self, monkeypatch, mocker):
         import pyarrow as pa
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         class FakeDeltaTable:
             def __init__(self, uri, storage_options=None):
@@ -168,7 +301,7 @@ class TestReadDeltaLookback:
                 })
 
         monkeypatch.setattr(repo, "DeltaTable", FakeDeltaTable)
-        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        mocker.patch("app.infrastructure.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
         df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
 
@@ -176,9 +309,9 @@ class TestReadDeltaLookback:
 
     def test_delta_read_falls_back_to_all_rows_when_filter_returns_empty(self, monkeypatch, mocker):
         """A small or old table where every row pre-dates the cutoff must not
-        be silently discarded — the pipeline should fall back to a full read."""
+        be silently discarded â€” the pipeline should fall back to a full read."""
         import pyarrow as pa
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         class FakeDeltaTable:
             def __init__(self, uri, storage_options=None):
@@ -187,7 +320,7 @@ class TestReadDeltaLookback:
             def to_pyarrow_dataset(self):
                 return pa.table({
                     "id": [1, 2],
-                    # both rows are from 2020 — far older than the 365-day cutoff
+                    # both rows are from 2020 â€” far older than the 365-day cutoff
                     "created_at": [
                         datetime(2020, 1, 1, tzinfo=timezone.utc),
                         datetime(2020, 6, 1, tzinfo=timezone.utc),
@@ -195,7 +328,7 @@ class TestReadDeltaLookback:
                 })
 
         monkeypatch.setattr(repo, "DeltaTable", FakeDeltaTable)
-        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        mocker.patch("app.infrastructure.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
         df = read_delta("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t", {})
 
@@ -245,8 +378,8 @@ class TestReadSqlTableLookback:
         return FakeConn(cursor)
 
     def test_sql_read_falls_back_when_filter_returns_empty(self, monkeypatch, mocker):
-        from app.repository import read_sql_table, _sql_temporal_columns
-        import app.repository as repo
+        from app.infrastructure.repository import read_sql_table, _sql_temporal_columns
+        import app.infrastructure.repository as repo
 
         columns = ["id", "event_date"]
         # Filtered result is empty; full table has two rows
@@ -256,7 +389,7 @@ class TestReadSqlTableLookback:
             columns=columns,
         )
 
-        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        mocker.patch("app.infrastructure.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
         monkeypatch.setattr(repo, "_sql_connection", lambda *a, **kw: self._make_conn(cur))
         monkeypatch.setattr(repo, "_sql_temporal_columns", lambda *a, **kw: ["event_date"])
 
@@ -267,8 +400,8 @@ class TestReadSqlTableLookback:
         assert cur._calls == 2   # filtered query + fallback query
 
     def test_sql_read_does_not_fall_back_when_filter_has_rows(self, monkeypatch, mocker):
-        from app.repository import read_sql_table
-        import app.repository as repo
+        from app.infrastructure.repository import read_sql_table
+        import app.infrastructure.repository as repo
 
         columns = ["id", "event_date"]
         cur = self._make_cursor(
@@ -277,7 +410,7 @@ class TestReadSqlTableLookback:
             columns=columns,
         )
 
-        mocker.patch("app.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        mocker.patch("app.infrastructure.repository.read_cutoff_ts", return_value=datetime(2024, 1, 1, tzinfo=timezone.utc))
         monkeypatch.setattr(repo, "_sql_connection", lambda *a, **kw: self._make_conn(cur))
         monkeypatch.setattr(repo, "_sql_temporal_columns", lambda *a, **kw: ["event_date"])
 
@@ -318,7 +451,7 @@ class TestWriteDelta:
                 pass
 
     def test_uploads_delta_directory_to_explicit_path(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         fs_client = mocker.MagicMock()
         file_client = mocker.MagicMock()
@@ -349,7 +482,7 @@ class TestWriteDelta:
         assert file_client.upload_data.call_args.kwargs["overwrite"] is True
 
     def test_replaces_existing_remote_delta_directory_before_upload(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         fs_client = mocker.MagicMock()
         directory_client = mocker.MagicMock()
@@ -376,7 +509,7 @@ class TestWriteDelta:
         assert method_names.index("get_directory_client") < method_names.index("get_file_client")
 
     def test_uses_table_folder_name_for_delta_output(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         fs_client = mocker.MagicMock()
         file_client = mocker.MagicMock()
@@ -398,7 +531,7 @@ class TestWriteDelta:
         assert "lh.Lakehouse/Tables/customers/_delta_log/00000000000000000000.json" in uploaded_paths
 
     def test_write_uses_delta_rs_not_duckdb_extension(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         service = mocker.MagicMock()
         service.get_file_system_client.return_value = mocker.MagicMock()
@@ -425,7 +558,7 @@ class TestWriteDelta:
             )
 
     def test_rejects_empty_schema_before_storage_access(self, monkeypatch, mocker):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         service_cls = mocker.MagicMock()
         monkeypatch.setattr(repo, "DataLakeServiceClient", service_cls)
@@ -472,7 +605,7 @@ class TestAuditSchemaMigration:
             pass
 
     def test_init_schema_adds_missing_audit_columns(self, monkeypatch):
-        import app.repository as repo
+        import app.infrastructure.repository as repo
 
         executed: list[str] = []
         monkeypatch.setattr(
@@ -524,7 +657,6 @@ class TestRunPurviewCheck:
         assert result["discrepancies"] == []
 
     def test_returns_flagged_columns(self, mocker):
-        mocker.patch("main.acquire_token", return_value="fake-token")
         mock_cls = mocker.patch("main.PurviewClient")
         mock_cls.qualified_name.return_value = "https://onelake.dfs.fabric.microsoft.com/ws/lh/t"
         mock_cls.return_value.column_classifications.return_value = {
@@ -543,7 +675,6 @@ class TestRunPurviewCheck:
         assert result["discrepancies"] == []
 
     def test_discrepancy_when_flagged_column_absent_from_dataframe(self, mocker):
-        mocker.patch("main.acquire_token", return_value="fake-token")
         mock_cls = mocker.patch("main.PurviewClient")
         mock_cls.qualified_name.return_value = "https://..."
         mock_cls.return_value.column_classifications.return_value = {
@@ -561,7 +692,8 @@ class TestRunPurviewCheck:
         assert "email" not in result["discrepancies"]
 
     def test_non_fatal_on_auth_failure(self, mocker):
-        mocker.patch("main.acquire_token", side_effect=Exception("auth failed"))
+        mock_cls = mocker.patch("main.PurviewClient")
+        mock_cls.side_effect = Exception("auth failed")
         result = run_purview_check(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t",
             df_columns=[],
@@ -570,12 +702,12 @@ class TestRunPurviewCheck:
         assert result["available"] is False
 
     def test_non_fatal_on_http_404(self, mocker):
-        import requests
-        mocker.patch("main.acquire_token", return_value="token")
+        from azure.core.exceptions import HttpResponseError
         mock_cls = mocker.patch("main.PurviewClient")
         mock_cls.qualified_name.return_value = "https://..."
-        http_err = requests.HTTPError(response=mocker.MagicMock(status_code=404))
-        mock_cls.return_value.column_classifications.side_effect = http_err
+        mock_cls.return_value.column_classifications.side_effect = HttpResponseError(
+            message="Not Found", response=mocker.MagicMock(status_code=404)
+        )
 
         result = run_purview_check(
             "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/t",
@@ -585,9 +717,9 @@ class TestRunPurviewCheck:
         assert result["available"] is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Free-text column flagging
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestFlagFreeTextColumns:
 
@@ -620,9 +752,9 @@ class TestFlagFreeTextColumns:
         assert flag_free_text_columns(df) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Quasi-identifier detection
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestDetectQuasiIdentifiers:
 
@@ -658,9 +790,9 @@ class TestDetectQuasiIdentifiers:
         assert "age" in qi
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # k-Anonymity enforcement
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestEnforceKAnonymity:
 
@@ -709,12 +841,12 @@ class TestEnforceKAnonymity:
         assert info["k"] == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Residual PII validation
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestValidateResidualPII:
 
@@ -842,9 +974,9 @@ class TestValidateResidualPII:
         assert count == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Identifier column detection
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestDetectIdentifierColumns:
 
@@ -892,9 +1024,9 @@ class TestDetectIdentifierColumns:
         assert "IDENTIFIER_0" in detect_identifier_columns(df)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Identifier column pseudonymization (Key Vault-bound)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestPseudonymizeIdentifierColumns:
 
@@ -968,3 +1100,52 @@ class TestPseudonymizeIdentifierColumns:
         df = pd.DataFrame({"employee_id": ["EMP001"]})
         with pytest.raises(ValueError, match="pseudonymizer is required"):
             pseudonymize_identifier_columns(df, ["employee_id"], None)
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Null-column coercion for Delta write
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestCoerceNullColumns:
+    """_coerce_null_columns must convert pa.null() columns to pa.string()
+    so delta-rs can write them without SchemaMismatchError."""
+
+    def test_all_null_column_becomes_string(self):
+        import pyarrow as pa
+        df = pd.DataFrame({"id": ["A", "B"], "notes": [None, None]})
+        table = _coerce_null_columns(df)
+        assert pa.types.is_string(table.schema.field("notes").type) or \
+               pa.types.is_large_string(table.schema.field("notes").type)
+
+    def test_null_values_preserved_as_null(self):
+        import pyarrow as pa
+        df = pd.DataFrame({"id": ["A"], "notes": [None]})
+        table = _coerce_null_columns(df)
+        assert table.column("notes")[0].as_py() is None
+
+    def test_non_null_columns_unchanged(self):
+        import pyarrow as pa
+        df = pd.DataFrame({"id": ["A", "B"], "score": [1.0, 2.0]})
+        table = _coerce_null_columns(df)
+        assert pa.types.is_floating(table.schema.field("score").type)
+
+    def test_empty_dataframe_null_column_coerced(self):
+        import pyarrow as pa
+        df = pd.DataFrame({"id": pd.Series([], dtype=object), "notes": pd.Series([], dtype=object)})
+        table = _coerce_null_columns(df)
+        # At minimum, the table should be writeable â€” no pa.null() fields remain
+        for field in table.schema:
+            assert not pa.types.is_null(field.type), f"Column {field.name!r} still has null type"
+
+    def test_no_null_columns_returns_table_unchanged(self):
+        import pyarrow as pa
+        df = pd.DataFrame({"name": ["Alice"], "age": [30]})
+        table = _coerce_null_columns(df)
+        assert table.schema.field("name").type == pa.string() or \
+               pa.types.is_large_string(table.schema.field("name").type)
+        assert pa.types.is_integer(table.schema.field("age").type)
+
+    def test_column_order_preserved(self):
+        df = pd.DataFrame({"z": [None], "a": ["x"], "m": [None]})
+        table = _coerce_null_columns(df)
+        assert table.schema.names == ["z", "a", "m"]

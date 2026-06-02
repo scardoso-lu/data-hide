@@ -1,9 +1,9 @@
-"""Tests for numeric quasi-identifier binning."""
+﻿"""Tests for numeric quasi-identifier binning."""
 
 import pandas as pd
 import pytest
 
-from app.anonymization import bin_numeric_columns
+from app.domain.anonymization import bin_numeric_columns
 
 
 class TestBinNumericColumns:
@@ -24,7 +24,7 @@ class TestBinNumericColumns:
         result, _ = bin_numeric_columns(df, ["price"])
         assert result["price"].dtype == object
         for val in result["price"].dropna():
-            assert "–" in str(val)
+            assert "â€“" in str(val)
 
     def test_original_dataframe_not_mutated(self):
         df = pd.DataFrame({"hours": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]})
@@ -68,7 +68,7 @@ class TestBinNumericColumns:
         df = pd.DataFrame({"units": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]})
         result, _ = bin_numeric_columns(df, ["units"])
         for val in result["units"].dropna():
-            assert "." not in val or val.replace("–", "").replace(".", "").isnumeric() is False
+            assert "." not in val or val.replace("â€“", "").replace(".", "").isnumeric() is False
 
     def test_missing_column_name_silently_ignored(self):
         df = pd.DataFrame({"hours": [10.0, 20.0, 30.0, 40.0]})

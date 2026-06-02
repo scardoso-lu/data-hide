@@ -32,7 +32,41 @@ services:
         condition: service_healthy
     volumes:
       - spacy_models:/app/models       # cache spaCy models between one-shot runs
-    restart: "no"                     # one-shot batch job — do not auto-restart
+    restart: "no"                      # one-shot batch job — do not auto-restart
+    # Hard memory ceiling for the pipeline container.
+    # Without this the Linux OOM killer fires at an unpredictable host-level
+    # threshold and "docker stats" shows no % indicator.  With it:
+    #   • exit 137 + OOMKilled=true appears in "docker inspect / events"
+    #   • "docker stats" shows memory % so you can watch it climb
+    #   • the pre-read log lines (parquet_files, compressed_size, process_rss)
+    #     tell you exactly which table was being loaded when the kill happened
+    # Tune this to match your host.  Rule of thumb: 3–5× the largest table's
+    # uncompressed in-memory size (Parquet decompresses 3–8×; Pandas adds more).
+    # Set PIPELINE_MEMORY_LIMIT in .env or override on the CLI:
+    #   PIPELINE_MEMORY_LIMIT=12g docker compose up
+    mem_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"
+    memswap_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"  # disable swap → fast fail, not thrash
+
+  # ── Next.js admin frontend ───────────────────────────────────────────────────
+  server:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
+      NODE_ENV: production
+      AUTH_SECRET: "${AUTH_SECRET}"
+      AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
+      # Set to true when running behind a reverse proxy or inside Docker so
+      # NextAuth accepts the forwarded host header.
+      AUTH_TRUST_HOST: "true"
+      AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
+      AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
+      AZURE_AD_TENANT_ID: "${AZURE_AD_TENANT_ID:-}"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped   # keep the admin UI always available
 
 volumes:
   pg_data:

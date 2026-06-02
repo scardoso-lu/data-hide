@@ -1,6 +1,6 @@
-"""Unit tests for the Azure Key Vault RSA pseudonymizer.
+﻿"""Unit tests for the Azure Key Vault RSA pseudonymizer.
 
-The real ``CryptographyClient`` is never instantiated — every test injects a
+The real ``CryptographyClient`` is never instantiated â€” every test injects a
 fake client whose ``sign`` method returns a controllable signature.  This
 verifies the key-derivation contract without requiring Key Vault credentials.
 """
@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from app.keyvault import (
+from app.infrastructure.keyvault import (
     KeyVaultPseudonymizer,
     LocalHashPseudonymizer,
     _DERIVATION_CONSTANT,
@@ -187,7 +187,7 @@ class TestBuildPseudonymizerFromEnv:
         assert isinstance(result, LocalHashPseudonymizer)
 
     def test_key_vault_disabled_ignores_url_and_key(self):
-        """When disabled, Key Vault credentials are ignored — no error raised."""
+        """When disabled, Key Vault credentials are ignored â€” no error raised."""
         result = build_pseudonymizer_from_env(
             "https://v.vault.azure.net/", "key", enable_key_vault=False,
         )
