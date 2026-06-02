@@ -1,5 +1,7 @@
 import { signIn } from "@/auth"
 
+export const dynamic = "force-dynamic"
+
 export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-base-200">
@@ -41,6 +43,9 @@ export default function LoginPage() {
             className="w-full"
             action={async () => {
               "use server"
+              // redirectTo is intentionally hardcoded — never derive it from
+              // ?callbackUrl or any other user-supplied parameter to prevent
+              // open-redirect attacks after OAuth callback.
               await signIn("microsoft-entra-id", { redirectTo: "/dashboard" })
             }}
           >

@@ -55,6 +55,14 @@ const nextConfig: NextConfig = {
           { key: "Cache-Control", value: "no-store" },
         ],
       },
+      {
+        // Prevent login/unauthorized pages from being cached — back-button after
+        // logout must not show a stale authenticated or access-denied state.
+        source: "/(login|unauthorized)",
+        headers: [
+          { key: "Cache-Control", value: "no-store" },
+        ],
+      },
     ]
   },
 }
