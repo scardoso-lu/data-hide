@@ -2,15 +2,15 @@ import NextAuth from "next-auth"
 import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id"
 
 // Fail fast at module load time so a misconfigured container never serves traffic.
-if (
-  process.env.NODE_ENV === "production" &&
-  (!process.env.AUTH_SECRET ||
-    process.env.AUTH_SECRET === "build-placeholder")
-) {
-  throw new Error(
-    "AUTH_SECRET must be set to a cryptographically random value in production. " +
-      "Generate one with: openssl rand -base64 32",
-  )
+// `openssl rand -base64 32` produces 44 characters; enforce >= 32 as the floor.
+if (process.env.NODE_ENV === "production") {
+  const s = process.env.AUTH_SECRET
+  if (!s || s === "build-placeholder" || s.length < 32) {
+    throw new Error(
+      "AUTH_SECRET must be a cryptographically random string of ≥ 32 characters. " +
+        "Generate one with: openssl rand -base64 32",
+    )
+  }
 }
 
 // ── Allowed groups ────────────────────────────────────────────────────────────
@@ -35,10 +35,15 @@ const ALLOWED_GROUPS = (process.env.AZURE_AD_ALLOWED_GROUPS ?? "")
  * Returns [] on any error; access is then denied when ALLOWED_GROUPS is set.
  */
 async function fetchGraphGroups(accessToken: string): Promise<string[]> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 5_000)
   try {
     const res = await fetch(
       "https://graph.microsoft.com/v1.0/me/memberOf?$select=id&$top=999",
-      { headers: { Authorization: `Bearer ${accessToken}` } },
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: controller.signal,
+      },
     )
     if (!res.ok) {
       console.error("[auth] Graph /memberOf returned HTTP", res.status)
@@ -49,6 +54,8 @@ async function fetchGraphGroups(accessToken: string): Promise<string[]> {
   } catch {
     console.error("[auth] fetchGraphGroups failed — check Graph API permissions")
     return []
+  } finally {
+    clearTimeout(timer)
   }
 }
 

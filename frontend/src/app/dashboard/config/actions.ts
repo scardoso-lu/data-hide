@@ -10,20 +10,30 @@ async function requireAccess(): Promise<void> {
   if (!session?.user || !allowed) throw new Error("Unauthorized")
 }
 
+const MAX_KEY_LEN   = 128
+const MAX_VALUE_LEN = 10_000
+const MAX_DESC_LEN  = 500
+
 export async function upsertConfigAction(formData: FormData): Promise<void> {
   await requireAccess()
-  const key = (formData.get("key") as string | null)?.trim()
-  const value = (formData.get("value") as string | null) ?? ""
-  const description = (formData.get("description") as string | null)?.trim() || null
+  const key         = (formData.get("key")         as string | null)?.trim()
+  const value       = (formData.get("value")        as string | null) ?? ""
+  const description = (formData.get("description")  as string | null)?.trim() || null
 
-  if (!key) throw new Error("Key is required")
+  if (!key)                              throw new Error("Key is required")
+  if (key.length > MAX_KEY_LEN)          throw new Error("Key exceeds 128-character limit")
+  if (value.length > MAX_VALUE_LEN)      throw new Error("Value exceeds 10 000-character limit")
+  if (description && description.length > MAX_DESC_LEN)
+                                         throw new Error("Description exceeds 500-character limit")
+
   await upsertConfig(key, value, description)
   revalidatePath("/dashboard/config")
 }
 
 export async function deleteConfigAction(key: string): Promise<void> {
   await requireAccess()
-  if (!key) throw new Error("Key is required")
+  if (!key || typeof key !== "string") throw new Error("Key is required")
+  if (key.length > MAX_KEY_LEN)        throw new Error("Key exceeds 128-character limit")
   await deleteConfig(key)
   revalidatePath("/dashboard/config")
 }

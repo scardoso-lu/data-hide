@@ -1,11 +1,12 @@
 import type { NextConfig } from "next"
 
 // CSP note: Next.js App Router requires 'unsafe-inline' for its runtime
-// script chunks and inline styles. A nonce-based strict CSP would need
-// additional build tooling. frame-ancestors 'none' is the critical control.
+// script chunks and inline styles, but NOT 'unsafe-eval'. A nonce-based
+// strict CSP would need additional build tooling.
+// frame-ancestors 'none' is the critical clickjacking control.
 const CSP = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+  "script-src 'self' 'unsafe-inline'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data:",
   "font-src 'self'",
