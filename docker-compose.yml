@@ -47,14 +47,13 @@ services:
     mem_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"
     memswap_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"  # disable swap → fast fail, not thrash
 
-  # ── Next.js auth gateway ─────────────────────────────────────────────────────
-  # Handles Microsoft Entra ID (Azure AD) login only.  All /admin/* routes are
-  # proxied to the internal Flask admin service — no admin logic lives in JS.
+  # ── Next.js admin frontend ───────────────────────────────────────────────────
   server:
     build: ./frontend
     ports:
       - "3000:3000"
     environment:
+      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
       NODE_ENV: production
       AUTH_SECRET: "${AUTH_SECRET}"
       AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
@@ -62,25 +61,6 @@ services:
       AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
       AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
       AZURE_AD_TENANT_ID: "${AZURE_AD_TENANT_ID:-}"
-      # Proxy target and shared secret for the /admin/* proxy route
-      FLASK_ADMIN_URL: "http://admin:5001"
-      ADMIN_TOKEN: "${ADMIN_TOKEN}"
-    depends_on:
-      db:
-        condition: service_healthy
-      admin:
-        condition: service_started
-    restart: unless-stopped
-
-  # ── Python admin UI (Flask + SQLAlchemy) ─────────────────────────────────────
-  # Not exposed externally — only reachable from the Next.js proxy above.
-  # Validates X-Admin-Token on every request; rejects direct access.
-  admin:
-    build: ./admin
-    environment:
-      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
-      FLASK_SECRET_KEY: "${FLASK_SECRET_KEY:-change-me-in-production}"
-      ADMIN_TOKEN: "${ADMIN_TOKEN}"
     depends_on:
       db:
         condition: service_healthy
