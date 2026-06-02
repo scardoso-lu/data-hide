@@ -2,6 +2,7 @@ import { auth } from "@/auth"
 import { redirect } from "next/navigation"
 import Navbar from "@/components/navbar"
 import Sidebar from "@/components/sidebar"
+import SessionMonitor from "@/components/session-monitor"
 
 export default async function DashboardLayout({
   children,
@@ -17,6 +18,7 @@ export default async function DashboardLayout({
 
   return (
     <div className="min-h-screen bg-base-200">
+      <SessionMonitor />
       <Navbar user={session.user} />
       <div className="flex">
         <Sidebar />

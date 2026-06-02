@@ -18,6 +18,19 @@ function fmtNum(n: number | null | undefined): string {
   return n.toLocaleString()
 }
 
+// Redact credential-like patterns that can appear in pipeline error messages
+// (e.g. connection strings, Azure SAS tokens, passwords in exception traces).
+function sanitizeErrorMsg(msg: string): string {
+  return msg
+    .replace(/password\s*[=:]\s*\S+/gi, "password=[REDACTED]")
+    .replace(/pwd\s*[=:]\s*\S+/gi, "pwd=[REDACTED]")
+    .replace(/api[_-]?key\s*[=:]\s*\S+/gi, "api_key=[REDACTED]")
+    .replace(/secret\s*[=:]\s*\S+/gi, "secret=[REDACTED]")
+    .replace(/access[_-]?token\s*[=:]\s*\S+/gi, "access_token=[REDACTED]")
+    .replace(/sig=[A-Za-z0-9%+/=]{20,}/g, "sig=[REDACTED]")
+    .replace(/:\/\/[^:@\s]+:[^@\s]+@/g, "://[REDACTED]@")
+}
+
 interface Props {
   params: Promise<{ run_id: string }>
 }
@@ -70,9 +83,12 @@ export default async function RunDetailPage({ params }: Props) {
           <div>
             <p className="font-semibold text-sm">Error</p>
             <pre className="text-xs whitespace-pre-wrap mt-1 opacity-90">
-              {run.error_msg.length > 500
-                ? run.error_msg.slice(0, 500) + "\n… (truncated — see pipeline logs for full detail)"
-                : run.error_msg}
+              {(() => {
+                const safe = sanitizeErrorMsg(run.error_msg)
+                return safe.length > 500
+                  ? safe.slice(0, 500) + "\n… (truncated — see pipeline logs for full detail)"
+                  : safe
+              })()}
             </pre>
           </div>
         </div>

@@ -169,8 +169,15 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         )
       }
 
-      if (!isLoggedIn) return false
-      if (!hasAccess) return Response.redirect(new URL("/unauthorized", nextUrl))
+      if (!isLoggedIn) {
+        console.warn(`[security] unauthenticated access attempt path=${pathname}`)
+        return false
+      }
+      if (!hasAccess) {
+        const email = (session as typeof session & { user?: { email?: string } })?.user?.email ?? "unknown"
+        console.warn(`[security] access denied path=${pathname} actor=${email}`)
+        return Response.redirect(new URL("/unauthorized", nextUrl))
+      }
       return true
     },
   },
