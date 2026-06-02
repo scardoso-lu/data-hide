@@ -2,11 +2,9 @@ import { redirect } from "next/navigation"
 import { auth } from "@/auth"
 
 /**
- * Root page — bounce to /dashboard if authenticated, /login otherwise.
- * The middleware also handles this redirect, but this ensures the root URL
- * always resolves to something meaningful.
+ * Root page — bounce to /admin if authenticated, /login otherwise.
  */
 export default async function Home() {
   const session = await auth()
-  redirect(session ? "/dashboard" : "/login")
+  redirect(session ? "/admin" : "/login")
 }

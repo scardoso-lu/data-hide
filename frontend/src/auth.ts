@@ -138,7 +138,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       if (pathname.startsWith("/login")) {
         if (!isLoggedIn) return true
         return Response.redirect(
-          new URL(hasAccess ? "/dashboard" : "/unauthorized", nextUrl),
+          new URL(hasAccess ? "/admin" : "/unauthorized", nextUrl),
         )
       }
 
