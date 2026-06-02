@@ -93,6 +93,11 @@ async function resolveAccess(
 
 // ── NextAuth ──────────────────────────────────────────────────────────────────
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  // Only trust the X-Forwarded-Host header when explicitly enabled via env var.
+  // In production behind a reverse proxy, set AUTH_TRUST_HOST=true and ensure
+  // the proxy strips/rewrites the header before forwarding.
+  trustHost: process.env.AUTH_TRUST_HOST === "true",
+
   providers: [
     MicrosoftEntraID({
       clientId: process.env.AZURE_AD_CLIENT_ID!,
@@ -113,6 +118,18 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   session: {
     // Limit admin sessions to 8 hours (A07 — authentication failures)
     maxAge: 8 * 60 * 60,
+  },
+
+  // Explicit cookie security — do not rely on silent NextAuth defaults.
+  cookies: {
+    sessionToken: {
+      options: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax" as const,
+        path: "/",
+      },
+    },
   },
 
   callbacks: {
