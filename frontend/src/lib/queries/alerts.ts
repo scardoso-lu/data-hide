@@ -1,5 +1,8 @@
 import { pool } from "@/lib/db"
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 export interface PipelineAlert {
   id: number
   severity: string
@@ -18,7 +21,11 @@ export async function getAlerts(limit: number): Promise<PipelineAlert[]> {
      LIMIT $1`,
     [Math.min(limit, 500)],
   )
-  return rows
+  // Nullify any run_id that isn't a valid UUID to prevent malformed hrefs.
+  return rows.map((row) => ({
+    ...row,
+    run_id: row.run_id && UUID_RE.test(row.run_id) ? row.run_id : null,
+  }))
 }
 
 export async function getRecentAlertCount(): Promise<number> {
