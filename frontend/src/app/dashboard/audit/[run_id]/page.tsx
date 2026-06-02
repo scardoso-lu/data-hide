@@ -19,11 +19,12 @@ function fmtNum(n: number | null | undefined): string {
 }
 
 interface Props {
-  params: { run_id: string }
+  params: Promise<{ run_id: string }>
 }
 
 export default async function RunDetailPage({ params }: Props) {
-  const run = await getRunById(params.run_id)
+  const { run_id } = await params
+  const run = await getRunById(run_id)
   if (!run) notFound()
 
   const totalSec = run.stage_seconds
@@ -37,7 +38,7 @@ export default async function RunDetailPage({ params }: Props) {
         <ul>
           <li><Link href="/dashboard/audit">Audit Runs</Link></li>
           <li className="font-mono text-xs opacity-60">
-            {params.run_id.slice(0, 8)}…
+            {run_id.slice(0, 8)}…
           </li>
         </ul>
       </div>
