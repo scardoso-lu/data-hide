@@ -29,13 +29,13 @@ async function fetchGraphGroups(accessToken: string): Promise<string[]> {
       { headers: { Authorization: `Bearer ${accessToken}` } },
     )
     if (!res.ok) {
-      console.error("[auth] Graph /memberOf →", res.status, await res.text())
+      console.error("[auth] Graph /memberOf returned HTTP", res.status)
       return []
     }
     const data = (await res.json()) as { value: { id: string }[] }
     return data.value.map((g) => g.id)
-  } catch (err) {
-    console.error("[auth] fetchGraphGroups failed:", err)
+  } catch {
+    console.error("[auth] fetchGraphGroups failed — check Graph API permissions")
     return []
   }
 }
@@ -106,6 +106,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           profileGroups,
           account.access_token,
         )
+      } else {
+        // Refresh path — preserve existing value; deny if somehow missing.
+        token.allowedAccess = (token.allowedAccess as boolean | undefined) ?? false
       }
       return token
     },
@@ -114,7 +117,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     session({ session, token }) {
       return {
         ...session,
-        allowedAccess: (token.allowedAccess as boolean | undefined) ?? true,
+        allowedAccess: (token.allowedAccess as boolean | undefined) ?? false,
       }
     },
 
@@ -130,7 +133,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       const isLoggedIn = !!session?.user
       const hasAccess =
         (session as (typeof session & { allowedAccess?: boolean }))
-          ?.allowedAccess ?? true
+          ?.allowedAccess ?? false
       const { pathname } = nextUrl
 
       if (pathname.startsWith("/unauthorized")) return true

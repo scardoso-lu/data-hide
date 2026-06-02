@@ -60,7 +60,7 @@ export default async function RunDetailPage({ params }: Props) {
         </div>
       </div>
 
-      {/* Error box */}
+      {/* Error box — truncate at 500 chars to avoid leaking long stack traces */}
       {run.error_msg && (
         <div className="alert alert-error">
           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -68,7 +68,11 @@ export default async function RunDetailPage({ params }: Props) {
           </svg>
           <div>
             <p className="font-semibold text-sm">Error</p>
-            <pre className="text-xs whitespace-pre-wrap mt-1 opacity-90">{run.error_msg}</pre>
+            <pre className="text-xs whitespace-pre-wrap mt-1 opacity-90">
+              {run.error_msg.length > 500
+                ? run.error_msg.slice(0, 500) + "\n… (truncated — see pipeline logs for full detail)"
+                : run.error_msg}
+            </pre>
           </div>
         </div>
       )}
