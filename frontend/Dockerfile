@@ -14,11 +14,10 @@ COPY . .
 # Disable Next.js telemetry during build.
 ENV NEXT_TELEMETRY_DISABLED=1
 
-# Build-time placeholder — the real values are injected at runtime via env.
-# AUTH_SECRET must be set at runtime; a placeholder avoids a build error.
-ENV AUTH_SECRET=build-placeholder
-
-RUN npm run build
+# AUTH_SECRET is required by NextAuth at build time but must NOT be baked
+# into the image. Inline it only for this RUN step so it never persists as
+# an ENV layer; supply the real value at runtime via -e AUTH_SECRET=…
+RUN AUTH_SECRET=build-placeholder npm run build
 
 # ── Stage 3: production runner ────────────────────────────────────────────────
 FROM node:20-alpine AS runner

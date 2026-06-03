@@ -4,6 +4,8 @@ import { getRecentAlertCount } from "@/lib/queries/alerts"
 import RunStatusBadge from "@/components/run-status-badge"
 import { getRuns } from "@/lib/queries/runs"
 
+export const dynamic = "force-dynamic"
+
 function fmtNumber(n: string | number | null): string {
   if (n === null || n === undefined) return "—"
   return Number(n).toLocaleString()

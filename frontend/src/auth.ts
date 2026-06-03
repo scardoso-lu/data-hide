@@ -1,6 +1,18 @@
 import NextAuth from "next-auth"
 import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id"
 
+// Fail fast at module load time so a misconfigured container never serves traffic.
+// `openssl rand -base64 32` produces 44 characters; enforce >= 32 as the floor.
+if (process.env.NODE_ENV === "production") {
+  const s = process.env.AUTH_SECRET
+  if (!s || s === "build-placeholder" || s.length < 32) {
+    throw new Error(
+      "AUTH_SECRET must be a cryptographically random string of ≥ 32 characters. " +
+        "Generate one with: openssl rand -base64 32",
+    )
+  }
+}
+
 // ── Allowed groups ────────────────────────────────────────────────────────────
 // Comma-separated Azure AD group Object IDs.
 // Leave empty (or unset) to allow every authenticated user in.
@@ -23,20 +35,27 @@ const ALLOWED_GROUPS = (process.env.AZURE_AD_ALLOWED_GROUPS ?? "")
  * Returns [] on any error; access is then denied when ALLOWED_GROUPS is set.
  */
 async function fetchGraphGroups(accessToken: string): Promise<string[]> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 5_000)
   try {
     const res = await fetch(
       "https://graph.microsoft.com/v1.0/me/memberOf?$select=id&$top=999",
-      { headers: { Authorization: `Bearer ${accessToken}` } },
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: controller.signal,
+      },
     )
     if (!res.ok) {
-      console.error("[auth] Graph /memberOf →", res.status, await res.text())
+      console.error("[auth] Graph /memberOf returned HTTP", res.status)
       return []
     }
     const data = (await res.json()) as { value: { id: string }[] }
     return data.value.map((g) => g.id)
-  } catch (err) {
-    console.error("[auth] fetchGraphGroups failed:", err)
+  } catch {
+    console.error("[auth] fetchGraphGroups failed — check Graph API permissions")
     return []
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -74,6 +93,11 @@ async function resolveAccess(
 
 // ── NextAuth ──────────────────────────────────────────────────────────────────
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  // Only trust the X-Forwarded-Host header when explicitly enabled via env var.
+  // In production behind a reverse proxy, set AUTH_TRUST_HOST=true and ensure
+  // the proxy strips/rewrites the header before forwarding.
+  trustHost: process.env.AUTH_TRUST_HOST === "true",
+
   providers: [
     MicrosoftEntraID({
       clientId: process.env.AZURE_AD_CLIENT_ID!,
@@ -86,6 +110,26 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
   pages: {
     signIn: "/login",
+    // Redirect all OAuth/callback errors to the login page so the default
+    // NextAuth error page (which exposes error-type names) is never shown.
+    error: "/login",
+  },
+
+  session: {
+    // Limit admin sessions to 8 hours (A07 — authentication failures)
+    maxAge: 8 * 60 * 60,
+  },
+
+  // Explicit cookie security — do not rely on silent NextAuth defaults.
+  cookies: {
+    sessionToken: {
+      options: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax" as const,
+        path: "/",
+      },
+    },
   },
 
   callbacks: {
@@ -106,6 +150,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           profileGroups,
           account.access_token,
         )
+      } else {
+        // Refresh path — preserve existing value; deny if somehow missing.
+        token.allowedAccess = (token.allowedAccess as boolean | undefined) ?? false
       }
       return token
     },
@@ -114,7 +161,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     session({ session, token }) {
       return {
         ...session,
-        allowedAccess: (token.allowedAccess as boolean | undefined) ?? true,
+        allowedAccess: (token.allowedAccess as boolean | undefined) ?? false,
       }
     },
 
@@ -130,7 +177,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       const isLoggedIn = !!session?.user
       const hasAccess =
         (session as (typeof session & { allowedAccess?: boolean }))
-          ?.allowedAccess ?? true
+          ?.allowedAccess ?? false
       const { pathname } = nextUrl
 
       if (pathname.startsWith("/unauthorized")) return true
@@ -142,8 +189,15 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         )
       }
 
-      if (!isLoggedIn) return false
-      if (!hasAccess) return Response.redirect(new URL("/unauthorized", nextUrl))
+      if (!isLoggedIn) {
+        console.warn(`[security] unauthenticated access attempt path=${pathname}`)
+        return false
+      }
+      if (!hasAccess) {
+        const email = (session as typeof session & { user?: { email?: string } })?.user?.email ?? "unknown"
+        console.warn(`[security] access denied path=${pathname} actor=${email}`)
+        return Response.redirect(new URL("/unauthorized", nextUrl))
+      }
       return true
     },
   },

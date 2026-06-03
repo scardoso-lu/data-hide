@@ -2,8 +2,10 @@ import type { Metadata } from "next"
 import "./globals.css"
 
 export const metadata: Metadata = {
-  title: "data-hide | PII Pipeline Admin",
-  description: "Manage and monitor the Fabric PII anonymization pipeline",
+  title: "Admin",
+  description: "Secure admin application",
+  // Prevent all search engine indexing globally; robots.ts adds the HTTP header.
+  robots: { index: false, follow: false },
 }
 
 export default function RootLayout({

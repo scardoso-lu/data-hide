@@ -57,8 +57,6 @@ services:
       NODE_ENV: production
       AUTH_SECRET: "${AUTH_SECRET}"
       AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
-      # Set to true when running behind a reverse proxy or inside Docker so
-      # NextAuth accepts the forwarded host header.
       AUTH_TRUST_HOST: "true"
       AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
       AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
@@ -66,7 +64,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    restart: unless-stopped   # keep the admin UI always available
+    restart: unless-stopped
 
 volumes:
   pg_data:

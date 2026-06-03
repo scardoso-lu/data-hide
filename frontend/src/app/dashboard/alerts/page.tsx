@@ -77,7 +77,9 @@ export default async function AlertsPage() {
               </div>
               {alert.body && (
                 <pre className="text-xs whitespace-pre-wrap opacity-80 w-full font-sans">
-                  {alert.body}
+                  {alert.body.length > 500
+                    ? alert.body.slice(0, 500) + "\n… (truncated)"
+                    : alert.body}
                 </pre>
               )}
             </div>

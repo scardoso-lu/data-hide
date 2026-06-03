@@ -8,6 +8,8 @@ import logging
 from datetime import datetime
 from typing import Generator
 
+from ._types import TableMapping
+
 try:
     import psycopg2
     import psycopg2.extras
@@ -118,6 +120,17 @@ CREATE TABLE IF NOT EXISTS pii_column_exclusions (
 )
 """
 
+_DDL_TABLE_TARGETS = """
+CREATE TABLE IF NOT EXISTS pii_table_targets (
+    id BIGSERIAL PRIMARY KEY,
+    source_uri TEXT NOT NULL,
+    target_uri TEXT NOT NULL,
+    table_name TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AuditDB
@@ -148,6 +161,7 @@ class AuditDB:
             cur.execute(_DDL_ALERTS)
             cur.execute(_DDL_CONFIG)
             cur.execute(_DDL_COLUMN_EXCLUSIONS)
+            cur.execute(_DDL_TABLE_TARGETS)
             for migration in _DDL_RUNS_MIGRATIONS:
                 cur.execute(migration)
 
@@ -208,6 +222,19 @@ class AuditDB:
             for table, column in cur.fetchall():
                 result.setdefault(table.lower(), []).append(column)
         return {t: frozenset(cols) for t, cols in result.items()}
+
+    def load_table_targets(self) -> list[TableMapping]:
+        """Return enabled rows from ``pii_table_targets`` as ``TableMapping`` objects.
+
+        When this list is non-empty, ``resolve_table_mappings`` uses it directly
+        and skips auto-discovery under ``SOURCE_BASE_ABFSS_URI``.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT source_uri, target_uri, table_name"
+                " FROM pii_table_targets WHERE enabled = TRUE"
+            )
+            return [TableMapping(row[0], row[1], row[2]) for row in cur.fetchall()]
 
     def record_alert(
         self,

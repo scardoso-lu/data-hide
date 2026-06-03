@@ -86,12 +86,16 @@ class PipelineConfig:
     sql_database: str | None = None
     gps_precision: int = 1
     max_table_workers: int = 1
+    # Explicit per-run table pairs loaded from pii_table_targets in PostgreSQL.
+    # When non-empty, auto-discovery under source_base_uri is skipped entirely.
+    table_targets: tuple[TableMapping, ...] = ()
 
     @classmethod
     def from_env(
         cls,
         config_overrides: "dict[str, str] | None" = None,
         excluded_columns: "dict[str, frozenset[str]] | None" = None,
+        table_targets: "tuple[TableMapping, ...] | None" = None,
     ) -> "PipelineConfig":
         """Build from environment variables, optionally overlaid with DB overrides.
 
@@ -143,6 +147,8 @@ class PipelineConfig:
             max_table_workers=_int_at_least("MAX_TABLE_WORKERS", 1, 1),
             # ── loaded from pii_column_exclusions table ────────────────────────
             excluded_columns_by_table=excluded_columns or {},
+            # ── loaded from pii_table_targets table ───────────────────────────
+            table_targets=table_targets or (),
         )
 
     @classmethod
@@ -158,6 +164,7 @@ class PipelineConfig:
             return cls.from_env()
         overrides: dict[str, str] = {}
         exclusions: dict[str, frozenset[str]] = {}
+        targets: tuple[TableMapping, ...] = ()
         try:
             overrides = db.load_runtime_config()
         except Exception as exc:
@@ -166,7 +173,11 @@ class PipelineConfig:
             exclusions = db.load_column_exclusions()
         except Exception as exc:
             logger.warning("Could not load column exclusions from DB (none applied): %s", exc)
-        return cls.from_env(config_overrides=overrides, excluded_columns=exclusions)
+        try:
+            targets = tuple(db.load_table_targets())
+        except Exception as exc:
+            logger.warning("Could not load table targets from DB (using auto-discovery): %s", exc)
+        return cls.from_env(config_overrides=overrides, excluded_columns=exclusions, table_targets=targets)
 
 
 def _csv(value: str) -> tuple[str, ...]:
@@ -243,9 +254,12 @@ def timed_stage(audit: dict, name: str):
 
 
 def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
+    if config.table_targets:
+        return list(config.table_targets)
     if not config.source_base_uri or not config.target_base_uri:
         raise RuntimeError(
-            "SOURCE_BASE_ABFSS_URI and TARGET_BASE_ABFSS_URI must both be set."
+            "SOURCE_BASE_ABFSS_URI and TARGET_BASE_ABFSS_URI must both be set "
+            "(or populate pii_table_targets in the audit database)."
         )
     mappings = discover_table_mappings(
         config.source_base_uri,
