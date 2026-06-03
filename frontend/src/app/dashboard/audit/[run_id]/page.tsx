@@ -18,12 +18,26 @@ function fmtNum(n: number | null | undefined): string {
   return n.toLocaleString()
 }
 
+// Redact credential-like patterns that can appear in pipeline error messages
+// (e.g. connection strings, Azure SAS tokens, passwords in exception traces).
+function sanitizeErrorMsg(msg: string): string {
+  return msg
+    .replace(/password\s*[=:]\s*\S+/gi, "password=[REDACTED]")
+    .replace(/pwd\s*[=:]\s*\S+/gi, "pwd=[REDACTED]")
+    .replace(/api[_-]?key\s*[=:]\s*\S+/gi, "api_key=[REDACTED]")
+    .replace(/secret\s*[=:]\s*\S+/gi, "secret=[REDACTED]")
+    .replace(/access[_-]?token\s*[=:]\s*\S+/gi, "access_token=[REDACTED]")
+    .replace(/sig=[A-Za-z0-9%+/=]{20,}/g, "sig=[REDACTED]")
+    .replace(/:\/\/[^:@\s]+:[^@\s]+@/g, "://[REDACTED]@")
+}
+
 interface Props {
-  params: { run_id: string }
+  params: Promise<{ run_id: string }>
 }
 
 export default async function RunDetailPage({ params }: Props) {
-  const run = await getRunById(params.run_id)
+  const { run_id } = await params
+  const run = await getRunById(run_id)
   if (!run) notFound()
 
   const totalSec = run.stage_seconds
@@ -37,7 +51,7 @@ export default async function RunDetailPage({ params }: Props) {
         <ul>
           <li><Link href="/dashboard/audit">Audit Runs</Link></li>
           <li className="font-mono text-xs opacity-60">
-            {params.run_id.slice(0, 8)}…
+            {run_id.slice(0, 8)}…
           </li>
         </ul>
       </div>
@@ -60,7 +74,7 @@ export default async function RunDetailPage({ params }: Props) {
         </div>
       </div>
 
-      {/* Error box */}
+      {/* Error box — truncate at 500 chars to avoid leaking long stack traces */}
       {run.error_msg && (
         <div className="alert alert-error">
           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -68,7 +82,14 @@ export default async function RunDetailPage({ params }: Props) {
           </svg>
           <div>
             <p className="font-semibold text-sm">Error</p>
-            <pre className="text-xs whitespace-pre-wrap mt-1 opacity-90">{run.error_msg}</pre>
+            <pre className="text-xs whitespace-pre-wrap mt-1 opacity-90">
+              {(() => {
+                const safe = sanitizeErrorMsg(run.error_msg)
+                return safe.length > 500
+                  ? safe.slice(0, 500) + "\n… (truncated — see pipeline logs for full detail)"
+                  : safe
+              })()}
+            </pre>
           </div>
         </div>
       )}

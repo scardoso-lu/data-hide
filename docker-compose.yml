@@ -56,6 +56,25 @@ services:
     mem_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"
     memswap_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"  # disable swap → fast fail, not thrash
 
+  # ── Next.js admin frontend ───────────────────────────────────────────────────
+  server:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
+      NODE_ENV: production
+      AUTH_SECRET: "${AUTH_SECRET}"
+      AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
+      AUTH_TRUST_HOST: "true"
+      AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
+      AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
+      AZURE_AD_TENANT_ID: "${AZURE_AD_TENANT_ID:-}"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pg_data:
   spacy_models:

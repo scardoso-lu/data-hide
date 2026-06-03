@@ -22,11 +22,15 @@ function elapsedSec(started: string, finished: string | null): string {
 }
 
 interface Props {
-  searchParams: { page?: string }
+  searchParams: Promise<{ page?: string }>
 }
 
 export default async function AuditPage({ searchParams }: Props) {
-  const page = Math.max(1, parseInt(searchParams.page ?? "1", 10))
+  const { page: pageParam } = await searchParams
+  const rawPage = parseInt(pageParam ?? "1", 10)
+  // parseInt returns NaN for non-numeric input; NaN propagates through Math.min/max
+  // and would reach the DB as OFFSET NaN, causing a query error. Clamp to 1 instead.
+  const page = Number.isFinite(rawPage) ? Math.min(10_000, Math.max(1, rawPage)) : 1
   const offset = (page - 1) * PAGE_SIZE
 
   const [runs, total] = await Promise.all([

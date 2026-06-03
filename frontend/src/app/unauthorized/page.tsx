@@ -1,5 +1,7 @@
 import { signOut } from "@/auth"
 
+export const dynamic = "force-dynamic"
+
 /**
  * Shown when the user successfully authenticated with Microsoft but is not
  * a member of any group listed in AZURE_AD_ALLOWED_GROUPS.
