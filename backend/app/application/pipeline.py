@@ -37,6 +37,7 @@ from ..domain.classification import (
     FREE_TEXT,
     IDENTIFIER,
     QUASI_IDENTIFIER,
+    _tier_a_purview,
     apply_column_policies,
     classify_columns,
     classify_pii_columns,
@@ -99,6 +100,9 @@ class PipelineConfig:
     # Loaded from the apply_row_scan table. Keys are lowercase table names;
     # values are the set of column names to scan cell-by-cell.
     row_scan_columns_by_table: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Custom Purview classification type that means "redact this column".
+    # Required whenever PURVIEW_ACCOUNT_NAME is set.  DB-overridable.
+    purview_must_anonymize_type: str | None = None
 
     @classmethod
     def from_env(
@@ -140,6 +144,25 @@ class PipelineConfig:
                 raise ValueError(f"{key} must be {minimum} or greater")
             return value
 
+        purview_account_name = _get("PURVIEW_ACCOUNT_NAME") or None
+        purview_must_anonymize_type = _get("PURVIEW_MUST_ANONYMIZE_TYPE") or None
+        if purview_account_name:
+            # Credential vars are secrets — read directly from os.environ,
+            # not _get(), so they can never be stored in the DB config table.
+            missing_creds = [
+                v for v in ("PURVIEW_CLIENT_ID", "PURVIEW_CLIENT_SECRET")
+                if not os.environ.get(v)
+            ]
+            if missing_creds:
+                raise ValueError(
+                    f"Purview credentials not set: {', '.join(missing_creds)} "
+                    "must be configured when PURVIEW_ACCOUNT_NAME is set"
+                )
+            if not purview_must_anonymize_type:
+                raise ValueError(
+                    "PURVIEW_MUST_ANONYMIZE_TYPE must be set when PURVIEW_ACCOUNT_NAME is configured"
+                )
+
         return cls(
             # ── secrets / connectivity: always from env, never from DB ────────
             database_url=os.environ.get("DATABASE_URL"),
@@ -149,7 +172,7 @@ class PipelineConfig:
             source_base_uri=os.environ.get("SOURCE_BASE_ABFSS_URI"),
             target_base_uri=os.environ.get("TARGET_BASE_ABFSS_URI"),
             # ── runtime-tunable: DB wins over env ─────────────────────────────
-            purview_account_name=_get("PURVIEW_ACCOUNT_NAME") or None,
+            purview_account_name=purview_account_name,
             k_anonymity_min=_int_at_least("K_ANONYMITY_MIN", 5, 1),
             key_vault_enabled=_get("ENABLE_KEY_VAULT", "1").strip().lower() in {
                 "1", "true", "yes", "on",
@@ -167,6 +190,7 @@ class PipelineConfig:
             table_targets=table_targets or (),
             # ── loaded from the apply_row_scan table ──────────────────────────
             row_scan_columns_by_table=row_scan_columns or {},
+            purview_must_anonymize_type=purview_must_anonymize_type,
         )
 
     @classmethod
@@ -615,13 +639,27 @@ def run_table(
         with timed_stage(audit, "column_policy_classification"):
             if policies is not None:
                 policies = dict(policies)
+                # Apply Purview overrides to pre-computed policies so that
+                # columns classified by the multi-pass phase are still
+                # subject to operator-level Purview pins.
+                _tier_a_purview(
+                    df_raw,
+                    pv.get("column_labels") or None,
+                    policies,
+                    purview_must_anonymize_type=config.purview_must_anonymize_type,
+                )
             else:
                 if analyzer is None:
                     with timed_stage(audit, "build_engines"):
                         # English-only — see the comment in run_pipeline().
                         analyzer = build_engines(("en",))
                 try:
-                    policies = classify_pii_columns(df_raw, analyzer=analyzer)
+                    policies = classify_pii_columns(
+                        df_raw,
+                        analyzer=analyzer,
+                        purview_classifications=pv.get("column_labels") or None,
+                        purview_must_anonymize_type=config.purview_must_anonymize_type,
+                    )
                 except Exception as exc:
                     logger.warning("Column-policy classification failed (non-fatal): %s", exc)
                     policies = {}

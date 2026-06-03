@@ -753,20 +753,42 @@ def _best_entity_for_column_name(
 
 def _tier_a_purview(
     df: pl.DataFrame,
-    purview_classifications: dict[str, str] | None,
+    purview_classifications: dict[str, str | list[str]] | None,
     policies: dict[str, ColumnPolicy],
+    *,
+    purview_must_anonymize_type: str | None = None,
 ) -> None:
     """Apply Purview-supplied column classifications.  No-op when the caller
-    didn't pass a mapping (Purview not configured / unreachable)."""
+    didn't pass a mapping (Purview not configured / unreachable).
+
+    Each column value may be a single classification type string (legacy /
+    test path) or a list of type strings as returned by the Purview catalog
+    API.  When ``purview_must_anonymize_type`` is set, any column carrying
+    that type (case-insensitive) is assigned ``ACTION_REDACT`` directly,
+    taking priority over all known Microsoft classification types.
+    """
     if not purview_classifications:
         return
-    for column, purview_type in purview_classifications.items():
+    must_upper = purview_must_anonymize_type.upper() if purview_must_anonymize_type else None
+    for column, raw_types in purview_classifications.items():
         if column not in df.columns or column in policies:
             continue
-        entity = PURVIEW_TYPE_TO_ENTITY.get(str(purview_type).upper())
-        if not entity:
+        types: list[str] = [raw_types] if isinstance(raw_types, str) else list(raw_types)
+        # Custom must-anonymize type wins over all known Microsoft types.
+        if must_upper and any(t.upper() == must_upper for t in types):
+            policies[column] = ColumnPolicy(
+                column=column,
+                entity_type="MUST_ANONYMIZE",
+                action=ACTION_REDACT,
+                source="purview",
+                score=1.0,
+            )
             continue
-        policies[column] = _make_policy(column, entity, source="purview", score=1.0)
+        for t in types:
+            entity = PURVIEW_TYPE_TO_ENTITY.get(t.upper())
+            if entity:
+                policies[column] = _make_policy(column, entity, source="purview", score=1.0)
+                break
 
 
 def _tier_a1_name_pattern(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
@@ -937,7 +959,8 @@ def _tier_c_fallback(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> Non
 def classify_pii_columns(
     df: pl.DataFrame,
     *,
-    purview_classifications: dict[str, str] | None = None,
+    purview_classifications: dict[str, str | list[str]] | None = None,
+    purview_must_anonymize_type: str | None = None,
     analyzer: Any | None = None,
     similarity_models: dict[str, Any] | None = None,
     similarity_threshold: float | None = None,
@@ -982,7 +1005,8 @@ def classify_pii_columns(
     """
     policies: dict[str, ColumnPolicy] = {}
 
-    _tier_a_purview(df, purview_classifications, policies)
+    _tier_a_purview(df, purview_classifications, policies,
+                    purview_must_anonymize_type=purview_must_anonymize_type)
     _tier_a1_name_pattern(df, policies)  # pin id-named columns before value-sampling
 
     if structured_enabled is None:

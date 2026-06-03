@@ -565,6 +565,95 @@ class TestPipelineConfigValidation:
             PipelineConfig.from_env()
 
 
+class TestPurviewMustAnonymizeConfig:
+    """PipelineConfig must validate Purview credentials and PURVIEW_MUST_ANONYMIZE_TYPE."""
+
+    def _set_purview_env(self, monkeypatch):
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+
+    def test_missing_client_id_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+        monkeypatch.delenv("PURVIEW_CLIENT_ID", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_CLIENT_ID"):
+            PipelineConfig.from_env()
+
+    def test_missing_client_secret_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+        monkeypatch.delenv("PURVIEW_CLIENT_SECRET", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_CLIENT_SECRET"):
+            PipelineConfig.from_env()
+
+    def test_missing_must_anonymize_type_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.delenv("PURVIEW_MUST_ANONYMIZE_TYPE", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_MUST_ANONYMIZE_TYPE"):
+            PipelineConfig.from_env()
+
+    def test_all_purview_config_set_succeeds(self, monkeypatch):
+        from main import PipelineConfig
+        self._set_purview_env(monkeypatch)
+        config = PipelineConfig.from_env()
+        assert config.purview_account_name == "my-purview"
+        assert config.purview_must_anonymize_type == "MUST_ANONYMIZE"
+
+    def test_no_purview_account_no_validation(self, monkeypatch):
+        """When PURVIEW_ACCOUNT_NAME is absent, credential vars are not required."""
+        from main import PipelineConfig
+        monkeypatch.delenv("PURVIEW_ACCOUNT_NAME", raising=False)
+        monkeypatch.delenv("PURVIEW_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PURVIEW_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("PURVIEW_MUST_ANONYMIZE_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+        assert config.purview_account_name is None
+        assert config.purview_must_anonymize_type is None
+
+    def test_db_override_wins_for_must_anonymize_type(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "ENV_TYPE")
+        config = PipelineConfig.from_env(
+            config_overrides={
+                "PURVIEW_ACCOUNT_NAME": "my-purview",
+                "PURVIEW_MUST_ANONYMIZE_TYPE": "DB_TYPE",
+            }
+        )
+        assert config.purview_must_anonymize_type == "DB_TYPE"
+
+    def test_classify_pii_columns_accepts_purview_kwargs(self, monkeypatch):
+        """classify_pii_columns accepts purview_classifications (list form) and
+        purview_must_anonymize_type and correctly assigns ACTION_REDACT."""
+        import polars as pl
+        from app.domain.classification import classify_pii_columns, ACTION_REDACT
+
+        df = pl.DataFrame({"secret": ["a", "b"], "name": ["Alice", "Bob"]})
+        policies = classify_pii_columns(
+            df,
+            purview_classifications={"secret": ["MUST_ANONYMIZE"]},
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+            similarity_models={},
+        )
+        assert "secret" in policies
+        assert policies["secret"].action == ACTION_REDACT
+        assert policies["secret"].source == "purview"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime table targets (pii_table_targets)
 # ─────────────────────────────────────────────────────────────────────────────
