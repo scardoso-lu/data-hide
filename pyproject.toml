@@ -20,15 +20,26 @@ dependencies = [
     # Azure Key Vault — RSA-bound pseudonymization of identifier columns
     "azure-keyvault-keys>=4.9.0,<5.0.0",
 
-    # Microsoft Purview — column-classification metadata via the official SDK
-    "azure-purview-catalog>=0.2.0,<1.0.0",
+    # Microsoft Purview — column-classification metadata via the official SDK.
+    # The SDK has only ever shipped pre-releases (1.0.0b1–b4); naming the
+    # pre-release floor explicitly opts uv/pip into resolving it.  Code is
+    # written against the b4 surface (entity.get_by_unique_attributes).
+    "azure-purview-catalog>=1.0.0b4,<2.0.0",
 
     # Delta Lake (delta-rs, no PySpark required)
     "deltalake>=0.18.0,<1.0.0",
 
-    # Data manipulation
-    "pandas>=2.1.0,<3.0.0",
+    # Data manipulation — Polars is the pipeline's DataFrame library end to
+    # end (read → classify → anonymize → write).  Arrow-backed strings use
+    # 3-5× less RAM than pandas object dtype for string-heavy PII tables.
+    "polars>=1.0.0,<2.0.0",
     "pyarrow>=15.0.0,<20.0.0",
+
+    # pandas remains ONLY as the presidio-structured boundary: Tier B1 of the
+    # column classifier converts a 500-row sample via df.to_pandas() because
+    # presidio-structured ships exclusively a PandasAnalysisBuilder.  No other
+    # module may import pandas.
+    "pandas>=2.1.0,<3.0.0",
 
     # Microsoft Presidio — PII detection (anonymizer not needed; tokens applied inline)
     "presidio-analyzer>=2.2.354,<3.0.0",

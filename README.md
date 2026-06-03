@@ -117,7 +117,7 @@ Edit `.env` with your values:
 | `SEMANTIC_SIMILARITY_THRESHOLD` | No (default `0.55`) | Token-level cosine threshold for the semantic Art. 9 / Art. 10 recognizer. |
 | `ENABLE_FUZZY_TYPO_MATCH` | No (default `0`) | Opt-in rapidfuzz fuzzy matcher for any remaining deny-list recognizers. The semantic recognizer has its own fuzzy fallback (always on) — this flag is only relevant if you re-introduce deny-list-based custom recognizers. |
 | `ANONYMIZATION_REGIONS` | No (default `all`) | Comma-separated regions to enable national-ID detection for (`us`, `eu`, `uk`). `eu` drops US-only entities. |
-| `SPACY_MODEL_EN` / `_FR` / `_DE` / `_LB` | No | Per-language spaCy model overrides. Default is `en_core_web_lg`, `fr_core_news_lg`, `de_core_news_lg`, `de_core_news_lg` (Luxembourgish uses the German model — no dedicated `_lg` exists). Override with smaller `_sm` or `_md` for low-resource environments. |
+| `SPACY_MODEL_EN` / `_FR` / `_DE` / `_LB` | No | Per-language spaCy model overrides. Default is `en_core_web_lg`, `fr_core_news_lg`, `de_core_news_lg`, `de_core_news_lg` (Luxembourgish uses the German model — no dedicated model exists). Overriding to `_md` saves ~800 MB peak RSS but fails 12 protected detection cases (semantic recognizer thresholds are tuned to `_lg` vectors) — only use in deployments that accept the recall loss. |
 
 OneLake URI format:
 ```

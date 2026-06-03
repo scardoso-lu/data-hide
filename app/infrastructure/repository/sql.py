@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import struct
 
-import pandas as pd
+import polars as pl
 
 from ._utils import _looks_temporal_by_name, read_cutoff_ts
 
@@ -91,7 +91,22 @@ def read_sql_table(
     sql_endpoint: str,
     database: str,
     schema: str = "dbo",
-) -> pd.DataFrame:
+    limit: int | None = None,
+) -> pl.DataFrame:
+    """Read a Fabric SQL endpoint table.  ``limit`` caps the row count
+    (used by the classification sample pass — TOP is pushed to the server)."""
+    if limit is not None:
+        conn = _sql_connection(sql_endpoint, database)
+        try:
+            cursor = conn.cursor()
+            table_ref = f"{_quote_tsql_ident(schema)}.{_quote_tsql_ident(table_name)}"
+            cursor.execute(f"SELECT TOP ({int(limit)}) * FROM {table_ref}")
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return pl.DataFrame([tuple(r) for r in rows], schema=columns, orient="row", strict=False)
+        finally:
+            conn.close()
+
     cutoff = read_cutoff_ts()
     sql_cutoff = cutoff.replace(tzinfo=None)
     logger.info(
@@ -124,6 +139,8 @@ def read_sql_table(
             cursor.execute(f"SELECT * FROM {table_ref}")
             rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
-        return pd.DataFrame.from_records(rows, columns=columns)
+        # pyodbc returns Row objects; Polars wants plain sequences.
+        data = [tuple(row) for row in rows]
+        return pl.DataFrame(data, schema=columns, orient="row", strict=False)
     finally:
         conn.close()

@@ -9,6 +9,7 @@ import sys
 from importlib import invalidate_caches
 from importlib.util import find_spec
 
+from . import health
 from .infrastructure import repository as _repository
 from .application import pipeline as _service
 from .domain.aggregation import aggregate_gps_table, detect_speed_column
@@ -50,6 +51,7 @@ from .infrastructure.repository import (
     connect_audit_db,
     discover_table_mappings,
     read_delta,
+    read_delta_sample,
     read_sql_table,
     write_delta,
 )
@@ -117,17 +119,27 @@ def _download_spacy_model(model: str, models_dir: str) -> None:
     )
 
 
-def build_engines():
+def build_engines(languages: tuple[str, ...] | None = None):
+    # All models are downloaded regardless of the engine's language subset —
+    # the Tier B2 sequential walk in app.domain.classification loads each
+    # language's model on demand and expects them to be installed.
     _ensure_spacy_models()
-    return _build_engines()
+    return _build_engines(languages)
 
 
 def main() -> None:
+    # Probe server first: liveness answers as soon as the process can serve
+    # HTTP, and the startup probe passes once bootstrap (the heavy module
+    # imports above plus this wiring) is complete.
+    health.start_health_server()
+    health.mark_started()
+
     _repository.DefaultAzureCredential = DefaultAzureCredential
     _repository.DeltaTable = DeltaTable
     _service.connect_audit_db = connect_audit_db
     _service.discover_table_mappings = discover_table_mappings
     _service.read_delta = read_delta
+    _service.read_delta_sample = read_delta_sample
     _service.read_sql_table = read_sql_table
     _service.write_delta = write_delta
     _service.run_purview_check = run_purview_check
@@ -145,7 +157,12 @@ def main() -> None:
     _service.pseudonymize_identifier_columns = pseudonymize_identifier_columns
     _service.build_pseudonymizer_from_env = build_pseudonymizer_from_env
     _service.enforce_k_anonymity = enforce_k_anonymity
-    run_pipeline()  # connects to DB first, then calls PipelineConfig.from_env_and_db()
+
+    health.mark_ready()
+    try:
+        run_pipeline()  # connects to DB first, then calls PipelineConfig.from_env_and_db()
+    finally:
+        health.mark_not_ready()
 
 
 def run_purview_check(source_uri: str, df_columns: list[str], purview_account: str | None) -> dict:

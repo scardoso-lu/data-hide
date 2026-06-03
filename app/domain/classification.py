@@ -1,4 +1,10 @@
-"""Column classification helpers for GDPR-oriented anonymization."""
+"""Column classification helpers for GDPR-oriented anonymization.
+
+Polars-native: every function in this module accepts and returns
+``polars.DataFrame`` / ``polars.Series``.  pandas appears at exactly one
+boundary — the 500-row sample handed to presidio-structured (Tier B1),
+which only ships a pandas builder.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,7 @@ import os
 import re
 from typing import Any, Iterable
 
-import pandas as pd
+import polars as pl
 
 
 IDENTIFIER = "IDENTIFIER"
@@ -64,11 +70,11 @@ class ColumnPolicy:
     score: float
 
 
-# Per-entity seed phrases in each supported language.  spaCy `_lg` models hold
-# 300-dim GloVe vectors in their own language; classification iterates over
-# all four models and takes the highest similarity, so a column called
-# "prenom" matches PERSON via the French model and "Vorname" matches via the
-# German model — without any column-name list.
+# Per-entity seed phrases in each supported language.  spaCy models hold
+# word vectors in their own language; classification iterates over all four
+# models and takes the highest similarity, so a column called "prenom"
+# matches PERSON via the French model and "Vorname" matches via the German
+# model — without any column-name list.
 CONCEPT_SEEDS: dict[str, dict[str, str]] = {
     "PERSON": {
         "en": "person name",
@@ -264,20 +270,47 @@ _TIMESTAMP_NAME_TOKENS = frozenset({
 })
 
 
-def _is_text_column(dtype) -> bool:
-    return pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype)
+def _is_text_column(dtype: pl.DataType) -> bool:
+    """String columns plus Object columns (heterogeneous Python values)."""
+    return dtype == pl.String or dtype == pl.Object
+
+
+def _is_temporal_dtype(dtype: pl.DataType) -> bool:
+    return isinstance(dtype, pl.Datetime) or dtype == pl.Date
+
+
+def _is_null_value(v: object) -> bool:
+    return v is None or (isinstance(v, float) and math.isnan(v))
 
 
 def _tokens(name: str) -> list[str]:
     return [t for t in re.split(r"[^a-zA-Z0-9]+", name.lower()) if t]
 
 
-def _sample(series: pd.Series, limit: int = 100) -> list[object]:
-    return [v for v in series.dropna().head(limit).tolist()]
+def _sample(series: pl.Series, limit: int = 100) -> list[object]:
+    return series.drop_nulls().head(limit).to_list()
+
+
+def _parse_datetime_ratio(values: list[object]) -> float:
+    """Fraction of values that parse as a datetime (lenient, dateutil-based)."""
+    from dateutil import parser as _date_parser
+
+    if not values:
+        return 0.0
+    parsed = 0
+    for v in values:
+        if not isinstance(v, str) or not v.strip():
+            continue
+        try:
+            _date_parser.parse(v)
+            parsed += 1
+        except (ValueError, OverflowError, TypeError):
+            continue
+    return parsed / len(values)
 
 
 def _unique_ratio(values: Iterable[object]) -> float:
-    vals = [str(v) for v in values if not pd.isna(v)]
+    vals = [str(v) for v in values if not _is_null_value(v)]
     if not vals:
         return 0.0
     return len(set(vals)) / len(vals)
@@ -305,17 +338,18 @@ def _looks_like_free_text(values: list[object]) -> bool:
     return avg_len >= 32 or avg_words >= 5 or jsonish >= 0.5
 
 
-def _looks_like_quasi_identifier(series: pd.Series, values: list[object]) -> bool:
+def _looks_like_quasi_identifier(series: pl.Series, values: list[object]) -> bool:
     if not values:
         return False
     ratio = _unique_ratio(values)
-    if pd.api.types.is_datetime64_any_dtype(series.dtype):
+    if _is_temporal_dtype(series.dtype):
         return True
-    if pd.api.types.is_numeric_dtype(series.dtype):
-        numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
-        if numeric.empty:
+    if series.dtype.is_numeric():
+        numeric = [float(v) for v in values if not _is_null_value(v)]
+        if not numeric:
             return False
-        return ratio <= 0.4 and numeric.between(0, 130).mean() >= 0.8
+        in_range = sum(1 for v in numeric if 0 <= v <= 130) / len(numeric)
+        return ratio <= 0.4 and in_range >= 0.8
     return 0 < ratio <= 0.35
 
 
@@ -333,7 +367,7 @@ class ColumnClassifier:
     text shape so it can adapt to new enterprise schemas.
     """
 
-    def classify(self, df: pd.DataFrame) -> list[ColumnProfile]:
+    def classify(self, df: pl.DataFrame) -> list[ColumnProfile]:
         profiles: list[ColumnProfile] = []
         for col in df.columns:
             series = df[col]
@@ -364,10 +398,10 @@ class ColumnClassifier:
         return id_token or id_suffix or _looks_like_identifier_values(values)
 
     @staticmethod
-    def _is_sensitive_shape(series: pd.Series, values: list[object]) -> bool:
+    def _is_sensitive_shape(series: pl.Series, values: list[object]) -> bool:
         if not values:
             return False
-        if pd.api.types.is_bool_dtype(series.dtype):
+        if series.dtype == pl.Boolean:
             return False
         non_null = len(values)
         unique = len({str(v) for v in values})
@@ -381,31 +415,31 @@ class ColumnClassifier:
         return unique <= max(8, non_null * 0.2) and entropy > 0 and non_null >= 5
 
 
-def classify_columns(df: pd.DataFrame) -> list[ColumnProfile]:
+def classify_columns(df: pl.DataFrame) -> list[ColumnProfile]:
     return ColumnClassifier().classify(df)
 
 
-def columns_by_category(df: pd.DataFrame, category: str) -> list[str]:
+def columns_by_category(df: pl.DataFrame, category: str) -> list[str]:
     return [p.name for p in classify_columns(df) if category in p.categories]
 
 
-def flag_free_text_columns(df: pd.DataFrame) -> list[str]:
+def flag_free_text_columns(df: pl.DataFrame) -> list[str]:
     return columns_by_category(df, FREE_TEXT)
 
 
-def detect_quasi_identifiers(df: pd.DataFrame, explicit_cols: list[str] | None = None) -> list[str]:
+def detect_quasi_identifiers(df: pl.DataFrame, explicit_cols: list[str] | None = None) -> list[str]:
     if explicit_cols:
         return [c for c in explicit_cols if c in df.columns]
     return columns_by_category(df, QUASI_IDENTIFIER)
 
 
-def detect_identifier_columns(df: pd.DataFrame, explicit_cols: list[str] | None = None) -> list[str]:
+def detect_identifier_columns(df: pl.DataFrame, explicit_cols: list[str] | None = None) -> list[str]:
     if explicit_cols:
         return [c for c in explicit_cols if c in df.columns]
     return columns_by_category(df, IDENTIFIER)
 
 
-def has_tracking_columns(df: pd.DataFrame, gps_cols: list[str] | None = None) -> bool:
+def has_tracking_columns(df: pl.DataFrame, gps_cols: list[str] | None = None) -> bool:
     """Return True when the DataFrame looks like a tracking table.
 
     K-anonymity is only meaningful for tables that contain location or network
@@ -426,7 +460,7 @@ def has_tracking_columns(df: pd.DataFrame, gps_cols: list[str] | None = None) ->
     return False
 
 
-def detect_gps_columns(df: pd.DataFrame) -> list[str]:
+def detect_gps_columns(df: pl.DataFrame) -> list[str]:
     """Return column names that contain GPS coordinates (numeric lat/lon or WKT POINT strings).
 
     A numeric column qualifies when its name contains a GPS keyword and all
@@ -442,29 +476,40 @@ def detect_gps_columns(df: pd.DataFrame) -> list[str]:
     return result
 
 
-def _is_numeric_gps_column(series: pd.Series, tokens: set[str]) -> bool:
+def _is_numeric_gps_column(series: pl.Series, tokens: set[str]) -> bool:
     if not (tokens & _GPS_NAME_TOKENS):
         return False
-    non_null = series.dropna()
-    if non_null.empty:
+    non_null = series.drop_nulls()
+    if len(non_null) == 0:
         return False
-    numeric = pd.to_numeric(non_null, errors="coerce")
-    if numeric.isna().any():
+    try:
+        if series.dtype == pl.Object:
+            values = [float(v) for v in non_null.to_list()]
+        elif series.dtype == pl.String:
+            cast = non_null.cast(pl.Float64, strict=False)
+            if cast.null_count() > 0:
+                return False
+            values = cast.to_list()
+        elif series.dtype.is_numeric():
+            values = non_null.cast(pl.Float64).to_list()
+        else:
+            return False
+    except (ValueError, TypeError):
         return False
-    return bool(numeric.between(-180, 180).all())
+    return all(-180 <= v <= 180 for v in values)
 
 
-def detect_timestamp_columns(df: pd.DataFrame) -> list[str]:
+def detect_timestamp_columns(df: pl.DataFrame) -> list[str]:
     """Return column names that contain timestamps or dates.
 
-    A datetime64 column always qualifies.  A string/object column qualifies
-    when its name contains a timestamp keyword and ≥80 % of the non-null
-    sample parses as a datetime.
+    A temporal (Datetime/Date) column always qualifies.  A string/object
+    column qualifies when its name contains a timestamp keyword and ≥80 % of
+    the non-null sample parses as a datetime.
     """
     result: list[str] = []
     for col in df.columns:
         series = df[col]
-        if pd.api.types.is_datetime64_any_dtype(series.dtype):
+        if _is_temporal_dtype(series.dtype):
             result.append(col)
             continue
         if not _is_text_column(series.dtype):
@@ -472,22 +517,18 @@ def detect_timestamp_columns(df: pd.DataFrame) -> list[str]:
         tokens = set(_tokens(str(col)))
         if not (tokens & _TIMESTAMP_NAME_TOKENS):
             continue
-        sample = series.dropna().head(20)
-        if sample.empty:
+        sample = _sample(series, limit=20)
+        if not sample:
             continue
-        try:
-            parsed = pd.to_datetime(sample, errors="coerce")
-            if parsed.notna().mean() >= 0.8:
-                result.append(col)
-        except Exception:
-            pass
+        if _parse_datetime_ratio(sample) >= 0.8:
+            result.append(col)
     return result
 
 
-def _is_wkt_gps_column(series: pd.Series) -> bool:
+def _is_wkt_gps_column(series: pl.Series) -> bool:
     if not _is_text_column(series.dtype):
         return False
-    sample = [v for v in series.dropna().head(20).tolist() if isinstance(v, str)]
+    sample = [v for v in _sample(series, limit=20) if isinstance(v, str)]
     if not sample:
         return False
     matches = sum(1 for v in sample if _WKT_POINT_RE.match(v.strip()))
@@ -543,16 +584,78 @@ def _normalise_column_name(name: str) -> str:
     return cleaned
 
 
-# Module-level cache so the four spaCy `_lg` models — each ~600MB — are
-# loaded exactly once per process.  Calling `classify_pii_columns()`
-# repeatedly (e.g. one call per Delta table in a multi-table run) reuses
-# the same `nlp` objects instead of re-instantiating them.
+# Module-level cache so the spaCy models are loaded exactly once per process.
+# Calling `classify_pii_columns()` repeatedly (e.g. one call per Delta table
+# in a multi-table run) reuses the same `nlp` objects instead of
+# re-instantiating them.
 _SIMILARITY_MODEL_CACHE: dict[frozenset, dict[str, Any]] = {}
+
+# Single-resident slot for the sequential Tier B2 walk: (model_name, nlp).
+# Holding at most ONE extra spaCy model at a time caps peak RSS — the
+# previous model is dereferenced (and gc'd) before the next one loads.
+_SEQUENTIAL_MODEL_SLOT: list = [None]
+
+
+def _models_from_analyzer(analyzer: Any) -> dict[str, Any]:
+    """Extract the already-loaded spaCy pipelines from a Presidio analyzer.
+
+    Presidio's ``SpacyNlpEngine`` keeps its models in ``nlp_engine.nlp``
+    (``{lang_code: spacy.Language}``).  Reusing them for Tier B2 embedding
+    similarity avoids loading a SECOND copy of each model via
+    ``spacy.load`` — previously the single largest memory cost of the
+    pipeline (every model resident twice).
+    """
+    try:
+        nlp_map = getattr(getattr(analyzer, "nlp_engine", None), "nlp", None)
+        if isinstance(nlp_map, dict) and nlp_map:
+            return dict(nlp_map)
+    except Exception:
+        pass
+    return {}
+
+
+def _sequential_model_for(lang: str) -> Any | None:
+    """Load one language's spaCy model into the single-resident slot.
+
+    Returns the model, or None when loading fails (Tier B2 then simply skips
+    that language).  Requesting a different model releases the previous one
+    first, so at most one sequentially-loaded model is resident at any time.
+    """
+    from .anonymization import SPACY_MODELS
+
+    model_name = SPACY_MODELS.get(lang)
+    if not model_name:
+        return None
+    slot = _SEQUENTIAL_MODEL_SLOT[0]
+    if slot is not None and slot[0] == model_name:
+        return slot[1]
+    # Release the previous model BEFORE loading the next so the two never
+    # coexist in memory; trim so the freed pages leave RSS too.
+    _SEQUENTIAL_MODEL_SLOT[0] = None
+    import gc
+    gc.collect()
+    from .anonymization import _trim_native_heap
+    _trim_native_heap()
+    try:
+        import spacy
+        nlp = spacy.load(model_name)
+    except Exception:
+        return None
+    _SEQUENTIAL_MODEL_SLOT[0] = (model_name, nlp)
+    return nlp
+
+
+def release_sequential_model() -> None:
+    """Free the single-resident Tier B2 model (called between tables/runs)."""
+    _SEQUENTIAL_MODEL_SLOT[0] = None
+    import gc
+    gc.collect()
+    from .anonymization import _trim_native_heap
+    _trim_native_heap()
 
 
 def _load_similarity_models(supported_languages: Iterable[str] | None = None) -> dict[str, Any]:
-    """Load (and cache) each language's spaCy `_lg` model for embedding
-    similarity.
+    """Load (and cache) each language's spaCy model for embedding similarity.
 
     Imports happen inside the function so that environments without spaCy
     (e.g. unit-test runs with the FakeAnalyzer) don't fail at import time.
@@ -649,7 +752,7 @@ def _best_entity_for_column_name(
 
 
 def _tier_a_purview(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     purview_classifications: dict[str, str] | None,
     policies: dict[str, ColumnPolicy],
 ) -> None:
@@ -666,7 +769,7 @@ def _tier_a_purview(
         policies[column] = _make_policy(column, entity, source="purview", score=1.0)
 
 
-def _tier_a1_name_pattern(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
+def _tier_a1_name_pattern(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
     """Pin identifier-named columns to ACTION_HASH before value-sampling tiers run.
 
     Presidio-structured (Tier B1) and spaCy embedding (Tier B2) both look at
@@ -693,7 +796,7 @@ def _tier_a1_name_pattern(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -
     for column in df.columns:
         if column in policies:
             continue
-        if not _is_text_column(df[column].dtype):
+        if not _is_text_column(df.schema[column]):
             continue
         tokens = _tokens(str(column))
         if not tokens:
@@ -711,7 +814,7 @@ def _tier_a1_name_pattern(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -
 
 
 def _tier_b1_presidio_structured(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     analyzer: Any | None,
     policies: dict[str, ColumnPolicy],
     enabled: bool,
@@ -723,7 +826,7 @@ def _tier_b1_presidio_structured(
         return
     candidate_cols = [
         c for c in df.columns
-        if c not in policies and _is_text_column(df[c].dtype)
+        if c not in policies and _is_text_column(df.schema[c])
     ]
     if not candidate_cols:
         return
@@ -734,7 +837,12 @@ def _tier_b1_presidio_structured(
     try:
         from presidio_structured import PandasAnalysisBuilder
         builder = PandasAnalysisBuilder(analyzer=analyzer)
-        analysis = builder.generate_analysis(df[candidate_cols].head(_TIER_B1_SAMPLE_ROWS))
+        # presidio-structured only ships a pandas builder — this is the single
+        # pandas boundary in the module.  500 rows: the conversion is
+        # negligible.  astype(object) matches the input shape the library is
+        # exercised against upstream.
+        sample = df.select(candidate_cols).head(_TIER_B1_SAMPLE_ROWS).to_pandas().astype(object)
+        analysis = builder.generate_analysis(sample)
     except Exception:
         return  # log path — caller wraps this in a logger.warning if desired
     for column, entity in (analysis.entity_mapping or {}).items():
@@ -745,20 +853,58 @@ def _tier_b1_presidio_structured(
         )
 
 
+def _score_columns_for_language(
+    columns: list[str],
+    lang: str,
+    nlp: Any,
+    best: dict[str, tuple[str | None, float]],
+) -> None:
+    """Score every candidate column name against ``lang``'s seeds with one
+    model, updating the running per-column best.  Same-language comparison
+    only — see `_best_entity_for_column_name` for the rationale."""
+    for column in columns:
+        entity, score = _best_entity_for_column_name(column, {lang: nlp})
+        prev_entity, prev_score = best.get(column, (None, 0.0))
+        if entity is not None and score > prev_score:
+            best[column] = (entity, score)
+
+
 def _tier_b2_embedding(
-    df: pd.DataFrame,
-    similarity_models: dict[str, Any],
+    df: pl.DataFrame,
+    similarity_models: dict[str, Any] | None,
     threshold: float,
     policies: dict[str, ColumnPolicy],
+    *,
+    sequential_languages: list[str] | None = None,
 ) -> None:
     """spaCy embedding similarity between each unclassified column name and
-    every CONCEPT_SEEDS entry, across every loaded language."""
-    if not similarity_models:
+    every CONCEPT_SEEDS entry, across every supported language.
+
+    Memory model: languages whose models are already resident (passed in
+    ``similarity_models``, e.g. extracted from the analyzer) are scored
+    first.  The remaining ``sequential_languages`` are walked ONE MODEL AT A
+    TIME through the single-resident slot — load, score all columns,
+    release, next — so peak RSS never holds more than one extra model.
+    """
+    candidates = [
+        c for c in df.columns
+        if c not in policies and _is_text_column(df.schema[c])
+    ]
+    if not candidates:
         return
-    for column in df.columns:
-        if column in policies or not _is_text_column(df[column].dtype):
+
+    best: dict[str, tuple[str | None, float]] = {}
+
+    for lang, nlp in (similarity_models or {}).items():
+        _score_columns_for_language(candidates, lang, nlp, best)
+
+    for lang in (sequential_languages or []):
+        nlp = _sequential_model_for(lang)
+        if nlp is None:
             continue
-        entity, score = _best_entity_for_column_name(column, similarity_models)
+        _score_columns_for_language(candidates, lang, nlp, best)
+
+    for column, (entity, score) in best.items():
         if entity is None or score < threshold:
             continue
         policies[column] = _make_policy(
@@ -766,7 +912,7 @@ def _tier_b2_embedding(
         )
 
 
-def _tier_c_fallback(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
+def _tier_c_fallback(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
     """Unclassified text columns get a FREE_TEXT fallback policy.
 
     Columns whose sampled values look like free text (long strings, many
@@ -776,7 +922,7 @@ def _tier_c_fallback(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> Non
     row-by-row scan — Presidio would find nothing useful there anyway.
     """
     for column in df.columns:
-        if column in policies or not _is_text_column(df[column].dtype):
+        if column in policies or not _is_text_column(df.schema[column]):
             continue
         action = ACTION_SCAN if _looks_like_free_text(_sample(df[column])) else ACTION_BIN
         policies[column] = ColumnPolicy(
@@ -789,7 +935,7 @@ def _tier_c_fallback(df: pd.DataFrame, policies: dict[str, ColumnPolicy]) -> Non
 
 
 def classify_pii_columns(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     *,
     purview_classifications: dict[str, str] | None = None,
     analyzer: Any | None = None,
@@ -814,7 +960,7 @@ def classify_pii_columns(
 
     Parameters
     ----------
-    df : the source DataFrame.
+    df : the source DataFrame (Polars).
     purview_classifications : optional ``{column_name: purview_type_name}``
         mapping fetched out-of-band from Microsoft Purview.  Tier A entries
         bypass all downstream tiers (authoritative).
@@ -843,14 +989,118 @@ def classify_pii_columns(
         structured_enabled = _presidio_structured_enabled()
     _tier_b1_presidio_structured(df, analyzer, policies, structured_enabled)
 
-    if similarity_models is None:
-        similarity_models = _load_similarity_models()
     threshold = similarity_threshold if similarity_threshold is not None else _column_similarity_threshold()
-    _tier_b2_embedding(df, similarity_models, threshold, policies)
+    if similarity_models is not None:
+        # Caller-supplied models (tests, custom deployments): use as-is.
+        _tier_b2_embedding(df, similarity_models, threshold, policies)
+    else:
+        # Default path: reuse whatever models the analyzer already has
+        # resident (zero extra memory), then cover the remaining languages
+        # sequentially — one model at a time through the single-resident
+        # slot.  This replaces the old behaviour of spacy.load-ing a SECOND
+        # copy of every model into _SIMILARITY_MODEL_CACHE.
+        from .anonymization import SPACY_MODELS, SUPPORTED_LANGUAGES
+
+        resident = _models_from_analyzer(analyzer)
+        seen_models = {SPACY_MODELS.get(lang) for lang in resident}
+        missing: list[str] = []
+        for lang in SUPPORTED_LANGUAGES:
+            model_name = SPACY_MODELS.get(lang)
+            if lang in resident or model_name in seen_models:
+                continue  # model already covered (e.g. lb shares de's model)
+            seen_models.add(model_name)
+            missing.append(lang)
+        _tier_b2_embedding(
+            df, resident, threshold, policies, sequential_languages=missing,
+        )
 
     _tier_c_fallback(df, policies)
 
     return policies
+
+
+def classify_pii_columns_multi_pass(
+    samples: list[pl.DataFrame],
+    *,
+    analyzer: Any,
+    similarity_threshold: float | None = None,
+    structured_enabled: bool | None = None,
+) -> list[dict[str, ColumnPolicy]]:
+    """Language-major classification across MANY tables at once.
+
+    Memory contract: at most ONE spaCy model is resident at any moment.
+
+    Pass structure::
+
+        EN pass   — the (English-only) analyzer runs Tier A1 + B1 + B2(en)
+                    for every sample, then the caller releases the engine.
+        FR pass   — the French model loads once, scores every sample's
+                    unclassified column names, and is released.
+        DE pass   — same (Luxembourgish shares the German model).
+        Commit    — per table: best B2 score across all passes is applied,
+                    then the Tier C fallback runs (no model needed).
+
+    ``samples`` are small per-table head frames (≤500 rows) — classification
+    never needs the full table.  Returns one policy dict per input sample,
+    in order.  Per-table tier failures are non-fatal (empty policies for
+    that table), matching the single-table classifier's behaviour in the
+    pipeline.
+    """
+    from .anonymization import SPACY_MODELS, SUPPORTED_LANGUAGES
+
+    if structured_enabled is None:
+        structured_enabled = _presidio_structured_enabled()
+    threshold = (
+        similarity_threshold if similarity_threshold is not None
+        else _column_similarity_threshold()
+    )
+
+    policies_per_table: list[dict[str, ColumnPolicy]] = [{} for _ in samples]
+    b2_best_per_table: list[dict[str, tuple[str | None, float]]] = [{} for _ in samples]
+
+    def _candidates(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> list[str]:
+        return [c for c in df.columns if c not in policies and _is_text_column(df.schema[c])]
+
+    # ── EN pass: A1 + B1 (analyzer) + B2 with the analyzer's own EN model ──
+    resident = _models_from_analyzer(analyzer)
+    for i, df in enumerate(samples):
+        try:
+            _tier_a1_name_pattern(df, policies_per_table[i])
+            _tier_b1_presidio_structured(df, analyzer, policies_per_table[i], structured_enabled)
+            for lang, nlp in resident.items():
+                _score_columns_for_language(
+                    _candidates(df, policies_per_table[i]), lang, nlp, b2_best_per_table[i],
+                )
+        except Exception:  # pragma: no cover — defensive, mirrors pipeline's non-fatal handling
+            continue
+    covered_models = {SPACY_MODELS.get(lang) for lang in resident}
+
+    # ── Remaining language passes: one model resident at a time ───────────
+    for lang in SUPPORTED_LANGUAGES:
+        model_name = SPACY_MODELS.get(lang)
+        if lang in resident or model_name in covered_models:
+            continue
+        covered_models.add(model_name)
+        nlp = _sequential_model_for(lang)
+        if nlp is None:
+            continue
+        for i, df in enumerate(samples):
+            _score_columns_for_language(
+                _candidates(df, policies_per_table[i]), lang, nlp, b2_best_per_table[i],
+            )
+    release_sequential_model()
+
+    # ── Commit B2 winners, then the model-free Tier C fallback ────────────
+    for i, df in enumerate(samples):
+        for column, (entity, score) in b2_best_per_table[i].items():
+            if entity is None or score < threshold or column in policies_per_table[i]:
+                continue
+            policies_per_table[i][column] = _make_policy(
+                column, entity, source="embedding_similarity", score=score,
+            )
+        _tier_c_fallback(df, policies_per_table[i])
+
+    return policies_per_table
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -862,13 +1112,13 @@ REDACTED_SENTINEL = "[REDACTED]"
 
 
 def apply_column_policies(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     policies: dict[str, ColumnPolicy],
     *,
     registry: Any | None = None,
     pseudonymizer: Any | None = None,
     inplace: bool = False,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pl.DataFrame, dict]:
     """Apply each `ColumnPolicy`'s action to every non-null cell in its column.
 
     ``ACTION_HASH``      → ``pseudonymizer(value)``     (deterministic, joinable)
@@ -877,7 +1127,7 @@ def apply_column_policies(
     ``ACTION_BIN``       → no-op (deferred to existing binning layers)
     ``ACTION_SCAN``      → no-op (deferred to row-by-row Presidio scan)
 
-    Returns a fresh DataFrame plus a stats dict::
+    Returns a new DataFrame plus a stats dict::
 
         {
           "columns_processed": [list of column names actually mutated],
@@ -890,11 +1140,11 @@ def apply_column_policies(
     The stats dict is intended for the audit log so an operator can verify
     which classifier tier acted on which column.
 
-    The DataFrame is copied before mutation so callers can keep the original.
-    Pass ``inplace=True`` to skip the copy when the caller transfers ownership.
+    Polars frames are persistent structures — ``with_columns`` returns a new
+    frame that shares the unchanged column buffers, so no defensive copy is
+    needed.  ``inplace`` is accepted for caller compatibility and ignored.
     """
-    if not inplace:
-        df = df.copy()
+    del inplace  # Polars frames never mutate the caller's frame
     stats = {
         "columns_processed": [],
         "actions_applied": {},
@@ -922,7 +1172,7 @@ def apply_column_policies(
             stats["skipped_columns"][column] = "missing_registry"
             continue
 
-        mutated = _apply_one_policy(df, column, policy, registry, pseudonymizer)
+        df, mutated = _apply_one_policy(df, column, policy, registry, pseudonymizer)
         if mutated == 0:
             stats["skipped_columns"][column] = "no_non_null_values"
             continue
@@ -936,29 +1186,36 @@ def apply_column_policies(
 
 
 def _apply_one_policy(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     column: str,
     policy: ColumnPolicy,
     registry: Any | None,
     pseudonymizer: Any | None,
-) -> int:
-    """In-place mask of one column according to its policy.  Returns the
-    number of cells mutated (non-null inputs)."""
+) -> tuple[pl.DataFrame, int]:
+    """Mask one column according to its policy.  Returns the new frame and the
+    number of cells mutated (non-null inputs).  All three actions write string
+    tokens, so the column dtype becomes String."""
     series = df[column]
-    mask = series.notna()
-    if not mask.any():
-        return 0
+    mutated = len(series) - series.null_count()
+    if mutated == 0:
+        return df, 0
 
     if policy.action == ACTION_HASH:
-        df.loc[mask, column] = series.loc[mask].map(pseudonymizer)
+        new = series.map_elements(pseudonymizer, return_dtype=pl.String, skip_nulls=True)
     elif policy.action == ACTION_TOKENIZE:
-        df.loc[mask, column] = series.loc[mask].map(
-            lambda v, e=policy.entity_type: registry.token_for(e, str(v))
+        new = series.map_elements(
+            lambda v, e=policy.entity_type: registry.token_for(e, str(v)),
+            return_dtype=pl.String,
+            skip_nulls=True,
         )
     elif policy.action == ACTION_REDACT:
-        df.loc[mask, column] = REDACTED_SENTINEL
+        new = series.map_elements(
+            lambda _v: REDACTED_SENTINEL, return_dtype=pl.String, skip_nulls=True,
+        )
+    else:  # pragma: no cover — callers filter BIN/SCAN before this point
+        return df, 0
 
-    return int(mask.sum())
+    return df.with_columns(new.alias(column)), mutated
 
 
 def free_text_columns_from_policies(policies: dict[str, ColumnPolicy]) -> list[str]:
@@ -978,4 +1235,3 @@ def already_masked_columns_from_policies(policies: dict[str, ColumnPolicy]) -> s
         column for column, policy in policies.items()
         if policy.action in (ACTION_HASH, ACTION_TOKENIZE, ACTION_REDACT)
     }
-

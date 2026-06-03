@@ -1,9 +1,17 @@
-"""GDPR-oriented anonymization and privacy transformations."""
+"""GDPR-oriented anonymization and privacy transformations.
+
+Polars-native: every DataFrame-level function in this module accepts and
+returns ``polars.DataFrame``.  Cell-level helpers (``_anonymize_text``,
+``_anonymize_json``) operate on plain Python values and are unchanged from
+the pandas era — Presidio works one string at a time regardless of the
+frame library.
+"""
 
 from __future__ import annotations
 
 import collections
 import copy
+import math
 import os
 from decimal import Decimal
 from functools import lru_cache
@@ -13,7 +21,7 @@ import logging
 import re
 from typing import Any, Callable
 
-import pandas as pd
+import polars as pl
 
 from .classification import _is_text_column
 
@@ -21,9 +29,15 @@ from .classification import _is_text_column
 # Luxembourgish (lb) has no dedicated spaCy model; the German model is the
 # closest approximation given the linguistic relationship between the two.
 # Each language's model can be overridden at deployment time via
-# `SPACY_MODEL_<LANG>` (e.g. `SPACY_MODEL_EN=en_core_web_sm` for low-resource
-# environments).  The defaults preserve the historical behaviour the test
-# suite was built against.
+# `SPACY_MODEL_<LANG>` (e.g. `SPACY_MODEL_EN=en_core_web_md` for low-resource
+# environments — saves ~800 MB peak RSS).  The `_lg` defaults are load-bearing:
+# the semantic Art. 9/10 recognizers and the Tier B2 column classifier were
+# threshold-tuned against `_lg` GloVe vectors, and the `_md` vectors shift
+# similarity scores enough to fail 12 protected detection cases (verified
+# 2026-06-02: TRADE_UNION false positives on plain English, French DOB /
+# court-case / insurance recall losses, `description`→IDENTIFIER
+# misclassification).  Do not change these defaults without a full
+# `pytest tests/test_anonymization.py` pass on the new vectors.
 _SPACY_MODEL_DEFAULTS: dict[str, str] = {
     "en": "en_core_web_lg",
     "fr": "fr_core_news_lg",
@@ -204,6 +218,22 @@ STRUCTURED_SCALAR_RE = re.compile(r"^[A-Za-z0-9_.:/\\-]+$")
 SAFE_JSON_PATH_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
+def _is_null_value(v: object) -> bool:
+    return v is None or (isinstance(v, float) and math.isnan(v))
+
+
+def _is_scannable_dtype(dtype: pl.DataType) -> bool:
+    """Columns the cell-level scanners walk: text/object plus nested documents.
+
+    Struct and List columns carry the dict/list payloads that
+    ``_anonymize_json`` handles — in the pandas era these arrived as
+    object-dtype columns and were scanned implicitly; with Polars the nested
+    dtypes must be opted in explicitly or PII inside nested documents would
+    silently skip anonymization.
+    """
+    return _is_text_column(dtype) or isinstance(dtype, (pl.Struct, pl.List))
+
+
 @lru_cache(maxsize=50000)
 def _detect_language(text: str) -> str:
     """Return a language code from SUPPORTED_LANGUAGES; defaults to 'en' on failure."""
@@ -218,7 +248,7 @@ def _detect_language(text: str) -> str:
 _COLUMN_LANGUAGE_HOMOGENEITY_THRESHOLD = 0.8
 
 
-def _detect_column_language(series: pd.Series, n_samples: int = 20) -> str | None:
+def _detect_column_language(series: pl.Series, n_samples: int = 20) -> str | None:
     """Sample up to *n_samples* non-null strings from *series* and return the
     dominant language if ≥ 80 % of the sample agrees, otherwise ``None``.
 
@@ -303,7 +333,20 @@ def _entities_supported_in(analyzer: Any, language: str) -> list[str] | None:
 
 
 @lru_cache(maxsize=1)
-def build_engines() -> Any:
+def build_engines(languages: tuple[str, ...] | None = None) -> Any:
+    """Build a Presidio ``AnalyzerEngine``.
+
+    ``languages`` restricts the engine to a subset of ``SUPPORTED_LANGUAGES``
+    so only that subset's spaCy models are loaded.  The pipeline passes
+    ``("en",)`` — Tier B1 (presidio-structured) analyzes samples in English
+    only, so loading the French/German models into the engine would waste
+    ~1.2 GB of RSS per run.  ``None`` (the default) keeps the historical
+    full-language engine for tests and direct callers.
+
+    ``lru_cache(maxsize=1)`` doubles as a single-resident slot: requesting a
+    different language set evicts (and frees) the previous engine instead of
+    accumulating one engine per language in memory.
+    """
     from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
     from presidio_analyzer.nlp_engine import NlpEngineProvider
     from presidio_analyzer.recognizer_registry.recognizers_loader_utils import (
@@ -311,17 +354,56 @@ def build_engines() -> Any:
         RecognizerListLoader,
     )
 
+    active_languages = list(languages) if languages else list(SUPPORTED_LANGUAGES)
+    active_models = {
+        lang: model for lang, model in SPACY_MODELS.items() if lang in active_languages
+    }
+
     provider = NlpEngineProvider(nlp_configuration={
         "nlp_engine_name": "spacy",
-        "models": [{"lang_code": lang, "model_name": model} for lang, model in SPACY_MODELS.items()],
+        "models": [{"lang_code": lang, "model_name": model} for lang, model in active_models.items()],
         "ner_model_configuration": {
             "model_to_presidio_entity_mapping": SPACY_TO_PRESIDIO_ENTITY_MAPPING,
             "labels_to_ignore": SPACY_LABELS_TO_IGNORE,
         },
     })
     nlp_engine = provider.create_engine()
-    registry = _build_recognizer_registry(nlp_engine, RecognizerConfigurationLoader, RecognizerListLoader, RecognizerRegistry)
-    return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=SUPPORTED_LANGUAGES)
+    registry = _build_recognizer_registry(
+        nlp_engine, RecognizerConfigurationLoader, RecognizerListLoader, RecognizerRegistry,
+        supported_languages=active_languages,
+    )
+    import gc
+    gc.collect()  # release any engine just evicted from the lru slot
+    return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=active_languages)
+
+
+def _trim_native_heap() -> None:
+    """Ask glibc to return freed pages to the OS (Linux containers).
+
+    ``gc.collect()`` frees the Python objects, but glibc's allocator keeps
+    the pages mapped by default, so container RSS plateaus at the high-water
+    mark even though the memory is reusable.  ``malloc_trim(0)`` releases
+    them — making the per-stage RSS log lines reflect reality and giving
+    tight-memory containers the headroom back.  No-op on non-glibc platforms.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def release_engines() -> None:
+    """Free every cached AnalyzerEngine (and its spaCy models).
+
+    Called by the pipeline at the end of the English classification pass so
+    the engine's model is fully released before the next language's model
+    loads — at most one model is ever resident.
+    """
+    build_engines.cache_clear()
+    import gc
+    gc.collect()
+    _trim_native_heap()
 
 
 def _build_recognizer_registry(
@@ -329,8 +411,11 @@ def _build_recognizer_registry(
     configuration_loader: Any,
     list_loader: Any,
     registry_cls: Any,
+    supported_languages: list[str] | None = None,
 ) -> Any:
-    config = _filter_recognizer_config(configuration_loader.get(), SUPPORTED_LANGUAGES)
+    config = _filter_recognizer_config(
+        configuration_loader.get(), supported_languages or SUPPORTED_LANGUAGES,
+    )
     recognizers = list_loader.get(
         config["recognizers"],
         config["supported_languages"],
@@ -466,22 +551,41 @@ def _is_pseudonymized_text(text: str) -> bool:
     return bool(PSEUDONYM_TOKEN_RE.fullmatch(text.strip()))
 
 
+def _rebuild_column(name: str, values: list, original_dtype: pl.DataType) -> pl.Series:
+    """Build the post-anonymization replacement Series for one column.
+
+    * Object columns keep ``pl.Object`` so heterogeneous Python values
+      (ints, Decimals, tuples, dicts) survive untouched.
+    * String columns stay ``pl.String`` (masked text is still text).
+    * Struct/List columns are re-inferred from the masked dicts/lists; if
+      masking changed the shape so a common schema no longer exists, the
+      column degrades to ``pl.Object`` rather than failing the pipeline.
+    """
+    if original_dtype == pl.Object:
+        return pl.Series(name, values, dtype=pl.Object)
+    if original_dtype == pl.String:
+        return pl.Series(name, values, dtype=pl.String)
+    try:
+        return pl.Series(name, values)
+    except Exception:
+        return pl.Series(name, values, dtype=pl.Object)
+
+
 def anonymize_dataframe(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     analyzer: Any,
     registry: EntityRegistry | None = None,
     scan_columns: list[str] | None = None,
     inplace: bool = False,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pl.DataFrame, dict]:
+    del inplace  # Polars frames never mutate the caller's frame
     if registry is None:
         registry = EntityRegistry()
 
-    if not inplace:
-        df = df.copy()
     if scan_columns is not None:
-        text_cols = [c for c in scan_columns if c in df.columns and _is_text_column(df[c].dtype)]
+        text_cols = [c for c in scan_columns if c in df.columns and _is_scannable_dtype(df.schema[c])]
     else:
-        text_cols = [c for c in df.columns if _is_text_column(df[c].dtype)]
+        text_cols = [c for c in df.columns if _is_scannable_dtype(df.schema[c])]
     entity_counts: collections.Counter[str] = collections.Counter()
     cols_hit: list[str] = []
     column_stats: list[dict] = []
@@ -501,7 +605,7 @@ def anonymize_dataframe(
                 entity_counts[f.entity_type] += 1
                 col_entity_counts[f.entity_type] += 1
 
-        df[col] = new_values
+        df = df.with_columns(_rebuild_column(col, new_values, df.schema[col]))
         if col_detections:
             cols_hit.append(col)
         column_stats.append({"column": col, "detections": col_detections, "entity_counts": col_entity_counts})
@@ -569,23 +673,24 @@ def _anonymize_value(val: object, analyzer: Any, registry: EntityRegistry, langu
     return val, []
 
 
-def enforce_k_anonymity(df: pd.DataFrame, quasi_cols: list[str], k: int) -> tuple[pd.DataFrame, dict]:
+def enforce_k_anonymity(df: pl.DataFrame, quasi_cols: list[str], k: int) -> tuple[pl.DataFrame, dict]:
     if not quasi_cols:
         return df, {"suppressed_rows": 0, "k": k}
     present = [c for c in quasi_cols if c in df.columns]
     if not present:
         return df, {"suppressed_rows": 0, "k": k}
-    group_sizes = df.groupby(present, dropna=False)[present[0]].transform("count")
-    filtered = df[group_sizes >= k].reset_index(drop=True)
+    # Window count over the quasi-identifier group; nulls form their own
+    # group, matching the previous groupby(dropna=False) semantics.
+    filtered = df.filter(pl.len().over(present) >= k)
     return filtered, {"suppressed_rows": len(df) - len(filtered), "k": k}
 
 
 def pseudonymize_identifier_columns(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     id_cols: list[str],
     pseudonymizer: Callable[[object], object],
     inplace: bool = False,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pl.DataFrame, list[str]]:
     """Replace identifier values with Key Vault-bound pseudonym tokens.
 
     ``pseudonymizer`` is a callable that maps each non-null value to a
@@ -593,6 +698,7 @@ def pseudonymize_identifier_columns(
     are preserved.  Missing columns are silently skipped so callers can pass
     a superset of column names.
     """
+    del inplace  # Polars frames never mutate the caller's frame
     if not id_cols:
         return df, []
     if pseudonymizer is None:
@@ -600,13 +706,12 @@ def pseudonymize_identifier_columns(
             "pseudonymizer is required to anonymize identifier columns; "
             "configure KEY_VAULT_URL and KEY_VAULT_RSA_KEY_NAME."
         )
-    if not inplace:
-        df = df.copy()
     pseudonymized: list[str] = []
     for col in id_cols:
         if col not in df.columns:
             continue
-        df[col] = df[col].map(pseudonymizer)
+        new = df[col].map_elements(pseudonymizer, return_dtype=pl.String, skip_nulls=True)
+        df = df.with_columns(new.alias(col))
         pseudonymized.append(col)
     return df, pseudonymized
 
@@ -640,10 +745,10 @@ def _looks_like_json(s: str) -> bool:
     return bool(ch) and ch[0] in ("{", "[")
 
 
-def residual_pii_findings(df: pd.DataFrame) -> list[dict]:
+def residual_pii_findings(df: pl.DataFrame) -> list[dict]:
     findings: list[dict] = []
     for col in df.columns:
-        if not _is_text_column(df[col].dtype):
+        if not _is_scannable_dtype(df.schema[col]):
             continue
         for val in df[col]:
             if isinstance(val, (dict, list)):
@@ -743,8 +848,9 @@ def _is_structured_scalar_text(text: str) -> bool:
     except ValueError:
         pass
     try:
-        if pd.notna(pd.to_datetime(stripped, errors="coerce")):
-            return True
+        from dateutil import parser as _date_parser
+        _date_parser.parse(stripped)
+        return True
     except Exception:
         pass
     return bool(STRUCTURED_SCALAR_RE.fullmatch(stripped))
@@ -819,15 +925,24 @@ def _round_wkt(wkt: str, precision: int) -> str:
     return re.sub(r"-?\d+\.\d+", lambda m: str(round(float(m.group()), precision)), wkt)
 
 
-def _is_numeric_like_series(series: pd.Series) -> bool:
-    non_null = series.dropna()
-    if non_null.empty:
+def _is_numeric_like_series(series: pl.Series) -> bool:
+    non_null = series.drop_nulls()
+    if len(non_null) == 0:
         return False
-    return not pd.to_numeric(non_null, errors="coerce").isna().any()
+    if series.dtype == pl.String:
+        return non_null.cast(pl.Float64, strict=False).null_count() == 0
+    if series.dtype == pl.Object:
+        try:
+            for v in non_null.to_list():
+                float(v)
+            return True
+        except (ValueError, TypeError):
+            return False
+    return False
 
 
 def _round_numeric_like_value(value: object, precision: int) -> object:
-    if pd.isna(value):
+    if _is_null_value(value):
         return value
     if isinstance(value, Decimal):
         return round(float(value), precision)
@@ -845,7 +960,16 @@ def _round_numeric_like_value(value: object, precision: int) -> object:
         return value
 
 
-def anonymize_gps_columns(df: pd.DataFrame, gps_cols: list[str], precision: int = 2) -> tuple[pd.DataFrame, list[str]]:
+def _map_column_python(df: pl.DataFrame, col: str, fn: Callable[[object], object], out_dtype: pl.DataType) -> pl.DataFrame:
+    """Apply a Python function to every non-null value of one column and
+    replace it, preserving nulls.  Used where ``map_elements`` dtype handling
+    is too restrictive (Object columns, mixed return types)."""
+    values = df[col].to_list()
+    new = [fn(v) if v is not None else None for v in values]
+    return df.with_columns(pl.Series(col, new, dtype=out_dtype))
+
+
+def anonymize_gps_columns(df: pl.DataFrame, gps_cols: list[str], precision: int = 2) -> tuple[pl.DataFrame, list[str]]:
     """Reduce spatial precision of GPS columns by rounding to `precision` decimal places.
 
     Default precision is 2 (about 1 km cells), matching
@@ -856,41 +980,50 @@ def anonymize_gps_columns(df: pd.DataFrame, gps_cols: list[str], precision: int 
     """
     if not gps_cols:
         return df, []
-    df = df.copy()
     anonymized: list[str] = []
     for col in gps_cols:
         if col not in df.columns:
             continue
         series = df[col]
-        if pd.api.types.is_numeric_dtype(series.dtype):
-            df[col] = series.round(precision)
+        if series.dtype.is_numeric():
+            df = df.with_columns(pl.col(col).round(precision))
         elif _is_numeric_like_series(series):
-            df[col] = series.map(lambda v, p=precision: _round_numeric_like_value(v, p))
+            out_dtype = pl.Object if series.dtype == pl.Object else pl.Float64
+            df = _map_column_python(
+                df, col, lambda v, p=precision: _round_numeric_like_value(v, p), out_dtype,
+            )
         else:
-            df[col] = series.map(lambda v, p=precision: _round_wkt(v, p) if isinstance(v, str) else v)
+            out_dtype = pl.Object if series.dtype == pl.Object else pl.String
+            df = _map_column_python(
+                df, col,
+                lambda v, p=precision: _round_wkt(v, p) if isinstance(v, str) else v,
+                out_dtype,
+            )
         anonymized.append(col)
     return df, anonymized
 
 
-def bin_timestamp_columns(df: pd.DataFrame, ts_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+def bin_timestamp_columns(df: pl.DataFrame, ts_cols: list[str]) -> tuple[pl.DataFrame, list[str]]:
     """Floor timestamp columns to daily granularity (temporal generalisation).
 
     Sub-day precision combined with rounded GPS coordinates is near-unique per
     person in a city.  Flooring to midnight removes the time-of-day signal
     while preserving the date for analytics.  Null values are preserved.
-    Only columns with an actual datetime64 dtype are processed; ambiguous
+    Only Datetime columns are transformed; Date columns are already
+    day-granular and are reported as binned without modification.  Ambiguous
     string timestamps are left untouched to avoid silent format changes.
     """
     if not ts_cols:
         return df, []
-    df = df.copy()
     binned: list[str] = []
     for col in ts_cols:
         if col not in df.columns:
             continue
-        series = df[col]
-        if pd.api.types.is_datetime64_any_dtype(series.dtype):
-            df[col] = series.dt.floor("D")
+        dtype = df.schema[col]
+        if isinstance(dtype, pl.Datetime):
+            df = df.with_columns(pl.col(col).dt.truncate("1d"))
+            binned.append(col)
+        elif dtype == pl.Date:
             binned.append(col)
     return df, binned
 
@@ -901,39 +1034,45 @@ def _bin_label(lo: float, hi: float) -> str:
     return f"{fmt(lo)}–{fmt(hi)}"
 
 
-def bin_numeric_columns(df: pd.DataFrame, cols: list[str], n_bins: int = 5) -> tuple[pd.DataFrame, list[str]]:
+def bin_numeric_columns(df: pl.DataFrame, cols: list[str], n_bins: int = 5) -> tuple[pl.DataFrame, list[str]]:
     """Replace numeric quasi-identifier columns with quantile-range labels.
 
     Converts e.g. hours_worked=38.5 → "35–40" so k-anonymity groups more rows
     together and suppresses fewer records.  Columns with fewer than two unique
-    values are left untouched.  Nulls are preserved as NaN.
+    values are left untouched.  Nulls are preserved.
     """
     if not cols:
         return df, []
-    df = df.copy()
     binned: list[str] = []
     for col in cols:
         if col not in df.columns:
             continue
-        if not pd.api.types.is_numeric_dtype(df[col]):
+        series = df[col]
+        if not series.dtype.is_numeric():
             continue
-        non_null = df[col].dropna()
-        if non_null.nunique() < 2:
+        non_null = series.drop_nulls()
+        if non_null.n_unique() < 2:
             continue
         try:
-            _, edges = pd.qcut(non_null, q=n_bins, retbins=True, duplicates="drop")
-        except ValueError:
+            quantile_points = [i / n_bins for i in range(n_bins + 1)]
+            edges = sorted({
+                non_null.quantile(q, interpolation="linear")
+                for q in quantile_points
+            })
+            if len(edges) < 2:
+                continue
+            labels = [_bin_label(lo, hi) for lo, hi in zip(edges[:-1], edges[1:])]
+            breaks = list(edges[1:-1])  # interior cut points only (Polars convention)
+            cut = series.cut(breaks=breaks, labels=labels).cast(pl.String)
+            df = df.with_columns(cut.alias(col))
+            binned.append(col)
+            logger.info("Binned numeric column %r into %d quantile ranges", col, len(labels))
+        except Exception:
             continue
-        if len(edges) < 2:
-            continue
-        labels = [_bin_label(lo, hi) for lo, hi in zip(edges[:-1], edges[1:])]
-        df[col] = pd.cut(df[col], bins=edges, labels=labels, include_lowest=True).astype(object)
-        binned.append(col)
-        logger.info("Binned numeric column %r into %d quantile ranges", col, len(labels))
     return df, binned
 
 
-def validate_residual_pii(df: pd.DataFrame) -> int:
+def validate_residual_pii(df: pl.DataFrame) -> int:
     residuals = _merge_residual_summaries(residual_pii_findings(df))
     return _raise_for_residuals(residuals)
 

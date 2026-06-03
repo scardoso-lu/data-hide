@@ -33,6 +33,15 @@ services:
     volumes:
       - spacy_models:/app/models       # cache spaCy models between one-shot runs
     restart: "no"                      # one-shot batch job — do not auto-restart
+    # Mirrors the Azure Container Apps liveness probe (deploy/containerapp.yaml)
+    # so local runs exercise the same endpoint. start_period covers the heavy
+    # import window before app/health.py starts serving.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz/live || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
     # Hard memory ceiling for the pipeline container.
     # Without this the Linux OOM killer fires at an unpredictable host-level
     # threshold and "docker stats" shows no % indicator.  With it:
@@ -46,27 +55,6 @@ services:
     #   PIPELINE_MEMORY_LIMIT=12g docker compose up
     mem_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"
     memswap_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"  # disable swap → fast fail, not thrash
-
-  # ── Next.js admin frontend ───────────────────────────────────────────────────
-  server:
-    build: ./frontend
-    ports:
-      - "3000:3000"
-    environment:
-      DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
-      NODE_ENV: production
-      AUTH_SECRET: "${AUTH_SECRET}"
-      AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
-      # Set to true when running behind a reverse proxy or inside Docker so
-      # NextAuth accepts the forwarded host header.
-      AUTH_TRUST_HOST: "true"
-      AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
-      AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
-      AZURE_AD_TENANT_ID: "${AZURE_AD_TENANT_ID:-}"
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped   # keep the admin UI always available
 
 volumes:
   pg_data:

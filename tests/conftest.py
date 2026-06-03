@@ -13,7 +13,11 @@ Run `pytest -m "not requires_spacy"` to skip all model-dependent tests.
 import pytest
 from unittest import mock
 
-_REQUIRED_SPACY_MODELS = ["en_core_web_lg", "fr_core_news_lg", "de_core_news_lg"]
+from app.domain.anonymization import SPACY_MODELS as _SPACY_MODELS
+
+# Resolved from SPACY_MODELS so the gate always matches the configured
+# defaults (en/fr/de `_md`, overridable via SPACY_MODEL_<LANG> env vars).
+_REQUIRED_SPACY_MODELS = sorted(set(_SPACY_MODELS.values()))
 
 
 def _spacy_available() -> bool:

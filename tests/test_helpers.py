@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unit tests for URI helpers, storage options, the optional Purview check,
 free-text column flagging, quasi-identifier detection, k-anonymity enforcement,
 and residual PII validation.
@@ -7,8 +7,9 @@ No external services or spaCy model required (except residual PII tests).
 
 from datetime import datetime, timezone
 
-import pandas as pd
+import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from main import (
     PurviewClient,
@@ -25,12 +26,26 @@ from main import (
 )
 from app.infrastructure.repository import (
     AuditDB,
-    _coerce_null_columns,
+    _coerce_null_columns_arrow,
     _fabric_workspace_guid_for_name,
     _parse_abfss_uri,
     _resolve_onelake_item_id_path,
     read_delta,
 )
+
+
+def _coerce_null_columns(df: pl.DataFrame):
+    """Test helper bridging the old _coerce_null_columns(pandas) contract to the
+    new _coerce_null_columns_arrow(table, null_col_names) API.
+
+    Builds a PyArrow Table from the Polars frame and computes the all-null
+    column names exactly as write_delta does.
+    """
+    import pyarrow as pa
+
+    table = df.to_arrow()
+    null_col_names = [f.name for f in table.schema if pa.types.is_null(f.type)]
+    return _coerce_null_columns_arrow(table, null_col_names)
 
 
 class _FakePseudonymizer:
@@ -46,13 +61,9 @@ class _FakePseudonymizer:
     def __call__(self, value):
         import hmac
         import hashlib
-        import pandas as pd
 
-        try:
-            if pd.isna(value):
-                return value
-        except (TypeError, ValueError):
-            pass
+        if value is None:
+            return value
         raw = value if isinstance(value, str) else str(value)
         return hmac.new(self._key, raw.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
 
@@ -465,7 +476,7 @@ class TestWriteDelta:
         monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
         write_delta(
-            pd.DataFrame({"x": [1]}),
+            pl.DataFrame({"x": [1]}),
             "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
             {},
         )
@@ -498,7 +509,7 @@ class TestWriteDelta:
         monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
         write_delta(
-            pd.DataFrame({"x": [1]}),
+            pl.DataFrame({"x": [1]}),
             "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
             {},
         )
@@ -521,7 +532,7 @@ class TestWriteDelta:
         monkeypatch.setattr(repo, "DataLakeServiceClient", mocker.MagicMock(return_value=service))
         monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
-        write_delta(pd.DataFrame({"x": [1]}), "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers", {})
+        write_delta(pl.DataFrame({"x": [1]}), "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers", {})
 
         uploaded_paths = {call.kwargs["file_path"] for call in fs_client.get_file_client.call_args_list}
         assert any(
@@ -542,7 +553,7 @@ class TestWriteDelta:
         monkeypatch.setattr(repo, "_credential_instance", lambda: object())
 
         write_delta(
-            pd.DataFrame({"x": [1]}),
+            pl.DataFrame({"x": [1]}),
             "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
             {},
         )
@@ -552,7 +563,7 @@ class TestWriteDelta:
     def test_rejects_lakehouse_files_target(self):
         with pytest.raises(ValueError, match="Lakehouse Files"):
             write_delta(
-                pd.DataFrame({"x": [1]}),
+                pl.DataFrame({"x": [1]}),
                 "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/out/customers",
                 {},
             )
@@ -565,7 +576,7 @@ class TestWriteDelta:
 
         with pytest.raises(ValueError, match="at least one column"):
             write_delta(
-                pd.DataFrame(),
+                pl.DataFrame(),
                 "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/customers",
                 {},
             )
@@ -724,31 +735,31 @@ class TestRunPurviewCheck:
 class TestFlagFreeTextColumns:
 
     def test_notes_column_flagged(self):
-        df = pd.DataFrame({"notes": ["This is a long free text value with multiple words."], "price": [9.99]})
+        df = pl.DataFrame({"notes": ["This is a long free text value with multiple words."], "price": [9.99]})
         assert "notes" in flag_free_text_columns(df)
 
     def test_description_column_flagged(self):
-        df = pd.DataFrame({"description": ["Widget A needs a longer narrative description for review."], "id": [1]})
+        df = pl.DataFrame({"description": ["Widget A needs a longer narrative description for review."], "id": [1]})
         assert "description" in flag_free_text_columns(df)
 
     def test_feedback_column_flagged(self):
-        df = pd.DataFrame({"customer_feedback": ["The delivery was late and the customer explained the problem in detail."], "qty": [1]})
+        df = pl.DataFrame({"customer_feedback": ["The delivery was late and the customer explained the problem in detail."], "qty": [1]})
         assert "customer_feedback" in flag_free_text_columns(df)
 
     def test_numeric_column_not_flagged(self):
-        df = pd.DataFrame({"price": pd.array([9.99], dtype="float64"), "qty": pd.array([1], dtype="int64")})
+        df = pl.DataFrame({"price": pl.Series([9.99], dtype=pl.Float64), "qty": pl.Series([1], dtype=pl.Int64)})
         assert flag_free_text_columns(df) == []
 
     def test_non_text_object_column_with_matching_name_still_flagged(self):
-        df = pd.DataFrame({"notes": [{"key": "val"}]})
+        df = pl.DataFrame({"notes": pl.Series("notes", [{"key": "val"}], dtype=pl.Object)})
         assert "notes" not in flag_free_text_columns(df)
 
     def test_unrelated_object_column_not_flagged(self):
-        df = pd.DataFrame({"customer_id": ["CID-001", "CID-002"]})
+        df = pl.DataFrame({"customer_id": ["CID-001", "CID-002"]})
         assert "customer_id" not in flag_free_text_columns(df)
 
     def test_empty_dataframe_returns_empty(self):
-        df = pd.DataFrame()
+        df = pl.DataFrame()
         assert flag_free_text_columns(df) == []
 
 
@@ -759,33 +770,33 @@ class TestFlagFreeTextColumns:
 class TestDetectQuasiIdentifiers:
 
     def test_explicit_cols_used_when_provided(self):
-        df = pd.DataFrame({"age": [25], "city": ["NYC"], "score": [10]})
+        df = pl.DataFrame({"age": [25], "city": ["NYC"], "score": [10]})
         qi = detect_quasi_identifiers(df, explicit_cols=["age", "city"])
         assert qi == ["age", "city"]
 
     def test_explicit_cols_filtered_to_present(self):
-        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
+        df = pl.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df, explicit_cols=["age", "missing_col"])
         assert qi == ["age"]
         assert "missing_col" not in qi
 
     def test_keyword_detection_on_age(self):
-        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
+        df = pl.DataFrame({"age": [25, 25, 25, 30, 30, 30], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df)
         assert "age" in qi
 
     def test_keyword_detection_on_gender(self):
-        df = pd.DataFrame({"gender": ["M", "M", "M", "F", "F", "F"], "score": [10, 11, 12, 13, 14, 15]})
+        df = pl.DataFrame({"gender": ["M", "M", "M", "F", "F", "F"], "score": [10, 11, 12, 13, 14, 15]})
         qi = detect_quasi_identifiers(df)
         assert "gender" in qi
 
     def test_non_qi_column_not_detected(self):
-        df = pd.DataFrame({"product_name": ["Widget"], "price": [9.99]})
+        df = pl.DataFrame({"product_name": ["Widget"], "price": [9.99]})
         qi = detect_quasi_identifiers(df)
         assert qi == []
 
     def test_empty_explicit_cols_falls_back_to_keyword(self):
-        df = pd.DataFrame({"age": [25, 25, 25, 30, 30, 30], "city": ["NYC", "NYC", "NYC", "LUX", "LUX", "LUX"]})
+        df = pl.DataFrame({"age": [25, 25, 25, 30, 30, 30], "city": ["NYC", "NYC", "NYC", "LUX", "LUX", "LUX"]})
         qi = detect_quasi_identifiers(df, explicit_cols=[])
         assert "age" in qi
 
@@ -797,31 +808,31 @@ class TestDetectQuasiIdentifiers:
 class TestEnforceKAnonymity:
 
     def test_no_suppression_when_k_met(self):
-        df = pd.DataFrame({"age": [25, 25, 30, 30, 30], "score": [1, 2, 3, 4, 5]})
+        df = pl.DataFrame({"age": [25, 25, 30, 30, 30], "score": [1, 2, 3, 4, 5]})
         result_df, info = enforce_k_anonymity(df, ["age"], k=2)
         assert len(result_df) == 5
         assert info["suppressed_rows"] == 0
 
     def test_suppresses_rare_groups(self):
-        df = pd.DataFrame({"age": [25, 25, 30, 30, 99]})
+        df = pl.DataFrame({"age": [25, 25, 30, 30, 99]})
         result_df, info = enforce_k_anonymity(df, ["age"], k=2)
-        assert 99 not in result_df["age"].values
+        assert 99 not in result_df["age"].to_list()
         assert info["suppressed_rows"] == 1
 
     def test_empty_quasi_cols_returns_unchanged(self):
-        df = pd.DataFrame({"score": [1, 2, 3]})
+        df = pl.DataFrame({"score": [1, 2, 3]})
         result_df, info = enforce_k_anonymity(df, [], k=5)
-        pd.testing.assert_frame_equal(result_df, df)
+        assert_frame_equal(result_df, df)
         assert info["suppressed_rows"] == 0
 
     def test_all_rows_suppressed_when_none_meet_k(self):
-        df = pd.DataFrame({"age": [10, 20, 30]})  # each age appears once
+        df = pl.DataFrame({"age": [10, 20, 30]})  # each age appears once
         result_df, info = enforce_k_anonymity(df, ["age"], k=2)
         assert len(result_df) == 0
         assert info["suppressed_rows"] == 3
 
     def test_multi_column_quasi_identifiers(self):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "age":    [25, 25, 25, 30],
             "gender": ["M", "M", "F", "M"],
         })
@@ -830,13 +841,13 @@ class TestEnforceKAnonymity:
         assert info["suppressed_rows"] == 2
 
     def test_missing_quasi_col_treated_gracefully(self):
-        df = pd.DataFrame({"score": [1, 2, 3]})
+        df = pl.DataFrame({"score": [1, 2, 3]})
         result_df, info = enforce_k_anonymity(df, ["nonexistent"], k=2)
-        pd.testing.assert_frame_equal(result_df, df)
+        assert_frame_equal(result_df, df)
         assert info["suppressed_rows"] == 0
 
     def test_k_value_returned_in_info(self):
-        df = pd.DataFrame({"age": [25, 25]})
+        df = pl.DataFrame({"age": [25, 25]})
         _, info = enforce_k_anonymity(df, ["age"], k=3)
         assert info["k"] == 3
 
@@ -851,7 +862,7 @@ class TestEnforceKAnonymity:
 class TestValidateResidualPII:
 
     def test_non_identifier_ner_residuals_do_not_abort(self):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "indicator_label": ["Luxembourg", "France", "Kayl"],
             "commune": ["Luxembourg", "Kayl", "France"],
             "notes": ["Luxembourg", "France", "Kayl"],
@@ -860,7 +871,7 @@ class TestValidateResidualPII:
         assert validate_residual_pii(df) == 0
 
     def test_structured_phone_false_positive_does_not_abort(self):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "record_key": ["source_2024_001"],
             "source_file": ["bronze_communes_2024.csv"],
         })
@@ -868,35 +879,35 @@ class TestValidateResidualPII:
         assert validate_residual_pii(df) == 0
 
     def test_direct_phone_residual_still_fails(self):
-        df = pd.DataFrame({"phone": ["+352 621 123 456"]})
+        df = pl.DataFrame({"phone": ["+352 621 123 456"]})
 
         with pytest.raises(RuntimeError, match="phone.PHONE_NUMBER=1"):
             validate_residual_pii(df)
 
     def test_direct_email_residual_still_fails(self):
-        df = pd.DataFrame({"source_file": ["alice@example.com.csv"], "email": ["bob@example.com"]})
+        df = pl.DataFrame({"source_file": ["alice@example.com.csv"], "email": ["bob@example.com"]})
 
         with pytest.raises(RuntimeError, match="email.EMAIL_ADDRESS=1"):
             validate_residual_pii(df)
 
     def test_direct_url_residual_still_fails(self):
-        df = pd.DataFrame({"url": ["https://example.com/private/customer"]})
+        df = pl.DataFrame({"url": ["https://example.com/private/customer"]})
 
         with pytest.raises(RuntimeError, match="url.URL=1"):
             validate_residual_pii(df)
 
     def test_direct_ip_residual_still_fails(self):
-        df = pd.DataFrame({"ip_address": ["192.168.10.25"]})
+        df = pl.DataFrame({"ip_address": ["192.168.10.25"]})
 
         with pytest.raises(RuntimeError, match="ip_address.IP_ADDRESS=1"):
             validate_residual_pii(df)
 
     def test_generated_tokens_are_not_residual_pii(self):
-        df = pd.DataFrame({"name": ["PERSON_0"], "email": ["EMAIL_ADDRESS_0"]})
+        df = pl.DataFrame({"name": ["PERSON_0"], "email": ["EMAIL_ADDRESS_0"]})
         assert validate_residual_pii(df) == 0
 
     def test_residual_error_summarizes_column_without_value(self):
-        df = pd.DataFrame({"email": ["alice@example.com"]})
+        df = pl.DataFrame({"email": ["alice@example.com"]})
         with pytest.raises(RuntimeError) as exc_info:
             validate_residual_pii(df)
         message = str(exc_info.value)
@@ -904,42 +915,42 @@ class TestValidateResidualPII:
         assert "alice@example.com" not in message
 
     def test_passes_clean_dataframe(self):
-        df = pd.DataFrame({"note": ["No issues found."], "qty": [5]})
+        df = pl.DataFrame({"note": ["No issues found."], "qty": [5]})
         count = validate_residual_pii(df)
         assert count == 0
 
     def test_raises_on_residual_email(self):
-        df = pd.DataFrame({"email": ["alice@example.com"]})
+        df = pl.DataFrame({"email": ["alice@example.com"]})
         with pytest.raises(RuntimeError, match="Residual PII"):
             validate_residual_pii(df)
 
     def test_raises_message_contains_count(self):
-        df = pd.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
+        df = pl.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
         with pytest.raises(RuntimeError) as exc_info:
             validate_residual_pii(df)
         assert "finding" in str(exc_info.value)
 
     def test_skips_non_object_columns(self):
-        df = pd.DataFrame({
-            "id":    pd.array([1, 2, 3], dtype="int64"),
-            "score": pd.array([0.1, 0.2, 0.3], dtype="float64"),
+        df = pl.DataFrame({
+            "id":    pl.Series([1, 2, 3], dtype=pl.Int64),
+            "score": pl.Series([0.1, 0.2, 0.3], dtype=pl.Float64),
         })
         count = validate_residual_pii(df)
         assert count == 0
 
     def test_skips_non_string_values_in_object_column(self):
-        df = pd.DataFrame({"mixed": [None, 42, {"key": "val"}]})
+        df = pl.DataFrame({"mixed": pl.Series("mixed", [None, 42, {"key": "val"}], dtype=pl.Object)})
         count = validate_residual_pii(df)
         assert count == 0
 
     def test_empty_dataframe_passes(self):
-        df = pd.DataFrame({"email": pd.Series([], dtype=object)})
+        df = pl.DataFrame({"email": pl.Series("email", [], dtype=pl.String)})
         count = validate_residual_pii(df)
         assert count == 0
 
     def test_entity_token_passes(self):
         """ENTITY_TYPE_N pseudonym tokens must not be flagged as PII."""
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "name":  ["PERSON_0", "PERSON_1"],
             "email": ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"],
         })
@@ -947,29 +958,29 @@ class TestValidateResidualPII:
         assert count == 0
 
     def test_raises_on_pii_inside_json_string(self):
-        df = pd.DataFrame({"payload": ['{"email": "alice@example.com"}']})
+        df = pl.DataFrame({"payload": ['{"email": "alice@example.com"}']})
         with pytest.raises(RuntimeError, match="Residual PII"):
             validate_residual_pii(df)
 
     def test_raises_on_pii_inside_native_dict(self):
-        df = pd.DataFrame({"data": [{"email": "alice@example.com"}]})
+        df = pl.DataFrame({"data": pl.Series("data", [{"email": "alice@example.com"}], dtype=pl.Object)})
         with pytest.raises(RuntimeError, match="Residual PII"):
             validate_residual_pii(df)
 
     def test_raises_on_pii_inside_json_key(self):
-        df = pd.DataFrame({"data": [{"alice@example.com": "primary contact"}]})
+        df = pl.DataFrame({"data": pl.Series("data", [{"alice@example.com": "primary contact"}], dtype=pl.Object)})
         with pytest.raises(RuntimeError, match=r"data:\$\.<key>\.EMAIL_ADDRESS"):
             validate_residual_pii(df)
 
     def test_metadata_column_exemption_does_not_hide_json_value_pii(self):
-        df = pd.DataFrame({"source_file": [{"email": "alice@example.com"}]})
+        df = pl.DataFrame({"source_file": pl.Series("source_file", [{"email": "alice@example.com"}], dtype=pl.Object)})
         with pytest.raises(RuntimeError, match=r"source_file:\$\.email\.EMAIL_ADDRESS=1"):
             validate_residual_pii(df)
 
     def test_pseudonym_passes_validation(self):
         """24-hex pseudonym tokens must not be detected as PII."""
         token = _FakePseudonymizer()("EMP001")
-        df = pd.DataFrame({"employee_id": [token]})
+        df = pl.DataFrame({"employee_id": [token]})
         count = validate_residual_pii(df)
         assert count == 0
 
@@ -981,46 +992,46 @@ class TestValidateResidualPII:
 class TestDetectIdentifierColumns:
 
     def test_employee_id_detected(self):
-        df = pd.DataFrame({"employee_id": [1], "name": ["Alice"]})
+        df = pl.DataFrame({"employee_id": [1], "name": ["Alice"]})
         assert "employee_id" in detect_identifier_columns(df)
 
     def test_microsoft_id_detected(self):
-        df = pd.DataFrame({"microsoft_id": ["abc123"], "score": [10]})
+        df = pl.DataFrame({"microsoft_id": ["abc123"], "score": [10]})
         assert "microsoft_id" in detect_identifier_columns(df)
 
     def test_matricule_detected(self):
-        df = pd.DataFrame({"matricule": ["M001"], "score": [10]})
+        df = pl.DataFrame({"matricule": ["M001"], "score": [10]})
         assert "matricule" in detect_identifier_columns(df)
 
     def test_person_id_detected(self):
-        df = pd.DataFrame({"person_id": ["P001"]})
+        df = pl.DataFrame({"person_id": ["P001"]})
         assert "person_id" in detect_identifier_columns(df)
 
     def test_user_id_detected(self):
-        df = pd.DataFrame({"user_id": [42]})
+        df = pl.DataFrame({"user_id": [42]})
         assert "user_id" in detect_identifier_columns(df)
 
     def test_column_with_space_normalised(self):
-        df = pd.DataFrame({"employee id": ["E001"]})
+        df = pl.DataFrame({"employee id": ["E001"]})
         assert "employee id" in detect_identifier_columns(df)
 
     def test_non_identifier_column_not_detected(self):
-        df = pd.DataFrame({"product_name": ["Widget"], "price": [9.99]})
+        df = pl.DataFrame({"product_name": ["Widget"], "price": [9.99]})
         assert detect_identifier_columns(df) == []
 
     def test_explicit_cols_override(self):
-        df = pd.DataFrame({"emp_id": [1], "score": [10]})
+        df = pl.DataFrame({"emp_id": [1], "score": [10]})
         assert detect_identifier_columns(df, explicit_cols=["emp_id"]) == ["emp_id"]
 
     def test_explicit_cols_filtered_to_present(self):
-        df = pd.DataFrame({"emp_id": [1]})
+        df = pl.DataFrame({"emp_id": [1]})
         result = detect_identifier_columns(df, explicit_cols=["emp_id", "missing_col"])
         assert result == ["emp_id"]
         assert "missing_col" not in result
 
     def test_placeholder_identifier_column_detected(self):
         """Legacy placeholder identifier column names are still detected."""
-        df = pd.DataFrame({"IDENTIFIER_0": ["x"]})
+        df = pl.DataFrame({"IDENTIFIER_0": ["x"]})
         assert "IDENTIFIER_0" in detect_identifier_columns(df)
 
 
@@ -1031,65 +1042,65 @@ class TestDetectIdentifierColumns:
 class TestPseudonymizeIdentifierColumns:
 
     def test_string_value_pseudonymized(self):
-        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        df = pl.DataFrame({"employee_id": ["EMP001", "EMP002"]})
         result_df, pseudonymized = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert "EMP001" not in result_df["employee_id"].values
-        assert "EMP002" not in result_df["employee_id"].values
+        assert "EMP001" not in result_df["employee_id"].to_list()
+        assert "EMP002" not in result_df["employee_id"].to_list()
         assert "employee_id" in pseudonymized
 
     def test_mapping_is_deterministic_for_same_key(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
-        r1, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer())
-        r2, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer())
-        assert r1["employee_id"].iloc[0] == r2["employee_id"].iloc[0]
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
+        r1, _ = pseudonymize_identifier_columns(df.clone(), ["employee_id"], _FakePseudonymizer())
+        r2, _ = pseudonymize_identifier_columns(df.clone(), ["employee_id"], _FakePseudonymizer())
+        assert r1["employee_id"][0] == r2["employee_id"][0]
 
     def test_same_value_same_pseudonym_across_rows(self):
-        df = pd.DataFrame({"employee_id": ["EMP001", "EMP001"]})
+        df = pl.DataFrame({"employee_id": ["EMP001", "EMP001"]})
         result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert result_df["employee_id"].iloc[0] == result_df["employee_id"].iloc[1]
+        assert result_df["employee_id"][0] == result_df["employee_id"][1]
 
     def test_different_values_different_pseudonyms(self):
-        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        df = pl.DataFrame({"employee_id": ["EMP001", "EMP002"]})
         result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert result_df["employee_id"].iloc[0] != result_df["employee_id"].iloc[1]
+        assert result_df["employee_id"][0] != result_df["employee_id"][1]
 
     def test_null_preserved(self):
-        df = pd.DataFrame({"employee_id": [None, "EMP001"]})
+        df = pl.DataFrame({"employee_id": [None, "EMP001"]})
         result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert pd.isna(result_df["employee_id"].iloc[0])
+        assert result_df["employee_id"][0] is None
 
     def test_integer_id_pseudonymized(self):
-        df = pd.DataFrame({"employee_id": pd.array([12345, 67890], dtype="int64")})
+        df = pl.DataFrame({"employee_id": pl.Series([12345, 67890], dtype=pl.Int64)})
         result_df, pseudonymized = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert 12345 not in result_df["employee_id"].values
+        assert 12345 not in result_df["employee_id"].to_list()
         assert "employee_id" in pseudonymized
 
     def test_different_keys_produce_different_pseudonyms(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
-        r1, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer(b"key_a"))
-        r2, _ = pseudonymize_identifier_columns(df.copy(), ["employee_id"], _FakePseudonymizer(b"key_b"))
-        assert r1["employee_id"].iloc[0] != r2["employee_id"].iloc[0]
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
+        r1, _ = pseudonymize_identifier_columns(df.clone(), ["employee_id"], _FakePseudonymizer(b"key_a"))
+        r2, _ = pseudonymize_identifier_columns(df.clone(), ["employee_id"], _FakePseudonymizer(b"key_b"))
+        assert r1["employee_id"][0] != r2["employee_id"][0]
 
     def test_empty_id_cols_returns_unchanged(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
         result_df, pseudonymized = pseudonymize_identifier_columns(df, [], _FakePseudonymizer())
-        assert result_df["employee_id"].iloc[0] == "EMP001"
+        assert result_df["employee_id"][0] == "EMP001"
         assert pseudonymized == []
 
     def test_pseudonym_has_fixed_length(self):
-        df = pd.DataFrame({"employee_id": ["short", "a_much_longer_employee_id_string"]})
+        df = pl.DataFrame({"employee_id": ["short", "a_much_longer_employee_id_string"]})
         result_df, _ = pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert len(result_df["employee_id"].iloc[0]) == 24
-        assert len(result_df["employee_id"].iloc[1]) == 24
+        assert len(result_df["employee_id"][0]) == 24
+        assert len(result_df["employee_id"][1]) == 24
 
     def test_original_dataframe_not_mutated(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
-        original = df["employee_id"].iloc[0]
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
+        original = df["employee_id"][0]
         pseudonymize_identifier_columns(df, ["employee_id"], _FakePseudonymizer())
-        assert df["employee_id"].iloc[0] == original
+        assert df["employee_id"][0] == original
 
     def test_missing_column_silently_skipped(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
         result_df, pseudonymized = pseudonymize_identifier_columns(
             df, ["employee_id", "nonexistent"], _FakePseudonymizer(),
         )
@@ -1097,7 +1108,7 @@ class TestPseudonymizeIdentifierColumns:
         assert "nonexistent" not in pseudonymized
 
     def test_none_pseudonymizer_raises(self):
-        df = pd.DataFrame({"employee_id": ["EMP001"]})
+        df = pl.DataFrame({"employee_id": ["EMP001"]})
         with pytest.raises(ValueError, match="pseudonymizer is required"):
             pseudonymize_identifier_columns(df, ["employee_id"], None)
 
@@ -1107,31 +1118,34 @@ class TestPseudonymizeIdentifierColumns:
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestCoerceNullColumns:
-    """_coerce_null_columns must convert pa.null() columns to pa.string()
+    """_coerce_null_columns_arrow must convert pa.null() columns to pa.string()
     so delta-rs can write them without SchemaMismatchError."""
 
     def test_all_null_column_becomes_string(self):
         import pyarrow as pa
-        df = pd.DataFrame({"id": ["A", "B"], "notes": [None, None]})
+        df = pl.DataFrame({"id": ["A", "B"], "notes": pl.Series("notes", [None, None], dtype=pl.Null)})
         table = _coerce_null_columns(df)
         assert pa.types.is_string(table.schema.field("notes").type) or \
                pa.types.is_large_string(table.schema.field("notes").type)
 
     def test_null_values_preserved_as_null(self):
         import pyarrow as pa
-        df = pd.DataFrame({"id": ["A"], "notes": [None]})
+        df = pl.DataFrame({"id": ["A"], "notes": pl.Series("notes", [None], dtype=pl.Null)})
         table = _coerce_null_columns(df)
         assert table.column("notes")[0].as_py() is None
 
     def test_non_null_columns_unchanged(self):
         import pyarrow as pa
-        df = pd.DataFrame({"id": ["A", "B"], "score": [1.0, 2.0]})
+        df = pl.DataFrame({"id": ["A", "B"], "score": [1.0, 2.0]})
         table = _coerce_null_columns(df)
         assert pa.types.is_floating(table.schema.field("score").type)
 
     def test_empty_dataframe_null_column_coerced(self):
         import pyarrow as pa
-        df = pd.DataFrame({"id": pd.Series([], dtype=object), "notes": pd.Series([], dtype=object)})
+        df = pl.DataFrame({
+            "id": pl.Series("id", [], dtype=pl.Null),
+            "notes": pl.Series("notes", [], dtype=pl.Null),
+        })
         table = _coerce_null_columns(df)
         # At minimum, the table should be writeable â€” no pa.null() fields remain
         for field in table.schema:
@@ -1139,13 +1153,17 @@ class TestCoerceNullColumns:
 
     def test_no_null_columns_returns_table_unchanged(self):
         import pyarrow as pa
-        df = pd.DataFrame({"name": ["Alice"], "age": [30]})
+        df = pl.DataFrame({"name": ["Alice"], "age": [30]})
         table = _coerce_null_columns(df)
         assert table.schema.field("name").type == pa.string() or \
                pa.types.is_large_string(table.schema.field("name").type)
         assert pa.types.is_integer(table.schema.field("age").type)
 
     def test_column_order_preserved(self):
-        df = pd.DataFrame({"z": [None], "a": ["x"], "m": [None]})
+        df = pl.DataFrame({
+            "z": pl.Series("z", [None], dtype=pl.Null),
+            "a": ["x"],
+            "m": pl.Series("m", [None], dtype=pl.Null),
+        })
         table = _coerce_null_columns(df)
         assert table.schema.names == ["z", "a", "m"]

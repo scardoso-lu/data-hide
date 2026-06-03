@@ -11,7 +11,7 @@ import hashlib
 import hmac
 from types import SimpleNamespace
 
-import pandas as pd
+import math
 import pytest
 
 from app.infrastructure.keyvault import (
@@ -105,7 +105,7 @@ class TestKeyVaultPseudonymize:
     def test_null_value_passes_through(self):
         p = KeyVaultPseudonymizer("https://v.vault.azure.net/", "k", crypto_client=_FakeCryptoClient())
         assert p.pseudonymize(None) is None
-        assert pd.isna(p.pseudonymize(pd.NA))
+        assert math.isnan(p.pseudonymize(float("nan")))
 
     def test_integer_value_pseudonymized_as_string_repr(self):
         sig = b"sig"
@@ -223,7 +223,7 @@ class TestLocalHashPseudonymizer:
     def test_null_passes_through(self):
         p = LocalHashPseudonymizer("test-salt")
         assert p.pseudonymize(None) is None
-        assert pd.isna(p.pseudonymize(pd.NA))
+        assert math.isnan(p.pseudonymize(float("nan")))
 
     def test_integer_coerced_to_string(self):
         p = LocalHashPseudonymizer("test-salt")
@@ -242,3 +242,4 @@ class TestLocalHashPseudonymizer:
         expected_secret = hashlib.sha256(_LOCAL_HASH_DEFAULT_SALT).digest()
         expected = _hmac.new(expected_secret, b"EMP001", hashlib.sha256).hexdigest()[:24]
         assert p.pseudonymize("EMP001") == expected
+

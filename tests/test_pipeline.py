@@ -15,7 +15,7 @@ One integration test re-uses the session-scoped analyzer fixture to verify
 the full chain end-to-end.
 """
 
-import pandas as pd
+import polars as pl
 import pytest
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -34,15 +34,16 @@ REQUIRED_ENV = {
     "TARGET_BASE_ABFSS_URI": BASE_TARGET_URI,
 }
 
-RAW_DF = pd.DataFrame({
+RAW_DF = pl.DataFrame({
     "name":  ["Alice Smith", "Bob Jones"],
     "email": ["alice@example.com", "bob@example.com"],
     "score": [10, 20],
 })
 
-ANON_DF = RAW_DF.copy()
-ANON_DF["name"]  = ["PERSON_0", "PERSON_1"]
-ANON_DF["email"] = ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]
+ANON_DF = RAW_DF.with_columns(
+    pl.Series("name", ["PERSON_0", "PERSON_1"]),
+    pl.Series("email", ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]),
+)
 
 MOCK_STATS = {
     "text_columns_scanned":    ["name", "email"],
@@ -74,7 +75,10 @@ def env(monkeypatch, mocker):
 
 @pytest.fixture()
 def mock_delta(mocker):
-    mock_read = mocker.patch("main.read_delta", return_value=RAW_DF.copy())
+    mock_read = mocker.patch("main.read_delta", return_value=RAW_DF.clone())
+    # Phase 1 sample reads route through read_delta_sample; classification
+    # behaves identically on the tiny fixture frame.
+    mocker.patch("main.read_delta_sample", return_value=RAW_DF.clone())
     mock_write = mocker.patch("main.write_delta")
     return mock_read, mock_write
 
@@ -90,7 +94,7 @@ def mock_auth(mocker):
 def mock_anonymize(mocker):
     return mocker.patch(
         "main.anonymize_dataframe",
-        return_value=(ANON_DF.copy(), MOCK_STATS),
+        return_value=(ANON_DF.clone(), MOCK_STATS),
     )
 
 
@@ -122,7 +126,7 @@ def mock_classify(mocker):
 def mock_hash(mocker):
     """Mock pseudonymize_identifier_columns â€” identity transform, no columns pseudonymized."""
     m = mocker.patch("main.pseudonymize_identifier_columns")
-    m.side_effect = lambda df, cols, pseudonymizer: (df.copy(), [])
+    m.side_effect = lambda df, cols, pseudonymizer: (df.clone(), [])
     return m
 
 
@@ -156,7 +160,7 @@ class TestPipelineSuccess:
         _, mock_write = mock_delta
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[0]
+        written_df: pl.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["name"])  == ["PERSON_0", "PERSON_1"]
         assert list(written_df["email"]) == ["EMAIL_ADDRESS_0", "EMAIL_ADDRESS_1"]
 
@@ -168,7 +172,7 @@ class TestPipelineSuccess:
         _, mock_write = mock_delta
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[0]
+        written_df: pl.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["score"]) == [10, 20]
 
     def test_write_target_uri_is_target(
@@ -487,7 +491,7 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[0]
+        written_df: pl.DataFrame = mock_write.call_args.args[0]
         for val in written_df["email"]:
             assert "example.com" not in val, f"Email not anonymized: {val!r}"
             assert "@" not in val, f"Email not fully masked: {val!r}"
@@ -503,7 +507,7 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[0]
+        written_df: pl.DataFrame = mock_write.call_args.args[0]
         assert list(written_df["score"]) == [10, 20]
 
     def test_entity_tokens_in_output(
@@ -518,7 +522,7 @@ class TestEndToEndAnonymization:
         from main import main
         main()
 
-        written_df: pd.DataFrame = mock_write.call_args.args[0]
+        written_df: pl.DataFrame = mock_write.call_args.args[0]
         for val in written_df["email"]:
             assert "EMAIL_ADDRESS_" in val, f"Expected EMAIL_ADDRESS token, got: {val!r}"
 
@@ -546,10 +550,11 @@ class TestDynamicDiscovery:
 
     def _std_mocks(self, mocker, mappings):
         mocker.patch("main.discover_table_mappings", return_value=mappings)
-        mocker.patch("main.read_delta", return_value=RAW_DF.copy())
+        mocker.patch("main.read_delta", return_value=RAW_DF.clone())
+        mocker.patch("main.read_delta_sample", return_value=RAW_DF.clone())
         mock_write = mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
-        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
+        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.clone(), MOCK_STATS))
         return mock_write
 
     def test_discover_is_called(
@@ -557,10 +562,10 @@ class TestDynamicDiscovery:
         mock_classify, mock_hash, mocker,
     ):
         mock_discover = mocker.patch("main.discover_table_mappings", return_value=self._two_mappings())
-        mocker.patch("main.read_delta", return_value=RAW_DF.copy())
+        mocker.patch("main.read_delta", return_value=RAW_DF.clone())
         mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
-        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.copy(), MOCK_STATS))
+        mocker.patch("main.anonymize_dataframe", return_value=(ANON_DF.clone(), MOCK_STATS))
 
         from main import main
         main()
@@ -1088,21 +1093,25 @@ class TestSQLShortcutRouting:
         self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
         mock_classify, mock_hash, mocker,
     ):
-        mock_sql_read = mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
+        mock_sql_read = mocker.patch("main.read_sql_table", return_value=RAW_DF.clone())
         mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
 
         from main import main
         main()
 
-        mock_sql_read.assert_called_once()
-        assert mock_sql_read.call_args.args[0] == "shortcuts"
+        # Two reads by design: the Phase 1 classification sample (limit=500)
+        # and the Phase 2 full read.  Both must target the SQL endpoint.
+        assert mock_sql_read.call_count == 2
+        assert mock_sql_read.call_args_list[0].kwargs.get("limit") == 500
+        for call in mock_sql_read.call_args_list:
+            assert call.args[0] == "shortcuts"
 
     def test_delta_table_not_called_for_sql_mapping(
         self, sql_env, mock_auth, mock_anonymize, mock_engines, mock_validate,
         mock_classify, mock_hash, mocker,
     ):
-        mocker.patch("main.read_sql_table", return_value=RAW_DF.copy())
+        mocker.patch("main.read_sql_table", return_value=RAW_DF.clone())
         mocker.patch("main.write_delta")
         mocker.patch("main.connect_audit_db", return_value=None)
         mock_delta_read = mocker.patch("main.read_delta")

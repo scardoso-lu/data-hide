@@ -124,13 +124,18 @@ CREATE TABLE IF NOT EXISTS pii_column_exclusions (
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AuditDB:
-    def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
+    def __init__(self, dsn_or_kwargs: "str | dict") -> None:
+        # Accept either a DSN string (tests, DATABASE_URL) or a kwargs dict
+        # (individual DB_* env vars — avoids URL-encoding special characters).
+        if isinstance(dsn_or_kwargs, str):
+            self._connect_kwargs: dict = {"dsn": dsn_or_kwargs}
+        else:
+            self._connect_kwargs = dsn_or_kwargs
         self._init_schema()
 
     @contextmanager
     def _cursor(self) -> Generator:
-        conn = psycopg2.connect(self._dsn)
+        conn = psycopg2.connect(**self._connect_kwargs)
         try:
             with conn.cursor() as cur:
                 yield cur
@@ -289,12 +294,37 @@ class AuditDB:
             ))
 
 
+def _build_db_connect_kwargs(database_url: str | None) -> "dict | None":
+    """Return psycopg2 connect kwargs.
+
+    Individual ``DB_*`` env vars take priority over ``database_url`` because
+    they are passed as keyword arguments to ``psycopg2.connect()`` — no URL
+    encoding is needed, so passwords with special characters work as-is.
+    Falls back to ``database_url`` (the old ``DATABASE_URL`` string) when the
+    individual vars are not configured.
+    """
+    import os as _os
+    host = _os.environ.get("DB_HOST")
+    if host:
+        return {
+            "host": host,
+            "port": int(_os.environ.get("DB_PORT", "5432")),
+            "user": _os.environ.get("DB_USER", ""),
+            "password": _os.environ.get("DB_PASSWORD", ""),
+            "dbname": _os.environ.get("DB_NAME", ""),
+        }
+    if database_url:
+        return {"dsn": database_url}
+    return None
+
+
 def connect_audit_db(database_url: str | None) -> "AuditDB | None":
-    if not database_url:
-        logger.info("DATABASE_URL not set; audit DB disabled.")
+    connect_kwargs = _build_db_connect_kwargs(database_url)
+    if not connect_kwargs:
+        logger.info("DATABASE_URL not set and DB_HOST not configured; audit DB disabled.")
         return None
     try:
-        return AuditDB(database_url)
+        return AuditDB(connect_kwargs)
     except Exception as exc:
         logger.warning("Audit DB connection failed (non-fatal): %s", exc)
         return None

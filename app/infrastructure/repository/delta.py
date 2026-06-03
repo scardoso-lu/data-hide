@@ -13,7 +13,7 @@ import logging
 import pathlib
 import tempfile
 
-import pandas as pd
+import polars as pl
 
 from ._types import TableMapping
 from ._utils import (
@@ -35,10 +35,23 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_rss_mb() -> float | None:
-    """Return current process RSS in MB, or None if unavailable.
+    """Return *current* process RSS in MB, or None if unavailable.
 
-    On Linux (containers) ``ru_maxrss`` is in kilobytes.
+    Reads ``/proc/self/statm`` (field 2 = resident pages) on Linux — this is
+    live RSS that rises AND falls as memory is freed.  ``resource.getrusage``
+    is deliberately NOT used: its ``ru_maxrss`` is the peak high-water mark,
+    which is monotonic and would make every post-peak stage look identical
+    (and "never released") even when current usage has dropped.
     """
+    # Linux: live RSS from /proc.
+    try:
+        with open("/proc/self/statm", "r") as fh:
+            resident_pages = int(fh.readline().split()[1])
+        import os
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1_048_576
+    except Exception:
+        pass
+    # Non-Linux fallback (peak only — best effort, e.g. local dev on Windows).
     try:
         import resource
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
@@ -92,14 +105,13 @@ def _log_pre_read_diagnostics(table, uri: str) -> None:
     )
 
 
-def _log_post_read_diagnostics(df: "pd.DataFrame", uri: str) -> None:
+def _log_post_read_diagnostics(df: pl.DataFrame, uri: str) -> None:
     """Log DataFrame in-memory size and process RSS after the load completes."""
     table_name = uri.rsplit("/", 1)[-1]
 
     mem_str = "?"
     try:
-        mem_mb = df.memory_usage(deep=True).sum() / 1_048_576
-        mem_str = f"{mem_mb:.0f} MB"
+        mem_str = f"{df.estimated_size('mb'):.0f} MB"
     except Exception:
         pass
 
@@ -149,7 +161,7 @@ def _duckdb_temporal_filter_sql(columns: list[str]) -> str:
     return 'SELECT * FROM "_source_rows" WHERE ' + " OR ".join(predicates)
 
 
-def read_delta(uri: str, storage_options: dict) -> pd.DataFrame:
+def read_delta(uri: str, storage_options: dict) -> pl.DataFrame:
     import app.infrastructure.repository as _r
     if _r.DeltaTable is None:
         from deltalake import DeltaTable as _DT
@@ -176,19 +188,49 @@ def read_delta(uri: str, storage_options: dict) -> pd.DataFrame:
     conn = _r._duckdb.connect()
     try:
         conn.register("_source_rows", dataset)
+        # DuckDB → Polars: Arrow-backed strings use 3-5× less RAM than
+        # pandas object dtype for string-heavy PII tables.
         if not temporal_columns:
-            df = conn.execute('SELECT * FROM "_source_rows"').df()
+            df = conn.execute('SELECT * FROM "_source_rows"').pl()
         else:
-            df = conn.execute(_duckdb_temporal_filter_sql(temporal_columns), [cutoff] * len(temporal_columns)).df()
-            if df.empty:
+            df = conn.execute(
+                _duckdb_temporal_filter_sql(temporal_columns), [cutoff] * len(temporal_columns)
+            ).pl()
+            if len(df) == 0:
                 logger.warning(
                     "%d-day filter returned 0 rows for '%s'; "
                     "table is too old or READ_LOOKBACK_DAYS is too short — reading all rows",
                     lookback_days, uri,
                 )
-                df = conn.execute('SELECT * FROM "_source_rows"').df()
+                df = conn.execute('SELECT * FROM "_source_rows"').pl()
         _log_post_read_diagnostics(df, uri)
         return df
+    finally:
+        conn.close()
+
+
+def read_delta_sample(uri: str, storage_options: dict, n: int = 500) -> pl.DataFrame:
+    """Read at most ``n`` rows of a Delta table — for column classification.
+
+    The language-major classification passes only need column names plus a
+    small value sample, so this avoids materialising the full table during
+    Phase 1.  DuckDB's LIMIT is pushed into the Parquet scan; only the row
+    groups needed for ``n`` rows are read.
+    """
+    import app.infrastructure.repository as _r
+    if _r.DeltaTable is None:
+        from deltalake import DeltaTable as _DT
+        _r.DeltaTable = _DT
+    if _r._duckdb is None:
+        import duckdb as _ddb
+        _r._duckdb = _ddb
+
+    table = _r.DeltaTable(uri, storage_options=storage_options)
+    dataset = table.to_pyarrow_dataset()
+    conn = _r._duckdb.connect()
+    try:
+        conn.register("_source_rows", dataset)
+        return conn.execute(f'SELECT * FROM "_source_rows" LIMIT {int(n)}').pl()
     finally:
         conn.close()
 
@@ -248,24 +290,15 @@ def _upload_delta_file_group(
         list(executor.map(upload_file, files))
 
 
-def _coerce_null_columns(df: pd.DataFrame):
-    """Convert a DataFrame to a PyArrow Table, casting any null-typed columns to string.
+def _coerce_null_columns_arrow(table, null_col_names: list[str]):
+    """Cast null-typed columns in an existing PyArrow Table to ``pa.string()``.
 
-    When every value in a column is ``None`` / ``NaN``, PyArrow infers the
-    column type as ``pa.null()``.  delta-rs rejects that type with
-    ``SchemaMismatchError: Invalid data type for Delta Lake: Null``.  Casting
-    those columns to ``pa.string()`` preserves the nulls while giving
-    delta-rs a concrete, writable type.  An empty DataFrame (0 rows) is
-    handled the same way â€" column schema is fixed even though there are no
-    data rows.
+    When every value in a column is null, the Arrow schema carries a
+    ``pa.null()`` type which delta-rs rejects with ``SchemaMismatchError:
+    Invalid data type for Delta Lake: Null``.  Casting to ``pa.string()``
+    preserves the nulls while giving delta-rs a concrete, writable type.
     """
     import pyarrow as pa
-
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    null_col_names = [f.name for f in table.schema if pa.types.is_null(f.type)]
-    if not null_col_names:
-        return table
-
     logger.debug(
         "Coercing %d all-null column(s) to pa.string() for Delta write: %s",
         len(null_col_names), null_col_names,
@@ -273,21 +306,20 @@ def _coerce_null_columns(df: pd.DataFrame):
     column_order = [table.schema.field(i).name for i in range(table.num_columns)]
     columns: dict = {}
     for name in column_order:
-        orig_col = table.column(name)
-        if pa.types.is_null(table.schema.field(name).type):
+        if name in null_col_names:
             columns[name] = pa.array([None] * len(table), type=pa.string())
         else:
-            columns[name] = orig_col
-
+            columns[name] = table.column(name)
     return pa.table(columns)
 
 
-def write_delta(df: pd.DataFrame, uri: str, storage_options: dict) -> None:
-    """Write df as a Delta Lake table to OneLake/ADLS.
+def write_delta(df: pl.DataFrame, uri: str, storage_options: dict) -> None:
+    """Write a Polars DataFrame as a Delta Lake table to OneLake/ADLS.
 
-    Builds the table locally with delta-rs then uploads the full directory
-    tree â€" data files and _delta_log â€" so Fabric recognises the output as a
-    proper Delta table without additional conversion steps.
+    Polars → Arrow conversion is zero-copy for most types.  Builds the table
+    locally with delta-rs then uploads the full directory tree - data files
+    and _delta_log - so Fabric recognises the output as a proper Delta table
+    without additional conversion steps.
     """
     if len(df.columns) == 0:
         raise ValueError("Delta output requires at least one column")
@@ -307,7 +339,18 @@ def write_delta(df: pd.DataFrame, uri: str, storage_options: dict) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = pathlib.Path(tmpdir) / table_name
 
-        arrow_table = _coerce_null_columns(df)
+        import pyarrow as pa
+        # Object columns (heterogeneous Python values) cannot convert to
+        # Arrow directly — re-infer a concrete dtype from the values.  A
+        # truly mixed column raises here, matching the historical
+        # pa.Table.from_pandas(ArrowInvalid) failure mode.
+        for _col, _dtype in df.schema.items():
+            if _dtype == pl.Object:
+                df = df.with_columns(pl.Series(_col, df[_col].to_list()))
+        arrow_table = df.to_arrow()
+        null_cols = [f.name for f in arrow_table.schema if pa.types.is_null(f.type)]
+        if null_cols:
+            arrow_table = _coerce_null_columns_arrow(arrow_table, null_cols)
         write_deltalake(str(local_path), arrow_table, mode="overwrite")
 
         local_files = sorted(f for f in local_path.rglob("*") if f.is_file())

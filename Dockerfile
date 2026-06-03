@@ -3,9 +3,18 @@ FROM python:3.11-slim
 # Disable .pyc bytecode; keep stdout/stderr unbuffered for live log streaming.
 # UV_LINK_MODE=copy avoids hardlink warnings when the cache and target dirs
 # live on different filesystems (common in Docker layered builds).
+#
+# MALLOC_TRIM_THRESHOLD_=131072 makes glibc return freed heap pages to the OS
+# at a 128 KB threshold instead of its adaptive default (which can grow into
+# the tens of MB and keep large freed blocks mapped).  Combined with the
+# explicit malloc_trim(0) calls after each model release, this keeps RSS
+# tracking actual live usage so the container frees memory between the
+# language-classification passes and between tables, rather than plateauing
+# at the high-water mark.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     SPACY_MODELS_DIR=/app/models \
+    MALLOC_TRIM_THRESHOLD_=131072 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
@@ -67,5 +76,10 @@ RUN groupadd --gid 1001 appgroup \
     && chown appuser:appgroup /app/models
 
 USER appuser
+
+# Health probe endpoints (/healthz/live, /healthz/startup, /healthz/ready)
+# served by app/health.py — see deploy/containerapp.yaml for the Azure
+# Container Apps probe configuration. Override the port with HEALTH_PORT.
+EXPOSE 8080
 
 CMD ["python", "-m", "app.main"]

@@ -92,9 +92,11 @@ class TestSchemaInit:
         assert any("pii_pipeline_column_events" in s for s in sqls)
 
     def test_expected_ddl_statements(self, mock_psycopg2):
+        # 5 CREATE TABLE statements + 2 ALTER TABLE migrations
+        # (_DDL_RUNS_MIGRATIONS: key_vault_key_version, stage_seconds).
         _, _, cur = mock_psycopg2
         AuditDB("postgresql://test")
-        assert cur.execute.call_count == 5
+        assert cur.execute.call_count == 7
 
     def test_connection_committed(self, mock_psycopg2):
         _, conn, _ = mock_psycopg2
@@ -427,3 +429,29 @@ class TestConnectAuditDB:
         mocker.patch("main.psycopg2.connect", side_effect=OSError("host not found"))
         result = connect_audit_db("postgresql://unreachable/db")
         assert result is None
+
+    def test_individual_db_vars_used_when_db_host_set(self, mock_psycopg2, monkeypatch):
+        mock_connect, _, _ = mock_psycopg2
+        monkeypatch.setenv("DB_HOST", "myserver.postgres.database.azure.com")
+        monkeypatch.setenv("DB_PORT", "5432")
+        monkeypatch.setenv("DB_USER", "pipelineuser")
+        monkeypatch.setenv("DB_PASSWORD", "p@ss#w0rd!")
+        monkeypatch.setenv("DB_NAME", "pii_audit")
+        result = connect_audit_db(None)
+        assert isinstance(result, AuditDB)
+        call_kwargs = mock_connect.call_args
+        assert call_kwargs.kwargs.get("host") == "myserver.postgres.database.azure.com"
+        assert call_kwargs.kwargs.get("password") == "p@ss#w0rd!"
+        assert "dsn" not in call_kwargs.kwargs
+
+    def test_individual_db_vars_take_priority_over_database_url(self, mock_psycopg2, monkeypatch):
+        mock_connect, _, _ = mock_psycopg2
+        monkeypatch.setenv("DB_HOST", "myserver.postgres.database.azure.com")
+        monkeypatch.setenv("DB_USER", "u")
+        monkeypatch.setenv("DB_PASSWORD", "pw")
+        monkeypatch.setenv("DB_NAME", "db")
+        result = connect_audit_db("postgresql://should-be-ignored/db")
+        assert isinstance(result, AuditDB)
+        call_kwargs = mock_connect.call_args
+        assert call_kwargs.kwargs.get("host") == "myserver.postgres.database.azure.com"
+        assert "dsn" not in call_kwargs.kwargs

@@ -16,8 +16,7 @@ import math
 import re
 from decimal import Decimal
 
-import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from main import (
@@ -177,9 +176,9 @@ class TestNonStringPassthrough:
 
     @pytest.mark.parametrize("desc,value", NON_STRING_VALUES)
     def test_value_unchanged_in_dataframe(self, analyzer, desc, value):
-        df = pd.DataFrame({"col": [value]})
+        df = pl.DataFrame({"col": pl.Series("col", [value], dtype=pl.Object)})
         result_df, _stats = anonymize_dataframe(df, analyzer)
-        actual = result_df["col"].iloc[0]
+        actual = result_df["col"][0]
 
         if isinstance(value, float) and math.isnan(value):
             assert isinstance(actual, float) and math.isnan(actual), (
@@ -193,24 +192,24 @@ class TestNonStringPassthrough:
     def test_mixed_column_strings_masked_non_strings_intact(self, analyzer):
         """Strings with PII are masked; non-string scalars pass through unchanged;
         dict without PII is returned structurally identical."""
-        df = pd.DataFrame({
-            "data": [
+        df = pl.DataFrame({
+            "data": pl.Series("data", [
                 "contact jane@example.com",  # str with PII       â†’ masked
                 42,                           # int                â†’ unchanged
                 None,                         # None               â†’ unchanged
                 "No PII here at all.",        # str no PII         â†’ unchanged
                 {"key": "value"},             # dict without PII   â†’ unchanged content
                 Decimal("4111111111111111"),  # Decimal CC         â†’ unchanged
-            ]
+            ], dtype=pl.Object)
         })
         result_df, stats = anonymize_dataframe(df, analyzer)
 
-        assert "EMAIL_ADDRESS_0" in str(result_df["data"].iloc[0])  # email masked
-        assert result_df["data"].iloc[1] == 42                       # int intact
-        assert result_df["data"].iloc[2] is None                     # None intact
-        assert result_df["data"].iloc[3] == "No PII here at all."    # no-PII intact
-        assert result_df["data"].iloc[4] == {"key": "value"}         # dict intact (no PII)
-        assert result_df["data"].iloc[5] == Decimal("4111111111111111")  # Decimal intact
+        assert "EMAIL_ADDRESS_0" in str(result_df["data"][0])  # email masked
+        assert result_df["data"][1] == 42                       # int intact
+        assert result_df["data"][2] is None                     # None intact
+        assert result_df["data"][3] == "No PII here at all."    # no-PII intact
+        assert result_df["data"][4] == {"key": "value"}         # dict intact (no PII)
+        assert result_df["data"][5] == Decimal("4111111111111111")  # Decimal intact
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -220,17 +219,17 @@ class TestNonStringPassthrough:
 class TestDataFrameAnonymization:
 
     def test_email_column_masked(self, analyzer):
-        df = pd.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
+        df = pl.DataFrame({"email": ["alice@example.com", "bob@company.org"]})
         result_df, stats = anonymize_dataframe(df, analyzer)
 
-        assert "alice@example.com" not in result_df["email"].values
-        assert "bob@company.org"   not in result_df["email"].values
+        assert "alice@example.com" not in result_df["email"].to_list()
+        assert "bob@company.org"   not in result_df["email"].to_list()
         for val in result_df["email"]:
             assert "@" not in val
             assert "example.com" not in val
 
     def test_multiple_pii_types_in_one_cell(self, analyzer):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "note": [
                 "Email alice@example.com, card 4111 1111 1111 1111."
             ]
@@ -238,23 +237,23 @@ class TestDataFrameAnonymization:
         result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert stats["total_entities_detected"] >= 2
-        assert "alice@example.com" not in result_df["note"].iloc[0]
-        assert "4111 1111 1111 1111" not in result_df["note"].iloc[0]
+        assert "alice@example.com" not in result_df["note"][0]
+        assert "4111 1111 1111 1111" not in result_df["note"][0]
 
     def test_non_object_dtype_columns_skipped_entirely(self, analyzer):
-        df = pd.DataFrame({
-            "id":     pd.array([1, 2, 3], dtype="int64"),
-            "score":  pd.array([0.1, 0.2, 0.3], dtype="float64"),
-            "active": pd.array([True, False, True], dtype="bool"),
+        df = pl.DataFrame({
+            "id":     pl.Series("id", [1, 2, 3], dtype=pl.Int64),
+            "score":  pl.Series("score", [0.1, 0.2, 0.3], dtype=pl.Float64),
+            "active": pl.Series("active", [True, False, True], dtype=pl.Boolean),
         })
         result_df, stats = anonymize_dataframe(df, analyzer)
 
-        pd.testing.assert_frame_equal(result_df, df)
+        assert result_df.equals(df)
         assert stats["text_columns_scanned"] == []
         assert stats["total_entities_detected"] == 0
 
     def test_pii_column_appears_in_stats(self, analyzer):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "email":       ["a@example.com", "b@example.com"],
             "description": ["Widget A", "Widget B"],
             "qty":         [1, 2],
@@ -267,7 +266,7 @@ class TestDataFrameAnonymization:
         assert stats["total_entities_detected"] >= 2
 
     def test_no_pii_column_absent_from_detections(self, analyzer):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "category": ["Electronics", "Home & Garden", "Sports"],
         })
         _, stats = anonymize_dataframe(df, analyzer)
@@ -276,7 +275,7 @@ class TestDataFrameAnonymization:
         assert stats["total_entities_detected"] == 0
 
     def test_column_stats_list_length_matches_text_cols(self, analyzer):
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "name":  ["Alice Smith"],
             "qty":   [5],
             "notes": ["No issues found."],
@@ -290,13 +289,13 @@ class TestDataFrameAnonymization:
 
     def test_original_dataframe_not_mutated(self, analyzer):
         """anonymize_dataframe must operate on a copy, not the original."""
-        df = pd.DataFrame({"email": ["alice@example.com"]})
-        original = df["email"].iloc[0]
+        df = pl.DataFrame({"email": ["alice@example.com"]})
+        original = df["email"][0]
         anonymize_dataframe(df, analyzer)
-        assert df["email"].iloc[0] == original
+        assert df["email"][0] == original
 
     def test_empty_dataframe_returns_zero_stats(self, analyzer):
-        df = pd.DataFrame({"email": pd.Series([], dtype=object)})
+        df = pl.DataFrame({"email": pl.Series("email", [], dtype=pl.String)})
         result_df, stats = anonymize_dataframe(df, analyzer)
 
         assert len(result_df) == 0
@@ -304,10 +303,10 @@ class TestDataFrameAnonymization:
         assert stats["columns_with_detections"] == []
 
     def test_all_null_column_leaves_nulls_intact(self, analyzer):
-        df = pd.DataFrame({"email": [None, None, None]})
+        df = pl.DataFrame({"email": pl.Series("email", [None, None, None], dtype=pl.String)})
         result_df, stats = anonymize_dataframe(df, analyzer)
 
-        assert result_df["email"].isna().all()
+        assert result_df["email"].is_null().all()
         assert stats["total_entities_detected"] == 0
 
 
@@ -371,15 +370,15 @@ class TestEntityRegistry:
     def test_consistent_across_rows_in_dataframe(self, analyzer):
         """The same email address in two rows maps to the same token."""
         registry = EntityRegistry()
-        df = pd.DataFrame({"email": ["alice@example.com", "alice@example.com"]})
+        df = pl.DataFrame({"email": ["alice@example.com", "alice@example.com"]})
         result_df, _ = anonymize_dataframe(df, analyzer, registry)
-        assert result_df["email"].iloc[0] == result_df["email"].iloc[1]
+        assert result_df["email"][0] == result_df["email"][1]
 
     def test_different_emails_get_different_tokens(self, analyzer):
         registry = EntityRegistry()
-        df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
+        df = pl.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
         result_df, _ = anonymize_dataframe(df, analyzer, registry)
-        assert result_df["email"].iloc[0] != result_df["email"].iloc[1]
+        assert result_df["email"][0] != result_df["email"][1]
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -390,66 +389,66 @@ class TestJSONAndDictAnonymization:
     """anonymize_dataframe must recurse into JSON strings and native dicts/lists."""
 
     def test_json_string_email_anonymized(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"name": "Alice", "email": "alice@example.com"}']})
+        df = pl.DataFrame({"payload": ['{"name": "Alice", "email": "alice@example.com"}']})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert "alice@example.com" not in parsed["email"]
         assert "@" not in parsed["email"]
 
     def test_json_output_is_valid_json(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"score": 100, "note": "Contact bob@company.com"}']})
+        df = pl.DataFrame({"payload": ['{"score": 100, "note": "Contact bob@company.com"}']})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert isinstance(parsed, dict)
         assert parsed["score"] == 100
 
     def test_nested_json_pii_anonymized(self, analyzer):
         payload = '{"contact": {"name": "John Smith", "email": "john@example.com"}}'
-        df = pd.DataFrame({"payload": [payload]})
+        df = pl.DataFrame({"payload": [payload]})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert "john@example.com" not in parsed["contact"]["email"]
 
     def test_json_array_pii_anonymized(self, analyzer):
-        df = pd.DataFrame({"contacts": ['["alice@example.com", "bob@example.com"]']})
+        df = pl.DataFrame({"contacts": ['["alice@example.com", "bob@example.com"]']})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["contacts"].iloc[0])
+        parsed = json.loads(result_df["contacts"][0])
         for item in parsed:
             assert "example.com" not in item
 
     def test_native_dict_pii_anonymized(self, analyzer):
-        df = pd.DataFrame({"data": [{"email": "alice@example.com", "score": 10}]})
+        df = pl.DataFrame({"data": pl.Series("data", [{"email": "alice@example.com", "score": 10}], dtype=pl.Object)})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        result = result_df["data"].iloc[0]
+        result = result_df["data"][0]
         assert isinstance(result, dict)
         assert "alice@example.com" not in result["email"]
         assert result["score"] == 10  # numeric value preserved
 
     def test_native_list_pii_anonymized(self, analyzer):
-        df = pd.DataFrame({"emails": [["alice@example.com", "bob@example.com"]]})
+        df = pl.DataFrame({"emails": pl.Series("emails", [["alice@example.com", "bob@example.com"]], dtype=pl.Object)})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        result = result_df["emails"].iloc[0]
+        result = result_df["emails"][0]
         assert isinstance(result, list)
         for item in result:
             assert "example.com" not in item
 
     def test_json_stats_counted(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"email": "alice@example.com"}']})
+        df = pl.DataFrame({"payload": ['{"email": "alice@example.com"}']})
         _, stats = anonymize_dataframe(df, analyzer)
         assert stats["total_entities_detected"] >= 1
         assert "payload" in stats["columns_with_detections"]
 
     def test_non_pii_json_structure_preserved(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"status": "completed", "score": 42}']})
+        df = pl.DataFrame({"payload": ['{"status": "completed", "score": 42}']})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert parsed["status"] == "completed"
         assert parsed["score"] == 42
 
     def test_numeric_json_values_preserved(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"id": 123, "ratio": 9.5, "active": true}']})
+        df = pl.DataFrame({"payload": ['{"id": 123, "ratio": 9.5, "active": true}']})
         result_df, _ = anonymize_dataframe(df, analyzer)
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert parsed["id"] == 123
         assert abs(parsed["ratio"] - 9.5) < 1e-9
 
@@ -472,28 +471,28 @@ class TestJSONAndDictAnonymization:
         assert len(findings) == 2
 
     def test_json_object_key_pii_anonymized(self, analyzer):
-        df = pd.DataFrame({"payload": ['{"alice@example.com": "primary contact"}']})
+        df = pl.DataFrame({"payload": ['{"alice@example.com": "primary contact"}']})
 
         result_df, _ = anonymize_dataframe(df, analyzer)
 
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert "alice@example.com" not in parsed
         assert any(key.startswith("EMAIL_ADDRESS_") for key in parsed)
 
     def test_json_string_primitive_remains_valid_json(self, analyzer):
-        df = pd.DataFrame({"payload": ['"alice@example.com"']})
+        df = pl.DataFrame({"payload": ['"alice@example.com"']})
 
         result_df, _ = anonymize_dataframe(df, analyzer)
 
-        parsed = json.loads(result_df["payload"].iloc[0])
+        parsed = json.loads(result_df["payload"][0])
         assert parsed.startswith("EMAIL_ADDRESS_")
 
     def test_native_dict_with_non_string_keys_preserved(self, analyzer):
-        df = pd.DataFrame({"payload": [{1: "alice@example.com", "score": 10}]})
+        df = pl.DataFrame({"payload": pl.Series("payload", [{1: "alice@example.com", "score": 10}], dtype=pl.Object)})
 
         result_df, _ = anonymize_dataframe(df, analyzer)
 
-        result = result_df["payload"].iloc[0]
+        result = result_df["payload"][0]
         assert result[1].startswith("EMAIL_ADDRESS_")
         assert result["score"] == 10
 
@@ -1038,7 +1037,7 @@ class TestIPv6EdgeFormats:
     def test_residual_check_catches_unmasked_ipv6(self):
         """Belt-and-braces: even if the upstream recognizer misses an IPv6,
         the residual safety net must abort the pipeline."""
-        df = pd.DataFrame({"log": ["Connection from fe80::1ff:fe23:4567:890a refused."]})
+        df = pl.DataFrame({"log": ["Connection from fe80::1ff:fe23:4567:890a refused."]})
         with pytest.raises(RuntimeError, match="IP_ADDRESS"):
             from main import validate_residual_pii
             validate_residual_pii(df)
@@ -1359,7 +1358,7 @@ class TestColumnNamePIIPolicy:
     def test_column_policy_masks_known_pii(
         self, analyzer, case_id, column, values, expected_entity, expected_action,
     ):
-        df = pd.DataFrame({column: values})
+        df = pl.DataFrame({column: values})
         policies = classify_pii_columns(df, analyzer=analyzer)
 
         assert column in policies, (
@@ -1386,15 +1385,15 @@ class TestColumnNamePIIPolicy:
 
         # Every original value must be absent from the masked column.
         for original in values:
-            assert original not in masked[column].astype(str).tolist(), (
+            assert original not in masked[column].cast(pl.String).to_list(), (
                 f"[{case_id}] Original value {original!r} leaked in masked "
-                f"column: {masked[column].tolist()}"
+                f"column: {masked[column].to_list()}"
             )
 
         # Equal inputs must map to equal outputs (joinability under HASH,
         # consistent tokenisation under TOKENIZE).
         if values.count(values[0]) > 1 or True:
-            paired_df = pd.DataFrame({column: values + [values[0]]})
+            paired_df = pl.DataFrame({column: values + [values[0]]})
             paired_policies = classify_pii_columns(paired_df, analyzer=analyzer)
             paired_masked, _ = apply_column_policies(
                 paired_df, paired_policies,
@@ -1402,10 +1401,10 @@ class TestColumnNamePIIPolicy:
                 pseudonymizer=pseudonymizer,
             )
             assert (
-                paired_masked[column].iloc[0] == paired_masked[column].iloc[-1]
+                paired_masked[column][0] == paired_masked[column][-1]
             ), (
                 f"[{case_id}] Identical inputs produced different outputs â€” "
-                f"not deterministic: {paired_masked[column].tolist()}"
+                f"not deterministic: {paired_masked[column].to_list()}"
             )
 
     @pytest.mark.parametrize(
@@ -1415,7 +1414,7 @@ class TestColumnNamePIIPolicy:
     def test_free_text_columns_not_force_masked(
         self, analyzer, case_id, column, values,
     ):
-        df = pd.DataFrame({column: values})
+        df = pl.DataFrame({column: values})
         policies = classify_pii_columns(df, analyzer=analyzer)
         assert column in policies, f"[{case_id}] No policy for {column!r}"
         policy = policies[column]
@@ -1432,7 +1431,7 @@ class TestColumnNamePIIPolicy:
         recognizer misses them, but the column-policy layer must mask
         every value because the column NAME identifies the entity type
         (or presidio-structured aggregates enough weak signals)."""
-        df = pd.DataFrame({"first_name": ["Jimmy", "Michael", "Anna", "Bob", "Carol"]})
+        df = pl.DataFrame({"first_name": ["Jimmy", "Michael", "Anna", "Bob", "Carol"]})
         policies = classify_pii_columns(df, analyzer=analyzer)
         assert policies["first_name"].action == ACTION_TOKENIZE
         assert policies["first_name"].entity_type == "PERSON"
@@ -1443,9 +1442,9 @@ class TestColumnNamePIIPolicy:
             pseudonymizer=_LockedTestPseudonymizer(),
         )
         for original in ["Jimmy", "Michael", "Anna", "Bob", "Carol"]:
-            assert original not in masked["first_name"].tolist(), (
+            assert original not in masked["first_name"].to_list(), (
                 f"Personal name {original!r} leaked through column-policy "
-                f"layer: {masked['first_name'].tolist()}"
+                f"layer: {masked['first_name'].to_list()}"
             )
         # Every value should now be a PERSON_N token.
         for value in masked["first_name"]:
@@ -1503,7 +1502,7 @@ class TestIdentifierNamePattern:
     @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_PATTERN_CASES)
     def test_id_named_column_gets_action_hash(self, column, values):
         """Tier A1 pins to ACTION_HASH regardless of value content."""
-        df = pd.DataFrame({column: values})
+        df = pl.DataFrame({column: values})
         policies: dict = {}
         _tier_a1_name_pattern(df, policies)
         assert column in policies, (
@@ -1521,7 +1520,7 @@ class TestIdentifierNamePattern:
     @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_PATTERN_CASES)
     def test_id_named_column_not_overridden_by_b1_b2(self, analyzer, column, values):
         """Full classify_pii_columns must not let B1/B2 override the name-pattern decision."""
-        df = pd.DataFrame({column: values})
+        df = pl.DataFrame({column: values})
         # Pass an empty similarity_models dict to isolate from spaCy model availability
         policies = classify_pii_columns(df, analyzer=analyzer, similarity_models={})
         assert column in policies
@@ -1533,7 +1532,7 @@ class TestIdentifierNamePattern:
 
     def test_purview_overrides_name_pattern(self, analyzer):
         """Purview (Tier A) is authoritative and must override Tier A1."""
-        df = pd.DataFrame({"employee_id": ["EMP001", "EMP002"]})
+        df = pl.DataFrame({"employee_id": ["EMP001", "EMP002"]})
         # Purview says this is a PERSON column â€” that overrides the name-pattern tier.
         policies = classify_pii_columns(
             df,
@@ -1548,7 +1547,7 @@ class TestIdentifierNamePattern:
     @pytest.mark.parametrize("column,values", IDENTIFIER_NAME_FP_CASES)
     def test_non_text_id_columns_skipped(self, column, values):
         """Numeric and boolean columns are excluded from name-pattern classification."""
-        df = pd.DataFrame({column: values})
+        df = pl.DataFrame({column: values})
         policies: dict = {}
         _tier_a1_name_pattern(df, policies)
         assert column not in policies, (

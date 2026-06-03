@@ -34,11 +34,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 from typing import Any
 
-import pandas as pd
-
 logger = logging.getLogger(__name__)
+
+
+def _is_null_value(value: object) -> bool:
+    """None / NaN check without a pandas dependency."""
+    return value is None or (isinstance(value, float) and math.isnan(value))
 
 # Fixed domain separator used by LocalHashPseudonymizer when no HASH_SALT is set.
 _LOCAL_HASH_DEFAULT_SALT = b"fabric-pii-pipeline:local-hash:v1"
@@ -115,11 +119,8 @@ class KeyVaultPseudonymizer:
         return hashlib.sha256(signature).digest()
 
     def pseudonymize(self, value: object) -> object:
-        try:
-            if pd.isna(value):
-                return value
-        except (TypeError, ValueError):
-            pass
+        if _is_null_value(value):
+            return value
         raw = value if isinstance(value, str) else str(value)
         token = hmac.new(self._derived_secret, raw.encode("utf-8"), hashlib.sha256).hexdigest()
         return token[:_PSEUDONYM_HEX_LENGTH]
@@ -151,11 +152,8 @@ class LocalHashPseudonymizer:
             )
 
     def pseudonymize(self, value: object) -> object:
-        try:
-            if pd.isna(value):
-                return value
-        except (TypeError, ValueError):
-            pass
+        if _is_null_value(value):
+            return value
         raw = value if isinstance(value, str) else str(value)
         return hmac.new(self._secret, raw.encode("utf-8"), hashlib.sha256).hexdigest()[
             :_PSEUDONYM_HEX_LENGTH

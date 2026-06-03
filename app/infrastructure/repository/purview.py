@@ -27,7 +27,7 @@ class PurviewClient:
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
                 "azure-purview-catalog is required for Purview integration. "
-                "Install it with: uv add 'azure-purview-catalog>=0.2.0,<1.0.0'"
+                "Install it with: uv add 'azure-purview-catalog>=1.0.0b4,<2.0.0'"
             ) from exc
         from .auth import _credential_instance
         self._client = PurviewCatalogClient(
@@ -43,7 +43,10 @@ class PurviewClient:
         caller treats Purview as unavailable rather than aborting the pipeline.
         """
         try:
-            data = self._client.entity.get_by_unique_attribute(
+            # SDK 1.0.0b4 method name (plural).  Earlier code called the
+            # singular `get_by_unique_attribute`, which no installable
+            # release of azure-purview-catalog ever exposed.
+            data = self._client.entity.get_by_unique_attributes(
                 "azure_datalake_gen2_path",
                 attr_qualified_name=qualified_name,
             )
@@ -88,8 +91,13 @@ def run_purview_check(
     if not purview_account:
         return empty
     try:
-        client = PurviewClient(purview_account)
-        col_labels = client.column_classifications(PurviewClient.qualified_name(source_uri))
+        # Resolve the client class through the package namespace so test
+        # patches of ``app.infrastructure.repository.PurviewClient`` (and the
+        # ``main.run_purview_check`` wrapper that swaps it in) take effect.
+        import app.infrastructure.repository as _r
+        client_cls = getattr(_r, "PurviewClient", PurviewClient)
+        client = client_cls(purview_account)
+        col_labels = client.column_classifications(client_cls.qualified_name(source_uri))
         flagged = list(col_labels.keys())
         return {
             "available": True,

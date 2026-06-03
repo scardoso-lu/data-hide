@@ -2,7 +2,7 @@
 import types
 from types import SimpleNamespace
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from app.domain.classification import (
@@ -93,7 +93,7 @@ def test_anonymize_dataframe_caches_repeated_text_values():
             return [_f("PERSON", start, start + len("Alice"))]
 
     analyzer = FakeAnalyzer()
-    df = pd.DataFrame({"name": ["Alice", "Alice", "Bob"]})
+    df = pl.DataFrame({"name": ["Alice", "Alice", "Bob"]})
 
     result, stats = anonymize_dataframe(df, analyzer, EntityRegistry())
 
@@ -103,14 +103,14 @@ def test_anonymize_dataframe_caches_repeated_text_values():
 
 
 def test_residual_validation_catches_deterministic_email():
-    df = pd.DataFrame({"email": ["alice@example.com"]})
+    df = pl.DataFrame({"email": ["alice@example.com"]})
 
     with pytest.raises(RuntimeError, match="email.EMAIL_ADDRESS=1"):
         validate_residual_pii(df)
 
 
 def test_residual_validation_ignores_structured_metadata_false_positives():
-    df = pd.DataFrame({
+    df = pl.DataFrame({
         "dataset_last_update": ["2026-05-23T14:45:20"],
         "record_key": ["LU280019400644750000"],
         "resource_last_modified": ["2026-05-23 14:45:20"],
@@ -121,7 +121,7 @@ def test_residual_validation_ignores_structured_metadata_false_positives():
 
 
 def test_residual_validation_ignores_numeric_measure_false_positives():
-    df = pd.DataFrame({
+    df = pl.DataFrame({
         "announced_price_eur_current_raw": ["4111111111111111", "1640000"],
         "announced_price_m2_eur_current_raw": ["4999123", "5500000000000004"],
     })
@@ -130,7 +130,7 @@ def test_residual_validation_ignores_numeric_measure_false_positives():
 
 
 def test_residual_validation_still_blocks_explicit_structured_pii_columns():
-    df = pd.DataFrame({
+    df = pl.DataFrame({
         "phone": ["+352 621 123 456"],
         "credit_card": ["4111111111111111"],
         "iban": ["GB29NWBK60161331926819"],
@@ -269,43 +269,43 @@ class TestAnonymizeDataframeScanColumns:
 
     def test_only_listed_columns_are_scanned(self):
         analyzer = FakeAnalyzerPersonOnly()
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "notes": ["Alice went to Paris"],
             "status": ["Alice"],
         })
         result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=["notes"])
 
-        assert "PERSON_0" in result["notes"].iloc[0]
-        assert result["status"].iloc[0] == "Alice"
+        assert "PERSON_0" in result["notes"][0]
+        assert result["status"][0] == "Alice"
         assert stats["text_columns_scanned"] == ["notes"]
 
     def test_none_scan_columns_scans_all_text_columns(self):
         analyzer = FakeAnalyzerPersonOnly()
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "notes": ["Alice went to Paris"],
             "status": ["Alice"],
         })
         result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=None)
 
-        assert "PERSON_0" in result["notes"].iloc[0]
-        assert "PERSON_0" in result["status"].iloc[0]
+        assert "PERSON_0" in result["notes"][0]
+        assert "PERSON_0" in result["status"][0]
         assert set(stats["text_columns_scanned"]) == {"notes", "status"}
 
     def test_empty_scan_columns_skips_all(self):
         analyzer = FakeAnalyzerPersonOnly()
-        df = pd.DataFrame({"notes": ["Alice went to Paris"]})
+        df = pl.DataFrame({"notes": ["Alice went to Paris"]})
         result, stats = anonymize_dataframe(df, analyzer, EntityRegistry(), scan_columns=[])
 
-        assert result["notes"].iloc[0] == "Alice went to Paris"
+        assert result["notes"][0] == "Alice went to Paris"
         assert stats["text_columns_scanned"] == []
 
     def test_nonexistent_scan_column_is_ignored(self):
         analyzer = FakeAnalyzerPersonOnly()
-        df = pd.DataFrame({"notes": ["Alice went to Paris"]})
+        df = pl.DataFrame({"notes": ["Alice went to Paris"]})
         result, stats = anonymize_dataframe(
             df, analyzer, EntityRegistry(), scan_columns=["notes", "nonexistent"]
         )
-        assert "PERSON_0" in result["notes"].iloc[0]
+        assert "PERSON_0" in result["notes"][0]
         assert stats["text_columns_scanned"] == ["notes"]
 
 
@@ -372,7 +372,7 @@ class TestTierCFallback:
         def analyze(self, text, entities=None, language=None, score_threshold=None):
             return []
 
-    def _classify(self, df: pd.DataFrame) -> dict[str, ColumnPolicy]:
+    def _classify(self, df: pl.DataFrame) -> dict[str, ColumnPolicy]:
         return classify_pii_columns(
             df,
             analyzer=self._NullAnalyzer(),
@@ -387,7 +387,7 @@ class TestTierCFallback:
             "Follow-up needed: the delivery was delayed by three days due to a warehouse issue.",
             "Agent noted the account has been flagged for unusual login activity in the past week.",
         ]
-        df = pd.DataFrame({"notes": long_values})
+        df = pl.DataFrame({"notes": long_values})
         policies = self._classify(df)
 
         assert "notes" in policies
@@ -396,7 +396,7 @@ class TestTierCFallback:
 
     def test_many_words_column_gets_action_scan(self):
         # avg_words >= 5 path
-        df = pd.DataFrame({"remarks": ["one two three four five six", "a b c d e f g"]})
+        df = pl.DataFrame({"remarks": ["one two three four five six", "a b c d e f g"]})
         policies = self._classify(df)
 
         assert "remarks" in policies
@@ -404,7 +404,7 @@ class TestTierCFallback:
 
     def test_json_blob_column_gets_action_scan(self):
         # jsonish >= 0.5 path
-        df = pd.DataFrame({"payload": ['{"event": "click", "user": "u1"}', '{"event": "view"}']})
+        df = pl.DataFrame({"payload": ['{"event": "click", "user": "u1"}', '{"event": "view"}']})
         policies = self._classify(df)
 
         assert "payload" in policies
@@ -413,7 +413,7 @@ class TestTierCFallback:
     # â”€â”€ ACTION_BIN paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_short_structured_column_gets_action_bin(self):
-        df = pd.DataFrame({"status": ["Active", "Inactive", "Pending"]})
+        df = pl.DataFrame({"status": ["Active", "Inactive", "Pending"]})
         policies = self._classify(df)
 
         assert "status" in policies
@@ -421,7 +421,7 @@ class TestTierCFallback:
         assert "status" not in free_text_columns_from_policies(policies)
 
     def test_single_word_enum_column_gets_action_bin(self):
-        df = pd.DataFrame({"type": ["A", "B", "C", "D"]})
+        df = pl.DataFrame({"type": ["A", "B", "C", "D"]})
         policies = self._classify(df)
 
         assert "type" in policies
@@ -430,13 +430,13 @@ class TestTierCFallback:
     # â”€â”€ Metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_fallback_policy_source_is_fallback(self):
-        df = pd.DataFrame({"notes": ["short"]})
+        df = pl.DataFrame({"notes": ["short"]})
         policies = self._classify(df)
 
         assert policies["notes"].source == "fallback"
 
     def test_fallback_policy_entity_type_is_free_text(self):
-        df = pd.DataFrame({"notes": ["short"]})
+        df = pl.DataFrame({"notes": ["short"]})
         policies = self._classify(df)
 
         assert policies["notes"].entity_type == FREE_TEXT
@@ -444,7 +444,7 @@ class TestTierCFallback:
     # â”€â”€ Non-text columns skipped â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_numeric_column_not_added_to_policies(self):
-        df = pd.DataFrame({"age": [25, 30, 35]})
+        df = pl.DataFrame({"age": [25, 30, 35]})
         policies = self._classify(df)
 
         assert "age" not in policies
@@ -452,7 +452,7 @@ class TestTierCFallback:
     # â”€â”€ Pre-classified columns not overwritten â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def test_already_classified_column_not_overwritten(self):
-        df = pd.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
+        df = pl.DataFrame({"email": ["alice@example.com", "bob@example.com"]})
         existing = ColumnPolicy(
             column="email", entity_type="EMAIL_ADDRESS",
             action=ACTION_HASH, source="presidio_structured", score=0.9,
@@ -483,7 +483,7 @@ class TestScanColumnsIntegration:
             "Alice contacted support about a billing issue with her account last Tuesday.",
             "The customer Alice reported that her order was missing two items from the shipment.",
         ]
-        df = pd.DataFrame({
+        df = pl.DataFrame({
             "notes": free_text,
             "status": ["Open", "Closed"],          # short structured â†’ ACTION_BIN
         })
@@ -510,7 +510,7 @@ class TestDetectColumnLanguage:
     """_detect_column_language must return the majority language from a sample."""
 
     def test_english_column_returns_en(self):
-        series = pd.Series([
+        series = pl.Series([
             "The customer placed an order yesterday.",
             "Please contact support for further assistance.",
             "Your invoice has been processed successfully.",
@@ -518,7 +518,7 @@ class TestDetectColumnLanguage:
         assert _detect_column_language(series) == "en"
 
     def test_french_column_returns_fr(self):
-        series = pd.Series([
+        series = pl.Series([
             "Le client a passÃ© une commande hier.",
             "Veuillez contacter le support pour obtenir de l'aide.",
             "Votre facture a Ã©tÃ© traitÃ©e avec succÃ¨s.",
@@ -526,20 +526,20 @@ class TestDetectColumnLanguage:
         assert _detect_column_language(series) == "fr"
 
     def test_empty_series_returns_en(self):
-        assert _detect_column_language(pd.Series([], dtype="object")) == "en"
+        assert _detect_column_language(pl.Series("s", [], dtype=pl.String)) == "en"
 
     def test_all_null_series_returns_en(self):
-        assert _detect_column_language(pd.Series([None, None])) == "en"
+        assert _detect_column_language(pl.Series("s", [None, None], dtype=pl.String)) == "en"
 
     def test_all_blank_strings_returns_en(self):
-        assert _detect_column_language(pd.Series(["", "   "])) == "en"
+        assert _detect_column_language(pl.Series(["", "   "])) == "en"
 
     def test_non_string_values_ignored(self):
-        series = pd.Series([42, None, True])
+        series = pl.Series("s", [42, None, True], dtype=pl.Object)
         assert _detect_column_language(series) == "en"
 
     def test_homogeneous_majority_returns_language(self):
-        series = pd.Series([
+        series = pl.Series([
             "English sentence one.",
             "English sentence two.",
             "English sentence three.",
@@ -551,7 +551,7 @@ class TestDetectColumnLanguage:
 
     def test_mixed_language_column_returns_none(self):
         # Luxembourg-style comment column: en / fr / de / lb all present
-        series = pd.Series([
+        series = pl.Series([
             "The customer placed an order yesterday.",
             "Le client a passÃ© une commande hier.",
             "Der Kunde hat gestern eine Bestellung aufgegeben.",
@@ -566,7 +566,7 @@ class TestDetectColumnLanguage:
         # We use a counting wrapper around _detect_language.
         calls = []
         original = _detect_language.__wrapped__  # unwrap lru_cache
-        series = pd.Series([f"English text row {i}" for i in range(100)])
+        series = pl.Series([f"English text row {i}" for i in range(100)])
 
         import app.domain.anonymization as anon_mod
         original_fn = anon_mod._detect_language
@@ -616,7 +616,7 @@ class TestAnalyzeLanguageFastPath:
                 received_languages.append(language)
                 return []
 
-        df = pd.DataFrame({"notes": [
+        df = pl.DataFrame({"notes": [
             "The customer placed an order yesterday.",
             "Please contact support for further assistance.",
             "Your invoice has been processed successfully.",
@@ -637,7 +637,7 @@ class TestAnalyzeLanguageFastPath:
                 return []
 
         # Four rows, each in a different language â†’ column returns None â†’ per-value
-        df = pd.DataFrame({"comments": [
+        df = pl.DataFrame({"comments": [
             "The customer placed an order yesterday.",
             "Le client a passÃ© une commande hier.",
             "Der Kunde hat gestern eine Bestellung aufgegeben.",

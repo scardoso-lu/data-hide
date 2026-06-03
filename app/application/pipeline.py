@@ -16,7 +16,7 @@ import os
 from time import perf_counter
 import uuid
 
-import pandas as pd
+import polars as pl
 
 from ..domain.aggregation import aggregate_gps_table, detect_speed_column
 from ..domain.anonymization import (
@@ -28,6 +28,7 @@ from ..domain.anonymization import (
     build_engines,
     enforce_k_anonymity,
     pseudonymize_identifier_columns,
+    release_engines,
     validate_residual_pii,
 )
 from ..domain.classification import (
@@ -38,11 +39,14 @@ from ..domain.classification import (
     apply_column_policies,
     classify_columns,
     classify_pii_columns,
+    classify_pii_columns_multi_pass,
     detect_gps_columns,
     detect_timestamp_columns,
     free_text_columns_from_policies,
+    release_sequential_model,
 )
 from ..infrastructure.keyvault import LocalHashPseudonymizer, build_pseudonymizer_from_env
+from ..infrastructure.repository.delta import _process_rss_mb
 from ..infrastructure.repository import (
     AuditDB,
     TableMapping,
@@ -50,6 +54,7 @@ from ..infrastructure.repository import (
     connect_audit_db,
     discover_table_mappings,
     read_delta,
+    read_delta_sample,
     read_sql_table,
     run_purview_check,
     write_delta,
@@ -101,7 +106,8 @@ class PipelineConfig:
 
         Secrets and connectivity settings are **always** read from the
         environment and cannot be overridden via the database:
-        ``DATABASE_URL``, ``AZURE_*``, ``KEY_VAULT_URL``,
+        ``DATABASE_URL`` (or ``DB_HOST`` / ``DB_PORT`` / ``DB_USER`` /
+        ``DB_PASSWORD`` / ``DB_NAME``), ``AZURE_*``, ``KEY_VAULT_URL``,
         ``KEY_VAULT_RSA_KEY_NAME``, ``HASH_SALT``,
         ``SOURCE_BASE_ABFSS_URI``, ``TARGET_BASE_ABFSS_URI``.
         """
@@ -240,6 +246,15 @@ def timed_stage(audit: dict, name: str):
         yield
     finally:
         audit.setdefault("stage_seconds", {})[name] = round(perf_counter() - start, 6)
+        # Per-stage RSS so OOM kills can be attributed from the container log:
+        # the last "stage_rss" line before exit code 137 names the stage that
+        # was running when the limit was hit, and the audit row (pre-populated
+        # by open_run) survives even though the kill bypasses finally-blocks
+        # in the data path.
+        rss = _process_rss_mb()
+        if rss is not None:
+            audit.setdefault("stage_rss_mb", {})[name] = round(rss)
+            logger.info("stage_rss: stage=%s rss=%d MB", name, round(rss))
 
 
 def resolve_table_mappings(config: PipelineConfig) -> list[TableMapping]:
@@ -304,7 +319,7 @@ def record_alert(db: AuditDB | None, run_id: str | None, mapping: TableMapping |
         logger.error("Alert persistence failed: %s", exc)
 
 
-def _read_source_table(config: PipelineConfig, mapping: TableMapping) -> pd.DataFrame:
+def _read_source_table(config: PipelineConfig, mapping: TableMapping) -> pl.DataFrame:
     if mapping.read_mode == "sql":
         return read_sql_table(
             mapping.table_name,
@@ -314,6 +329,28 @@ def _read_source_table(config: PipelineConfig, mapping: TableMapping) -> pd.Data
         )
     if mapping.read_mode == "delta":
         return read_delta(mapping.source_uri, _fresh_opts(mapping.source_uri))
+    raise RuntimeError(f"Unsupported read_mode {mapping.read_mode!r} for table {mapping.table_name!r}")
+
+
+_CLASSIFICATION_SAMPLE_ROWS = 500
+
+
+def _read_source_sample(config: PipelineConfig, mapping: TableMapping) -> pl.DataFrame:
+    """Read at most ``_CLASSIFICATION_SAMPLE_ROWS`` rows for Phase 1
+    classification — the full table is only materialised later, in Phase 2,
+    after every model has been released."""
+    if mapping.read_mode == "sql":
+        return read_sql_table(
+            mapping.table_name,
+            config.sql_endpoint,
+            config.sql_database,
+            schema=mapping.schema or "dbo",
+            limit=_CLASSIFICATION_SAMPLE_ROWS,
+        )
+    if mapping.read_mode == "delta":
+        return read_delta_sample(
+            mapping.source_uri, _fresh_opts(mapping.source_uri), n=_CLASSIFICATION_SAMPLE_ROWS,
+        )
     raise RuntimeError(f"Unsupported read_mode {mapping.read_mode!r} for table {mapping.table_name!r}")
 
 
@@ -335,7 +372,7 @@ def _profile_columns_by_category(profiles, category: str) -> list[str]:
     return [profile.name for profile in profiles if category in profile.categories]
 
 
-def _configured_or_profiled_columns(configured: tuple[str, ...], profiles, category: str, df: pd.DataFrame) -> list[str]:
+def _configured_or_profiled_columns(configured: tuple[str, ...], profiles, category: str, df: pl.DataFrame) -> list[str]:
     if configured:
         return [col for col in configured if col in df.columns]
     return _profile_columns_by_category(profiles, category)
@@ -350,7 +387,23 @@ def _close_audit_run(db: AuditDB | None, run_id: str, audit: dict) -> None:
         logger.warning("Audit close_run failed (non-fatal): %s", exc)
 
 
-def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None, run_id: str | None = None) -> dict:
+def run_table(
+    config: PipelineConfig,
+    mapping: TableMapping,
+    db: AuditDB | None,
+    run_id: str | None = None,
+    *,
+    analyzer=None,
+    policies: dict | None = None,
+) -> dict:
+    """Process one table end to end.
+
+    ``policies`` — pre-computed column policies from the Phase 1
+    language-major classification passes (see ``run_pipeline``).  When
+    provided, no NLP engine or spaCy model is needed (or loaded) for this
+    table: classification already happened on a small sample, and every
+    remaining stage (masking, binning, k-anonymity, write) is model-free.
+    """
     run_id = run_id or str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
     audit = _new_audit(config)
@@ -445,7 +498,7 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 qi_cols = _configured_or_profiled_columns(_table_qi_cols, column_profiles, QUASI_IDENTIFIER, df_raw)
                 qi_cols = list(dict.fromkeys(gps_anonymized + ts_binned + qi_cols))
                 audit["quasi_columns"] = qi_cols
-                numeric_qi = [c for c in qi_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
+                numeric_qi = [c for c in qi_cols if df_raw.schema[c].is_numeric()]
                 if numeric_qi:
                     df_raw, num_binned = bin_numeric_columns(df_raw, numeric_qi)
                     audit["numeric_columns_binned"] = num_binned
@@ -459,8 +512,6 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
                 )
                 audit["quasi_columns"] = []
 
-        with timed_stage(audit, "build_engines"):
-            analyzer = build_engines()
         registry = EntityRegistry()
 
         # ── Column-policy classification (Phase 2/3 of the column-aware
@@ -469,12 +520,30 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         # Hash/tokenise classified columns BEFORE row-by-row Presidio scans.
         # Failures here are non-fatal — the existing per-cell scan remains
         # the backstop.
+        #
+        # Preferred flow: ``policies`` arrives pre-computed from the Phase 1
+        # language-major sample passes in run_pipeline — no model is loaded
+        # in this function at all.  The inline branch below remains for
+        # direct callers (parallel workers, tests).
         with timed_stage(audit, "column_policy_classification"):
-            try:
-                policies = classify_pii_columns(df_raw, analyzer=analyzer)
-            except Exception as exc:
-                logger.warning("Column-policy classification failed (non-fatal): %s", exc)
-                policies = {}
+            if policies is not None:
+                policies = dict(policies)
+            else:
+                if analyzer is None:
+                    with timed_stage(audit, "build_engines"):
+                        # English-only — see the comment in run_pipeline().
+                        analyzer = build_engines(("en",))
+                try:
+                    policies = classify_pii_columns(df_raw, analyzer=analyzer)
+                except Exception as exc:
+                    logger.warning("Column-policy classification failed (non-fatal): %s", exc)
+                    policies = {}
+
+        # Columns pseudonymized above already hold deterministic hashes —
+        # masking them again (e.g. a Tier B1 PERSON vote from raw sample
+        # values) would tokenise the hashes and break join keys.
+        if pseudonymized:
+            policies = {c: p for c, p in policies.items() if c not in set(pseudonymized)}
 
         # Drop columns that the operator explicitly excluded from anonymization
         # (pii_column_exclusions table in PostgreSQL).  These columns pass
@@ -596,6 +665,26 @@ def run_table(config: PipelineConfig, mapping: TableMapping, db: AuditDB | None,
         _close_audit_run(db, run_id, audit)
 
 
+def _release_between_tables() -> None:
+    """Drop refs held by per-table caches and return freed pages to the OS.
+
+    Between Phase 2 tables: collect garbage (the previous table's Polars
+    frame, EntityRegistry, and stats are now unreferenced) and trim the glibc
+    heap so RSS actually falls instead of plateauing at the high-water mark.
+    Also clears the process-wide language-detection cache, whose entries
+    accumulate across tables with no per-table reset.
+    """
+    import gc
+    from ..domain.anonymization import _detect_language, _trim_native_heap
+
+    try:
+        _detect_language.cache_clear()
+    except Exception:
+        pass
+    gc.collect()
+    _trim_native_heap()
+
+
 def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
     if config is None:
         # Connect to DB first so runtime config and column exclusions can be
@@ -606,9 +695,62 @@ def run_pipeline(config: PipelineConfig | None = None) -> list[dict]:
     else:
         db = connect_audit_db(config.database_url)
     mappings = resolve_table_mappings(config)
-    if config.max_table_workers <= 1 or len(mappings) <= 1:
-        return [run_table(config, mapping, db) for mapping in mappings]
 
+    if config.max_table_workers <= 1 or len(mappings) <= 1:
+        # Language-major two-phase flow — at most ONE spaCy model resident:
+        #
+        # Phase 1 (samples only, ≤500 rows per table):
+        #   load EN engine → classify every table (A1 + B1 + B2-en) →
+        #   release engine → FR model → score all tables → release →
+        #   DE model → score all tables → release (lb shares DE's model).
+        # Phase 2 (zero models resident):
+        #   per table: full read → apply policies → transforms → write.
+        #
+        # Classification only ever needs column names + a value sample, so
+        # the full tables are read exactly once, in Phase 2, with no model
+        # in memory.  NOTE: if the row-by-row Presidio scan is re-enabled,
+        # revisit — cell-level analysis needs an engine during Phase 2.
+        samples: list = []
+        for mapping in mappings:
+            try:
+                samples.append(_read_source_sample(config, mapping))
+            except Exception as exc:
+                logger.warning(
+                    "Sample read failed for table %r (non-fatal — empty policies): %s",
+                    mapping.table_name, exc,
+                )
+                samples.append(None)
+
+        policies_by_table: list[dict] = [{} for _ in mappings]
+        classified = [(i, s) for i, s in enumerate(samples) if s is not None]
+        if classified:
+            analyzer = build_engines(("en",))
+            try:
+                results = classify_pii_columns_multi_pass(
+                    [s for _, s in classified], analyzer=analyzer,
+                )
+                for (i, _), table_policies in zip(classified, results):
+                    policies_by_table[i] = table_policies
+            except Exception as exc:
+                logger.warning("Multi-pass classification failed (non-fatal): %s", exc)
+            finally:
+                release_engines()
+                release_sequential_model()
+        del samples
+
+        # Phase 2: full-table processing, one table at a time.  Each table's
+        # frame is dropped and the native heap trimmed before the next read,
+        # so RSS does not stack table-over-table — peak ≈ one table, not the
+        # sum of all tables.
+        results: list[dict] = []
+        for i, mapping in enumerate(mappings):
+            results.append(run_table(config, mapping, db, policies=policies_by_table[i]))
+            _release_between_tables()
+        return results
+
+    # Parallel path: each worker is a separate process (ProcessPoolExecutor),
+    # so objects cannot be shared across the process boundary. Each worker
+    # builds its own engines. build_engines() is intentionally not called here.
     workers = min(config.max_table_workers, len(mappings))
     logger.info("Processing %d table(s) with %d process worker(s)", len(mappings), workers)
     with ProcessPoolExecutor(max_workers=workers) as executor:
