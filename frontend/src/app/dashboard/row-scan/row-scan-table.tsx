@@ -1,60 +1,57 @@
 "use client"
 
 import { useRef, useTransition } from "react"
-import type { ColumnExclusion } from "@/lib/queries/exclusions"
-import { addExclusionAction, deleteExclusionAction } from "./actions"
+import type { RowScanColumn } from "@/lib/queries/apply-row-scan"
+import { addRowScanColumnAction, deleteRowScanColumnAction } from "./actions"
 
 interface Props {
-  exclusions: ColumnExclusion[]
+  columns: RowScanColumn[]
 }
 
-export default function ExclusionTable({ exclusions }: Props) {
+export default function RowScanTable({ columns }: Props) {
   const [isPending, startTransition] = useTransition()
   const addDialogRef = useRef<HTMLDialogElement>(null)
 
   function handleAdd(formData: FormData) {
     startTransition(async () => {
-      await addExclusionAction(formData)
+      await addRowScanColumnAction(formData)
       addDialogRef.current?.close()
     })
   }
 
   function handleDelete(tableName: string, columnName: string) {
-    if (!confirm(`Remove exclusion for "${tableName}.${columnName}"?`)) return
+    if (!confirm(`Remove row-scan column "${tableName}.${columnName}"?`)) return
     startTransition(async () => {
-      await deleteExclusionAction(tableName, columnName)
+      await deleteRowScanColumnAction(tableName, columnName)
     })
   }
 
-  // Group by table name for readability
-  const grouped = exclusions.reduce<Record<string, ColumnExclusion[]>>(
-    (acc, ex) => {
-      ;(acc[ex.table_name] ??= []).push(ex)
-      return acc
-    },
-    {},
-  )
+  // Group by table name for readability.
+  const grouped = columns.reduce<Record<string, RowScanColumn[]>>((acc, c) => {
+    ;(acc[c.table_name] ??= []).push(c)
+    return acc
+  }, {})
 
   return (
     <>
       {/* Toolbar */}
       <div className="flex items-center justify-between mb-4">
         <p className="text-sm text-base-content/60">
-          {exclusions.length} exclusion{exclusions.length !== 1 ? "s" : ""} across{" "}
+          {columns.length} column{columns.length !== 1 ? "s" : ""} across{" "}
           {Object.keys(grouped).length} table{Object.keys(grouped).length !== 1 ? "s" : ""}
         </p>
         <button
           className="btn btn-primary btn-sm"
           onClick={() => addDialogRef.current?.showModal()}
         >
-          + Add exclusion
+          + Add column
         </button>
       </div>
 
       {/* Table */}
-      {exclusions.length === 0 ? (
+      {columns.length === 0 ? (
         <div className="py-12 text-center text-base-content/40 rounded-box border border-base-300">
-          No column exclusions configured.
+          No row-scan columns configured.
         </div>
       ) : (
         <div className="space-y-4">
@@ -68,27 +65,23 @@ export default function ExclusionTable({ exclusions }: Props) {
                 <thead>
                   <tr>
                     <th>Column</th>
-                    <th>Reason</th>
                     <th>Added</th>
                     <th className="w-20" />
                   </tr>
                 </thead>
                 <tbody>
-                  {cols.map((ex) => (
-                    <tr key={ex.column_name}>
-                      <td className="font-mono text-xs">{ex.column_name}</td>
-                      <td className="text-sm text-base-content/60">
-                        {ex.reason ?? <span className="opacity-30">—</span>}
-                      </td>
+                  {cols.map((c) => (
+                    <tr key={c.column_name}>
+                      <td className="font-mono text-xs">{c.column_name}</td>
                       <td className="text-xs text-base-content/50 whitespace-nowrap">
-                        {new Date(ex.created_at).toLocaleDateString("en-GB", {
+                        {new Date(c.created_at).toLocaleDateString("en-GB", {
                           day: "2-digit", month: "short", year: "numeric",
                         })}
                       </td>
                       <td>
                         <button
                           className="btn btn-ghost btn-xs text-error"
-                          onClick={() => handleDelete(ex.table_name, ex.column_name)}
+                          onClick={() => handleDelete(c.table_name, c.column_name)}
                           disabled={isPending}
                         >
                           Remove
@@ -106,10 +99,11 @@ export default function ExclusionTable({ exclusions }: Props) {
       {/* ── Add dialog ── */}
       <dialog ref={addDialogRef} className="modal">
         <div className="modal-box">
-          <h3 className="font-bold text-lg mb-4">Add Column Exclusion</h3>
+          <h3 className="font-bold text-lg mb-4">Add Row-Scan Column</h3>
           <p className="text-sm text-base-content/60 mb-4">
-            Excluded columns pass through the pipeline untouched, regardless
-            of what the classification tiers detect.
+            The pipeline runs a cell-by-cell Presidio scan on this column, masking
+            any PII it detects. Use for free-text columns (notes, descriptions,
+            comments) the column-level classifier can&apos;t fully cover.
           </p>
           <form action={handleAdd} className="space-y-3">
             <label className="form-control">
@@ -126,16 +120,8 @@ export default function ExclusionTable({ exclusions }: Props) {
               <input
                 name="column_name"
                 required
-                placeholder="e.g. internal_ref"
+                placeholder="e.g. planning_condition"
                 className="input input-bordered input-sm font-mono"
-              />
-            </label>
-            <label className="form-control">
-              <div className="label"><span className="label-text">Reason</span></div>
-              <input
-                name="reason"
-                placeholder="Why this column should not be anonymised"
-                className="input input-bordered input-sm"
               />
             </label>
             <div className="modal-action">

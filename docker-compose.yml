@@ -20,9 +20,9 @@ services:
 
   # ── PII anonymization pipeline ───────────────────────────────────────────────
   pipeline:
-    build: .
+    build: ./backend
     env_file:
-      - .env                          # Azure creds, Purview, classifier settings, etc.
+      - ./backend/.env                # Azure creds, Purview, classifier settings, etc.
     environment:
       # Overrides any DATABASE_URL that might be present in .env so the
       # pipeline always talks to the compose-managed Postgres instance.
@@ -57,19 +57,26 @@ services:
     memswap_limit: "${PIPELINE_MEMORY_LIMIT:-8g}"  # disable swap → fast fail, not thrash
 
   # ── Next.js admin frontend ───────────────────────────────────────────────────
-  server:
+  frontend:
     build: ./frontend
+    env_file:
+      - ./frontend/.env
     ports:
       - "3000:3000"
     environment:
+      # Infra overrides ONLY. Everything auth-related (AUTH_SECRET, AUTH_URL,
+      # AZURE_AD_CLIENT_ID/SECRET/TENANT_ID) comes from ./frontend/.env via the
+      # env_file above — do NOT redeclare those here.
+      #
+      # Why: keys in this block override env_file, and "${VAR}" interpolation is
+      # resolved by Compose from the project-root .env / shell — NOT from
+      # frontend/.env. The previous "${AUTH_SECRET}" entries therefore resolved
+      # to empty strings and clobbered the values configured in frontend/.env.
+      #
+      # DATABASE_URL is overridden intentionally so the frontend always talks to
+      # the compose-managed Postgres regardless of what frontend/.env contains.
       DATABASE_URL: postgresql://pipeline:pipeline@db:5432/pii_audit
-      NODE_ENV: production
-      AUTH_SECRET: "${AUTH_SECRET}"
-      AUTH_URL: "${AUTH_URL:-http://localhost:3000}"
       AUTH_TRUST_HOST: "true"
-      AZURE_AD_CLIENT_ID: "${AZURE_AD_CLIENT_ID}"
-      AZURE_AD_CLIENT_SECRET: "${AZURE_AD_CLIENT_SECRET}"
-      AZURE_AD_TENANT_ID: "${AZURE_AD_TENANT_ID:-}"
     depends_on:
       db:
         condition: service_healthy

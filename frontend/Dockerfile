@@ -11,6 +11,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# Ensure public/ exists so the runner stage's COPY never fails — the project
+# has no static assets today, and Docker's COPY hard-errors on a missing source.
+RUN mkdir -p public
+
 # Disable Next.js telemetry during build.
 ENV NEXT_TELEMETRY_DISABLED=1
 

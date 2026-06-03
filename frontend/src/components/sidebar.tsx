@@ -33,6 +33,16 @@ const NAV = [
     ),
   },
   {
+    href: "/dashboard/row-scan",
+    label: "Row-Scan Columns",
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h10M4 18h10" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M15.5 15.5l2 2m1-3.5a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+    ),
+  },
+  {
     href: "/dashboard/audit",
     label: "Audit Runs",
     icon: (

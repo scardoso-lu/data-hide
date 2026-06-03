@@ -3,9 +3,19 @@ import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id"
 
 // Fail fast at module load time so a misconfigured container never serves traffic.
 // `openssl rand -base64 32` produces 44 characters; enforce >= 32 as the floor.
-if (process.env.NODE_ENV === "production") {
+//
+// `next build` collects page data with NODE_ENV=production but no real secret is
+// available, so the Dockerfile injects AUTH_SECRET=build-placeholder as a build
+// sentinel. Skip the guard during the build phase (and for that sentinel) and
+// enforce it only at genuine production runtime, where the real secret is
+// supplied via env and neither signal is present.
+const isBuildPhase =
+  process.env.NEXT_PHASE === "phase-production-build" ||
+  process.env.AUTH_SECRET === "build-placeholder"
+
+if (process.env.NODE_ENV === "production" && !isBuildPhase) {
   const s = process.env.AUTH_SECRET
-  if (!s || s === "build-placeholder" || s.length < 32) {
+  if (!s || s.length < 32) {
     throw new Error(
       "AUTH_SECRET must be a cryptographically random string of ≥ 32 characters. " +
         "Generate one with: openssl rand -base64 32",
@@ -102,9 +112,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     MicrosoftEntraID({
       clientId: process.env.AZURE_AD_CLIENT_ID!,
       clientSecret: process.env.AZURE_AD_CLIENT_SECRET!,
-      // Leave undefined for multi-tenant; set AZURE_AD_TENANT_ID for
-      // single-tenant deployments (recommended for corporate setups).
-      tenantId: process.env.AZURE_AD_TENANT_ID,
+      // Tenant is configured via the issuer URL (Auth.js v5 dropped `tenantId`).
+      // Leave AZURE_AD_TENANT_ID unset for multi-tenant (defaults to
+      // .../common/v2.0); set it for single-tenant deployments (recommended
+      // for corporate setups).
+      issuer: process.env.AZURE_AD_TENANT_ID
+        ? `https://login.microsoftonline.com/${process.env.AZURE_AD_TENANT_ID}/v2.0`
+        : undefined,
     }),
   ],
 
