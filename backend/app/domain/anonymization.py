@@ -453,7 +453,7 @@ def _install_custom_recognizers(registry: Any, nlp_engine: Any = None) -> None:
     their seed anchors through the same spaCy models the analyzer uses.
     """
     try:
-        from .recognizers import install_custom_recognizers
+        from ..infrastructure.nlp_recognizers import install_custom_recognizers
     except Exception:
         return
     try:
