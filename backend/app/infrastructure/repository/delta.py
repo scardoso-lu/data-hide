@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Memory / size diagnostics
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_rss_mb() -> float | None:
+def process_rss_mb() -> float | None:
     """Return *current* process RSS in MB, or None if unavailable.
 
     Reads ``/proc/self/statm`` (field 2 = resident pages) on Linux — this is
@@ -95,7 +95,7 @@ def _log_pre_read_diagnostics(table, uri: str) -> None:
     except Exception:
         pass
 
-    rss = _process_rss_mb()
+    rss = process_rss_mb()
     rss_str = f"{rss:.0f} MB" if rss is not None else "?"
 
     logger.info(
@@ -115,7 +115,7 @@ def _log_post_read_diagnostics(df: pl.DataFrame, uri: str) -> None:
     except Exception:
         pass
 
-    rss = _process_rss_mb()
+    rss = process_rss_mb()
     rss_str = f"{rss:.0f} MB" if rss is not None else "?"
 
     logger.info(

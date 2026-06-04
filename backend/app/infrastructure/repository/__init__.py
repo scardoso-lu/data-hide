@@ -85,6 +85,7 @@ from .delta import (  # noqa: E402
     _upload_delta_file_group,
     _coerce_null_columns_arrow,
     write_delta,
+    process_rss_mb,
     _data_lake_service_client,
     _mapping_for_delta_path,
     _discover_delta_mappings,
@@ -112,3 +113,16 @@ from .audit import (  # noqa: E402
     connect_audit_db,
 )
 from .purview import PurviewClient, run_purview_check  # noqa: E402
+
+
+def _clear_caches() -> None:
+    """Clear all lazily-initialised per-run caches between tables.
+
+    Call from _release_between_tables() so Azure resource GUIDs and storage
+    clients don't accumulate indefinitely across a multi-table run.
+    """
+    _token_cache.clear()
+    _service_client_cache.clear()
+    _fabric_item_name_cache.clear()
+    _fabric_workspace_id_cache.clear()
+    _fabric_lakehouse_id_cache.clear()

@@ -47,13 +47,14 @@ from ..domain.classification import (
     release_sequential_model,
 )
 from ..infrastructure.keyvault import LocalHashPseudonymizer, build_pseudonymizer_from_env
-from ..infrastructure.repository.delta import _process_rss_mb
 from ..infrastructure.repository import (
     AuditDB,
     TableMapping,
+    _clear_caches,
     _fresh_opts,
     connect_audit_db,
     discover_table_mappings,
+    process_rss_mb,
     read_delta,
     read_delta_sample,
     read_sql_table,
@@ -98,7 +99,7 @@ def timed_stage(audit: dict, name: str):
         # was running when the limit was hit, and the audit row (pre-populated
         # by open_run) survives even though the kill bypasses finally-blocks
         # in the data path.
-        rss = _process_rss_mb()
+        rss = process_rss_mb()
         if rss is not None:
             audit.setdefault("stage_rss_mb", {})[name] = round(rss)
             logger.info("stage_rss: stage=%s rss=%d MB", name, round(rss))
@@ -527,16 +528,18 @@ def _release_between_tables() -> None:
     Between Phase 2 tables: collect garbage (the previous table's Polars
     frame, EntityRegistry, and stats are now unreferenced) and trim the glibc
     heap so RSS actually falls instead of plateauing at the high-water mark.
-    Also clears the process-wide language-detection cache, whose entries
-    accumulate across tables with no per-table reset.
+    Also clears the process-wide language-detection cache and all repository
+    caches so Azure resource GUIDs don't accumulate across tables.
     """
     import gc
-    from ..domain.anonymization import _detect_language, _trim_native_heap
+    from ..domain.anonymization import _detect_language
+    from ..infrastructure.nlp import _trim_native_heap
 
     try:
         _detect_language.cache_clear()
     except Exception:
         pass
+    _clear_caches()
     gc.collect()
     _trim_native_heap()
 
