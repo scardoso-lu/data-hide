@@ -189,6 +189,9 @@ def _install_custom_recognizers(registry: Any, nlp_engine: Any = None) -> None:
         logger.warning("Failed to install custom recognizers: %s", exc)
 
 
+_DEFAULT_SUPPORTED_LANGUAGES: list[str] = ["en", "fr", "de", "lb"]
+
+
 def _build_recognizer_registry(
     nlp_engine: Any,
     configuration_loader: Any,
@@ -196,10 +199,9 @@ def _build_recognizer_registry(
     registry_cls: Any,
     supported_languages: list[str] | None = None,
 ) -> Any:
-    from ..domain.anonymization import SUPPORTED_LANGUAGES as _SUPPORTED_LANGUAGES
     config = _filter_recognizer_config(
         configuration_loader.get(),
-        supported_languages or _SUPPORTED_LANGUAGES,
+        supported_languages or _DEFAULT_SUPPORTED_LANGUAGES,
     )
     recognizers = list_loader.get(
         config["recognizers"],
