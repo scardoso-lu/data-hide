@@ -8,19 +8,25 @@ which only ships a pandas builder.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from .models import (
+    IDENTIFIER,
+    SENSITIVE,
+    FREE_TEXT,
+    QUASI_IDENTIFIER,
+    ACTION_HASH,
+    ACTION_TOKENIZE,
+    ACTION_REDACT,
+    ACTION_BIN,
+    ACTION_SCAN,
+    ColumnPolicy,
+    ColumnProfile,
+)
 import math
 import os
 import re
 from typing import Any, Iterable
 
 import polars as pl
-
-
-IDENTIFIER = "IDENTIFIER"
-SENSITIVE = "SENSITIVE"
-FREE_TEXT = "FREE_TEXT"
-QUASI_IDENTIFIER = "QUASI_IDENTIFIER"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,40 +40,6 @@ QUASI_IDENTIFIER = "QUASI_IDENTIFIER"
 # structured value sampling → spaCy embedding similarity against the
 # CONCEPT_SEEDS dictionary below — and assigns one of these policies.
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-# Actions a column policy can apply to every non-null cell in the column.
-ACTION_HASH = "hash"          # → KeyVault deterministic pseudonymizer
-ACTION_TOKENIZE = "tokenize"  # → EntityRegistry (PERSON_0, PERSON_1, …)
-ACTION_REDACT = "redact"      # → fixed sentinel ("[REDACTED]")
-ACTION_BIN = "bin"            # → defer to existing bin/anonymize_gps_columns
-ACTION_SCAN = "scan"          # → defer to row-by-row Presidio (free text)
-
-
-@dataclass(frozen=True)
-class ColumnPolicy:
-    """Resolved policy for one column.
-
-    Attributes
-    ----------
-    column : the original column name.
-    entity_type : Presidio entity type (PERSON, EMAIL_ADDRESS, IDENTIFIER, …)
-        or "FREE_TEXT" when the column should be scanned cell-by-cell.
-    action : one of ACTION_HASH / ACTION_TOKENIZE / ACTION_REDACT /
-        ACTION_BIN / ACTION_SCAN.
-    source : which classifier tier produced this policy — "purview",
-        "presidio_structured", "embedding_similarity" or "fallback".
-        Carried through for auditability.
-    score : confidence in [0.0, 1.0]; 1.0 for Purview (authoritative),
-        Presidio-structured's aggregate confidence, or the spaCy cosine
-        similarity, depending on tier.
-    """
-
-    column: str
-    entity_type: str
-    action: str
-    source: str
-    score: float
 
 
 # Per-entity seed phrases in each supported language.  spaCy models hold
@@ -351,12 +323,6 @@ def _looks_like_quasi_identifier(series: pl.Series, values: list[object]) -> boo
         in_range = sum(1 for v in numeric if 0 <= v <= 130) / len(numeric)
         return ratio <= 0.4 and in_range >= 0.8
     return 0 < ratio <= 0.35
-
-
-@dataclass(frozen=True)
-class ColumnProfile:
-    name: str
-    categories: tuple[str, ...]
 
 
 class ColumnClassifier:

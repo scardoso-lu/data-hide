@@ -24,6 +24,7 @@ from typing import Any, Callable
 import polars as pl
 
 from .classification import _is_text_column
+from .models import EntityRegistry
 
 # spaCy models for each supported language.
 # Luxembourgish (lb) has no dedicated spaCy model; the German model is the
@@ -494,23 +495,6 @@ def _recognizer_language_code(language: object) -> str | None:
         value = language.get("language")
         return value if isinstance(value, str) else None
     return None
-
-
-class EntityRegistry:
-    def __init__(self) -> None:
-        self._map: dict[tuple[str, str], str] = {}
-        self._counters: dict[str, int] = {}
-
-    def token_for(self, entity_type: str, original: str) -> str:
-        key = (entity_type, original.strip().lower())
-        if key not in self._map:
-            n = self._counters.get(entity_type, 0)
-            self._map[key] = f"{entity_type}_{n}"
-            self._counters[entity_type] = n + 1
-        return self._map[key]
-
-    def unique_counts(self) -> dict[str, int]:
-        return dict(self._counters)
 
 
 def _resolve_overlapping_findings(findings: list) -> list:
