@@ -103,6 +103,10 @@ class PipelineConfig:
     # Custom Purview classification type that means "redact this column".
     # Required whenever PURVIEW_ACCOUNT_NAME is set.  DB-overridable.
     purview_must_anonymize_type: str | None = None
+    # Optional custom Purview classification type that means "verified non-PII,
+    # skip all analysis".  Columns bearing this type bypass both column-policy
+    # masking and row-level Presidio, exactly like pii_column_exclusions rows.
+    purview_not_pii_type: str | None = None
 
     @classmethod
     def from_env(
@@ -146,6 +150,7 @@ class PipelineConfig:
 
         purview_account_name = _get("PURVIEW_ACCOUNT_NAME") or None
         purview_must_anonymize_type = _get("PURVIEW_MUST_ANONYMIZE_TYPE") or None
+        purview_not_pii_type = _get("PURVIEW_NOT_PII_TYPE") or None
         if purview_account_name:
             # Credential vars are secrets — read directly from os.environ,
             # not _get(), so they can never be stored in the DB config table.
@@ -191,6 +196,7 @@ class PipelineConfig:
             # ── loaded from the apply_row_scan table ──────────────────────────
             row_scan_columns_by_table=row_scan_columns or {},
             purview_must_anonymize_type=purview_must_anonymize_type,
+            purview_not_pii_type=purview_not_pii_type,
         )
 
     @classmethod
@@ -674,6 +680,21 @@ def run_table(
         # (pii_column_exclusions table in PostgreSQL).  These columns pass
         # through untouched regardless of what the classification tiers found.
         _excluded = config.excluded_columns_by_table.get(_table_key, frozenset())
+
+        # Purview NOT_PII safelist — columns Purview has verified as non-PII
+        # are added to the exclusion set for this run, bypassing both
+        # column-policy masking and row-level Presidio.
+        if config.purview_not_pii_type and pv.get("column_labels"):
+            _not_pii_upper = config.purview_not_pii_type.upper()
+            purview_safe = frozenset(
+                col for col, types in pv["column_labels"].items()
+                if any(
+                    t.upper() == _not_pii_upper
+                    for t in (types if isinstance(types, list) else [types])
+                )
+            )
+            if purview_safe:
+                _excluded = _excluded | purview_safe
         if _excluded:
             before = len(policies)
             policies = {col: pol for col, pol in policies.items() if col not in _excluded}

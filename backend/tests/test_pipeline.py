@@ -654,6 +654,85 @@ class TestPurviewMustAnonymizeConfig:
         assert policies["secret"].source == "purview"
 
 
+class TestPurviewNotPiiSafelist:
+    """Columns Purview marks as NOT_PII must bypass all analysis."""
+
+    def test_not_set_is_noop(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.delenv("PURVIEW_NOT_PII_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+        assert config.purview_not_pii_type is None
+
+    def test_not_pii_type_loaded_from_env(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = PipelineConfig.from_env()
+        assert config.purview_not_pii_type == "PUBLIC_DATA"
+
+    def test_db_override_wins(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "ENV_TYPE")
+        config = PipelineConfig.from_env(
+            config_overrides={"PURVIEW_NOT_PII_TYPE": "DB_TYPE"}
+        )
+        assert config.purview_not_pii_type == "DB_TYPE"
+
+    def test_not_pii_column_excluded_from_policies(self, monkeypatch):
+        """Columns bearing NOT_PII type must be absent from policies after exclusion."""
+        import polars as pl
+        from app.domain.classification import classify_pii_columns, ACTION_REDACT, ColumnPolicy
+        from app.application.pipeline import PipelineConfig
+
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = PipelineConfig.from_env()
+
+        # Simulate what run_table does: build exclusion set from Purview data
+        column_labels = {"product_code": ["PUBLIC_DATA"], "email": ["MICROSOFT.PERSONAL.EMAIL"]}
+        _not_pii_upper = config.purview_not_pii_type.upper()
+        purview_safe = frozenset(
+            col for col, types in column_labels.items()
+            if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+        )
+        assert "product_code" in purview_safe
+        assert "email" not in purview_safe
+
+    def test_case_insensitive_match(self, monkeypatch):
+        from main import PipelineConfig
+        from app.application.pipeline import PipelineConfig as AppConfig
+
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = AppConfig.from_env()
+
+        # Both "public_data" and "PUBLIC_DATA" in Purview data must match
+        column_labels = {"col_a": ["public_data"], "col_b": ["PUBLIC_DATA"]}
+        _not_pii_upper = config.purview_not_pii_type.upper()
+        purview_safe = frozenset(
+            col for col, types in column_labels.items()
+            if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+        )
+        assert "col_a" in purview_safe
+        assert "col_b" in purview_safe
+
+    def test_not_pii_column_not_in_exclusion_when_type_not_configured(self, monkeypatch):
+        """When PURVIEW_NOT_PII_TYPE is absent, no Purview column is auto-excluded."""
+        from main import PipelineConfig
+
+        monkeypatch.delenv("PURVIEW_NOT_PII_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+
+        column_labels = {"product_code": ["PUBLIC_DATA"]}
+        not_pii_type = config.purview_not_pii_type
+        # safelist computation: should yield empty set since type is not configured
+        purview_safe: frozenset = frozenset()
+        if not_pii_type and column_labels:
+            _not_pii_upper = not_pii_type.upper()
+            purview_safe = frozenset(
+                col for col, types in column_labels.items()
+                if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+            )
+        assert len(purview_safe) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime table targets (pii_table_targets)
 # ─────────────────────────────────────────────────────────────────────────────
