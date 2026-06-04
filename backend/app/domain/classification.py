@@ -8,19 +8,25 @@ which only ships a pandas builder.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from .models import (
+    IDENTIFIER,
+    SENSITIVE,
+    FREE_TEXT,
+    QUASI_IDENTIFIER,
+    ACTION_HASH,
+    ACTION_TOKENIZE,
+    ACTION_REDACT,
+    ACTION_BIN,
+    ACTION_SCAN,
+    ColumnPolicy,
+    ColumnProfile,
+)
 import math
 import os
 import re
 from typing import Any, Iterable
 
 import polars as pl
-
-
-IDENTIFIER = "IDENTIFIER"
-SENSITIVE = "SENSITIVE"
-FREE_TEXT = "FREE_TEXT"
-QUASI_IDENTIFIER = "QUASI_IDENTIFIER"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,40 +40,6 @@ QUASI_IDENTIFIER = "QUASI_IDENTIFIER"
 # structured value sampling → spaCy embedding similarity against the
 # CONCEPT_SEEDS dictionary below — and assigns one of these policies.
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-# Actions a column policy can apply to every non-null cell in the column.
-ACTION_HASH = "hash"          # → KeyVault deterministic pseudonymizer
-ACTION_TOKENIZE = "tokenize"  # → EntityRegistry (PERSON_0, PERSON_1, …)
-ACTION_REDACT = "redact"      # → fixed sentinel ("[REDACTED]")
-ACTION_BIN = "bin"            # → defer to existing bin/anonymize_gps_columns
-ACTION_SCAN = "scan"          # → defer to row-by-row Presidio (free text)
-
-
-@dataclass(frozen=True)
-class ColumnPolicy:
-    """Resolved policy for one column.
-
-    Attributes
-    ----------
-    column : the original column name.
-    entity_type : Presidio entity type (PERSON, EMAIL_ADDRESS, IDENTIFIER, …)
-        or "FREE_TEXT" when the column should be scanned cell-by-cell.
-    action : one of ACTION_HASH / ACTION_TOKENIZE / ACTION_REDACT /
-        ACTION_BIN / ACTION_SCAN.
-    source : which classifier tier produced this policy — "purview",
-        "presidio_structured", "embedding_similarity" or "fallback".
-        Carried through for auditability.
-    score : confidence in [0.0, 1.0]; 1.0 for Purview (authoritative),
-        Presidio-structured's aggregate confidence, or the spaCy cosine
-        similarity, depending on tier.
-    """
-
-    column: str
-    entity_type: str
-    action: str
-    source: str
-    score: float
 
 
 # Per-entity seed phrases in each supported language.  spaCy models hold
@@ -351,12 +323,6 @@ def _looks_like_quasi_identifier(series: pl.Series, values: list[object]) -> boo
         in_range = sum(1 for v in numeric if 0 <= v <= 130) / len(numeric)
         return ratio <= 0.4 and in_range >= 0.8
     return 0 < ratio <= 0.35
-
-
-@dataclass(frozen=True)
-class ColumnProfile:
-    name: str
-    categories: tuple[str, ...]
 
 
 class ColumnClassifier:
@@ -753,20 +719,48 @@ def _best_entity_for_column_name(
 
 def _tier_a_purview(
     df: pl.DataFrame,
-    purview_classifications: dict[str, str] | None,
+    purview_classifications: dict[str, str | list[str]] | None,
     policies: dict[str, ColumnPolicy],
+    *,
+    purview_must_anonymize_type: str | None = None,
 ) -> None:
     """Apply Purview-supplied column classifications.  No-op when the caller
-    didn't pass a mapping (Purview not configured / unreachable)."""
+    didn't pass a mapping (Purview not configured / unreachable).
+
+    Each column value may be a single classification type string (legacy /
+    test path) or a list of type strings as returned by the Purview catalog
+    API.  When ``purview_must_anonymize_type`` is set, any column carrying
+    that type (case-insensitive) is assigned ``ACTION_REDACT`` directly,
+    overriding even a pre-computed policy that arrived from the Phase 1
+    sampling pass.  Known Microsoft types respect the ``column in policies``
+    guard so that Phase 1 results are not silently overwritten.
+    """
     if not purview_classifications:
         return
-    for column, purview_type in purview_classifications.items():
-        if column not in df.columns or column in policies:
+    must_upper = purview_must_anonymize_type.upper() if purview_must_anonymize_type else None
+    for column, raw_types in purview_classifications.items():
+        if column not in df.columns:
             continue
-        entity = PURVIEW_TYPE_TO_ENTITY.get(str(purview_type).upper())
-        if not entity:
+        types: list[str] = [raw_types] if isinstance(raw_types, str) else list(raw_types)
+        # Must-anonymize is authoritative: overrides any pre-computed policy.
+        if must_upper and any(t.upper() == must_upper for t in types):
+            policies[column] = ColumnPolicy(
+                column=column,
+                entity_type="MUST_ANONYMIZE",
+                action=ACTION_REDACT,
+                source="purview",
+                score=1.0,
+            )
             continue
-        policies[column] = _make_policy(column, entity, source="purview", score=1.0)
+        # Known Microsoft types do not override existing policies — Phase 1
+        # sampling results (name-pattern, presidio-structured, spaCy) stand.
+        if column in policies:
+            continue
+        for t in types:
+            entity = PURVIEW_TYPE_TO_ENTITY.get(t.upper())
+            if entity:
+                policies[column] = _make_policy(column, entity, source="purview", score=1.0)
+                break
 
 
 def _tier_a1_name_pattern(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> None:
@@ -937,7 +931,8 @@ def _tier_c_fallback(df: pl.DataFrame, policies: dict[str, ColumnPolicy]) -> Non
 def classify_pii_columns(
     df: pl.DataFrame,
     *,
-    purview_classifications: dict[str, str] | None = None,
+    purview_classifications: dict[str, str | list[str]] | None = None,
+    purview_must_anonymize_type: str | None = None,
     analyzer: Any | None = None,
     similarity_models: dict[str, Any] | None = None,
     similarity_threshold: float | None = None,
@@ -982,7 +977,8 @@ def classify_pii_columns(
     """
     policies: dict[str, ColumnPolicy] = {}
 
-    _tier_a_purview(df, purview_classifications, policies)
+    _tier_a_purview(df, purview_classifications, policies,
+                    purview_must_anonymize_type=purview_must_anonymize_type)
     _tier_a1_name_pattern(df, policies)  # pin id-named columns before value-sampling
 
     if structured_enabled is None:

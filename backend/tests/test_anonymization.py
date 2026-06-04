@@ -28,10 +28,13 @@ from main import (
 from app.domain.classification import (
     ACTION_BIN,
     ACTION_HASH,
+    ACTION_REDACT,
     ACTION_SCAN,
     ACTION_TOKENIZE,
+    ColumnPolicy,
     apply_column_policies,
     classify_pii_columns,
+    _tier_a_purview,
     _tier_a1_name_pattern,
 )
 
@@ -1552,4 +1555,155 @@ class TestIdentifierNamePattern:
         _tier_a1_name_pattern(df, policies)
         assert column not in policies, (
             f"Non-text column {column!r} should not be classified by Tier A1"
+        )
+
+
+class TestPurviewMustAnonymizeType:
+    """Tier A must redact columns bearing the operator's custom must-anonymize type."""
+
+    _DF = pl.DataFrame({"secret_col": ["value_a", "value_b", None]})
+
+    def test_custom_type_gets_action_redact(self):
+        policies: dict = {}
+        _tier_a_purview(
+            self._DF,
+            {"secret_col": ["MUST_ANONYMIZE"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert "secret_col" in policies
+        assert policies["secret_col"].action == ACTION_REDACT
+        assert policies["secret_col"].source == "purview"
+        assert policies["secret_col"].score == 1.0
+
+    def test_custom_type_case_insensitive(self):
+        """Config and Purview data may differ in case."""
+        policies: dict = {}
+        _tier_a_purview(
+            self._DF,
+            {"secret_col": ["must_anonymize"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert policies["secret_col"].action == ACTION_REDACT
+
+    def test_custom_type_wins_over_known_microsoft_type(self):
+        """Custom must-anonymize type takes priority over specific Microsoft types."""
+        policies: dict = {}
+        _tier_a_purview(
+            self._DF,
+            {"secret_col": ["MICROSOFT.PERSONAL.NAME", "MUST_ANONYMIZE"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert policies["secret_col"].action == ACTION_REDACT
+
+    def test_list_of_types_known_microsoft_type_resolves(self):
+        """When no custom type matches, list-input still resolves known Microsoft types."""
+        df = pl.DataFrame({"email_col": ["a@b.com", "c@d.com"]})
+        policies: dict = {}
+        _tier_a_purview(
+            df,
+            {"email_col": ["MICROSOFT.PERSONAL.EMAIL"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert "email_col" in policies
+        assert policies["email_col"].entity_type == "EMAIL_ADDRESS"
+        assert policies["email_col"].action == ACTION_TOKENIZE
+
+    def test_plain_str_input_custom_type_works(self):
+        """Plain string values (legacy / test path) work for the custom type."""
+        policies: dict = {}
+        _tier_a_purview(
+            self._DF,
+            {"secret_col": "MUST_ANONYMIZE"},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert policies["secret_col"].action == ACTION_REDACT
+
+    def test_apply_column_policies_redact_replaces_non_null(self):
+        """apply_column_policies with ACTION_REDACT blanks non-null values, keeps nulls."""
+        policy = ColumnPolicy(
+            column="secret_col",
+            entity_type="MUST_ANONYMIZE",
+            action=ACTION_REDACT,
+            source="purview",
+            score=1.0,
+        )
+        result_df, stats = apply_column_policies(
+            self._DF,
+            {"secret_col": policy},
+        )
+        col = result_df["secret_col"].to_list()
+        assert col[0] == "[REDACTED]"
+        assert col[1] == "[REDACTED]"
+        assert col[2] is None
+
+    def test_custom_type_via_classify_pii_columns(self):
+        """classify_pii_columns threads purview_must_anonymize_type through to Tier A."""
+        policies = classify_pii_columns(
+            self._DF,
+            purview_classifications={"secret_col": ["MUST_ANONYMIZE"]},
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+            similarity_models={},
+        )
+        assert policies["secret_col"].action == ACTION_REDACT
+        assert policies["secret_col"].source == "purview"
+
+    def test_must_anonymize_overrides_precomputed_policy(self):
+        """Regression: must-anonymize must override a pre-computed policy.
+
+        In the sequential run_pipeline path, _tier_a_purview is called with a
+        policies dict that already contains Phase 1 sampling results.  The old
+        ``column in policies`` guard fired before the must-anonymize check, so
+        the Purview override was silently dropped.
+        """
+        df = pl.DataFrame({"secret_col": ["Alice", "Bob"]})
+        # Simulate a pre-computed PERSON policy from B1 presidio-structured.
+        policies: dict = {
+            "secret_col": ColumnPolicy(
+                column="secret_col",
+                entity_type="PERSON",
+                action=ACTION_TOKENIZE,
+                source="presidio_structured",
+                score=0.9,
+            )
+        }
+        _tier_a_purview(
+            df,
+            {"secret_col": ["MUST_ANONYMIZE"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert policies["secret_col"].action == ACTION_REDACT, (
+            "must-anonymize must override pre-computed PERSON policy"
+        )
+        assert policies["secret_col"].source == "purview"
+
+    def test_known_microsoft_type_does_not_override_precomputed_policy(self):
+        """Known Microsoft types must NOT override Phase 1 results.
+
+        Only must-anonymize is authoritative enough to override.  Ordinary
+        Purview-to-entity mappings (MICROSOFT.PERSONAL.NAME → PERSON) should
+        leave an existing pre-computed policy intact.
+        """
+        df = pl.DataFrame({"col": ["EMP001", "EMP002"]})
+        existing = ColumnPolicy(
+            column="col",
+            entity_type="IDENTIFIER",
+            action=ACTION_HASH,
+            source="name_pattern",
+            score=1.0,
+        )
+        policies: dict = {"col": existing}
+        _tier_a_purview(
+            df,
+            {"col": ["MICROSOFT.PERSONAL.NAME"]},
+            policies,
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+        )
+        assert policies["col"] is existing, (
+            "known Microsoft type must not overwrite an existing name-pattern policy"
         )

@@ -10,7 +10,6 @@ frame library.
 from __future__ import annotations
 
 import collections
-import copy
 import math
 import os
 from decimal import Decimal
@@ -24,6 +23,18 @@ from typing import Any, Callable
 import polars as pl
 
 from .classification import _is_text_column
+from .models import EntityRegistry
+from ..infrastructure.nlp import (  # noqa: E402
+    NlpConfig as _NlpConfig,
+    NlpEngine as _NlpEngine,
+    _trim_native_heap as _trim_native_heap,  # re-export for backward compat
+    _build_recognizer_registry,
+    _install_custom_recognizers,
+    _filter_recognizer_config,
+    _recognizer_language_code,
+    SPACY_TO_PRESIDIO_ENTITY_MAPPING,
+    SPACY_LABELS_TO_IGNORE,
+)
 
 # spaCy models for each supported language.
 # Luxembourgish (lb) has no dedicated spaCy model; the German model is the
@@ -170,34 +181,10 @@ PRESIDIO_SCORE_THRESHOLD: float = DEFAULT_SCORE_THRESHOLD
 
 def _score_threshold_for(entity_type: str) -> float:
     return PRESIDIO_SCORE_THRESHOLDS.get(entity_type, DEFAULT_SCORE_THRESHOLD)
+
+
 logger = logging.getLogger(__name__)
-SPACY_TO_PRESIDIO_ENTITY_MAPPING = {
-    "PERSON": "PERSON",
-    "PER": "PERSON",
-    "ORG": "ORGANIZATION",
-    "GPE": "LOCATION",
-    "LOC": "LOCATION",
-    "FAC": "LOCATION",
-    "DATE": "DATE_TIME",
-    "TIME": "DATE_TIME",
-    "NORP": "NRP",
-}
-SPACY_LABELS_TO_IGNORE = [
-    "CARDINAL",
-    "ORDINAL",
-    "QUANTITY",
-    "PERCENT",
-    "MONEY",
-    "PRODUCT",
-    "EVENT",
-    "WORK_OF_ART",
-    "LAW",
-    "LANGUAGE",
-    # German/French spaCy models emit a generic "MISC" label that has no
-    # Presidio mapping; without this entry Presidio logs a warning per
-    # occurrence ("Entity MISC is not mapped to a Presidio entity").
-    "MISC",
-]
+
 # Column-name token policy lives in its own module so deployments can
 # extend or replace it without touching the recognizers.  The names are
 # re-exported here for backwards compatibility with existing callers / tests.
@@ -358,50 +345,9 @@ def build_engines(languages: tuple[str, ...] | None = None) -> Any:
     different language set evicts (and frees) the previous engine instead of
     accumulating one engine per language in memory.
     """
-    from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
-    from presidio_analyzer.nlp_engine import NlpEngineProvider
-    from presidio_analyzer.recognizer_registry.recognizers_loader_utils import (
-        RecognizerConfigurationLoader,
-        RecognizerListLoader,
-    )
-
-    active_languages = list(languages) if languages else list(SUPPORTED_LANGUAGES)
-    active_models = {
-        lang: model for lang, model in SPACY_MODELS.items() if lang in active_languages
-    }
-
-    provider = NlpEngineProvider(nlp_configuration={
-        "nlp_engine_name": "spacy",
-        "models": [{"lang_code": lang, "model_name": model} for lang, model in active_models.items()],
-        "ner_model_configuration": {
-            "model_to_presidio_entity_mapping": SPACY_TO_PRESIDIO_ENTITY_MAPPING,
-            "labels_to_ignore": SPACY_LABELS_TO_IGNORE,
-        },
-    })
-    nlp_engine = provider.create_engine()
-    registry = _build_recognizer_registry(
-        nlp_engine, RecognizerConfigurationLoader, RecognizerListLoader, RecognizerRegistry,
-        supported_languages=active_languages,
-    )
-    import gc
-    gc.collect()  # release any engine just evicted from the lru slot
-    return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=active_languages)
-
-
-def _trim_native_heap() -> None:
-    """Ask glibc to return freed pages to the OS (Linux containers).
-
-    ``gc.collect()`` frees the Python objects, but glibc's allocator keeps
-    the pages mapped by default, so container RSS plateaus at the high-water
-    mark even though the memory is reusable.  ``malloc_trim(0)`` releases
-    them — making the per-stage RSS log lines reflect reality and giving
-    tight-memory containers the headroom back.  No-op on non-glibc platforms.
-    """
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+    config = _NlpConfig.from_env()
+    engine = _NlpEngine(config, languages=languages)
+    return engine.build()
 
 
 def release_engines() -> None:
@@ -415,102 +361,6 @@ def release_engines() -> None:
     import gc
     gc.collect()
     _trim_native_heap()
-
-
-def _build_recognizer_registry(
-    nlp_engine: Any,
-    configuration_loader: Any,
-    list_loader: Any,
-    registry_cls: Any,
-    supported_languages: list[str] | None = None,
-) -> Any:
-    config = _filter_recognizer_config(
-        configuration_loader.get(), supported_languages or SUPPORTED_LANGUAGES,
-    )
-    recognizers = list_loader.get(
-        config["recognizers"],
-        config["supported_languages"],
-        config["global_regex_flags"],
-    )
-    registry = registry_cls(
-        recognizers=recognizers,
-        supported_languages=config["supported_languages"],
-        global_regex_flags=config["global_regex_flags"],
-    )
-    registry.add_nlp_recognizer(nlp_engine=nlp_engine)
-    _install_custom_recognizers(registry, nlp_engine)
-    return registry
-
-
-def _install_custom_recognizers(registry: Any, nlp_engine: Any = None) -> None:
-    """Install GDPR-special-category recognizers (LU CCSS, salary, semantic
-    Art. 9 / Art. 10 detection, …).
-
-    Imported lazily so the build_engines unit tests that monkeypatch
-    presidio_analyzer don't pull in the real PatternRecognizer class.  The
-    `nlp_engine` is forwarded so the semantic-concept recognizers can embed
-    their seed anchors through the same spaCy models the analyzer uses.
-    """
-    try:
-        from .recognizers import install_custom_recognizers
-    except Exception:
-        return
-    try:
-        install_custom_recognizers(registry, nlp_engine)
-    except Exception as exc:
-        logger.warning("Failed to install custom recognizers: %s", exc)
-
-
-def _filter_recognizer_config(config: dict, supported_languages: list[str]) -> dict:
-    filtered = copy.deepcopy(config)
-    filtered["supported_languages"] = supported_languages
-    recognizers = []
-
-    for recognizer in filtered.get("recognizers", []):
-        languages = recognizer.get("supported_languages") if isinstance(recognizer, dict) else None
-        if not languages:
-            recognizers.append(recognizer)
-            continue
-
-        kept_languages = [
-            language
-            for language in languages
-            if _recognizer_language_code(language) in supported_languages
-        ]
-        if not kept_languages:
-            continue
-
-        recognizer["supported_languages"] = kept_languages
-        recognizers.append(recognizer)
-
-    filtered["recognizers"] = recognizers
-    return filtered
-
-
-def _recognizer_language_code(language: object) -> str | None:
-    if isinstance(language, str):
-        return language
-    if isinstance(language, dict):
-        value = language.get("language")
-        return value if isinstance(value, str) else None
-    return None
-
-
-class EntityRegistry:
-    def __init__(self) -> None:
-        self._map: dict[tuple[str, str], str] = {}
-        self._counters: dict[str, int] = {}
-
-    def token_for(self, entity_type: str, original: str) -> str:
-        key = (entity_type, original.strip().lower())
-        if key not in self._map:
-            n = self._counters.get(entity_type, 0)
-            self._map[key] = f"{entity_type}_{n}"
-            self._counters[entity_type] = n + 1
-        return self._map[key]
-
-    def unique_counts(self) -> dict[str, int]:
-        return dict(self._counters)
 
 
 def _resolve_overlapping_findings(findings: list) -> list:

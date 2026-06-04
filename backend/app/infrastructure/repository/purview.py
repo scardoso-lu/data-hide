@@ -8,6 +8,7 @@ at module import time.
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +16,24 @@ logger = logging.getLogger(__name__)
 class PurviewClient:
     """Purview catalog client backed by the official ``azure-purview-catalog`` SDK.
 
-    Uses ``PurviewCatalogClient`` with ``DefaultAzureCredential`` — no manual
-    token acquisition needed.  The SDK is imported lazily so environments
-    without the package (e.g. unit-test runs that mock this class) don't fail
-    at module import time.
+    Purview runs under its own Azure service principal, separate from the
+    Fabric/OneLake principal used by the rest of the pipeline.  Credentials
+    are supplied explicitly (``client_id``, ``client_secret``, ``tenant_id``)
+    so that ``ClientSecretCredential`` is built in isolation and the shared
+    ``DefaultAzureCredential`` singleton is never used here.
+
+    The SDK is imported lazily so environments without the package (e.g.
+    unit-test runs that mock this class) don't fail at module import time.
     """
 
-    def __init__(self, account_name: str) -> None:
+    def __init__(
+        self,
+        account_name: str,
+        *,
+        client_id: str,
+        client_secret: str,
+        tenant_id: str,
+    ) -> None:
         try:
             from azure.purview.catalog import PurviewCatalogClient
         except ModuleNotFoundError as exc:
@@ -29,10 +41,15 @@ class PurviewClient:
                 "azure-purview-catalog is required for Purview integration. "
                 "Install it with: uv add 'azure-purview-catalog>=1.0.0b4,<2.0.0'"
             ) from exc
-        from .auth import _credential_instance
+        from azure.identity import ClientSecretCredential
+        credential = ClientSecretCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
         self._client = PurviewCatalogClient(
             endpoint=f"https://{account_name}.purview.azure.com",
-            credential=_credential_instance(),
+            credential=credential,
         )
 
     def column_classifications(self, qualified_name: str) -> dict[str, list[str]]:
@@ -96,7 +113,16 @@ def run_purview_check(
         # ``main.run_purview_check`` wrapper that swaps it in) take effect.
         import app.infrastructure.repository as _r
         client_cls = getattr(_r, "PurviewClient", PurviewClient)
-        client = client_cls(purview_account)
+        # Purview uses its own service principal, separate from the
+        # Fabric/OneLake credentials.  PURVIEW_TENANT_ID falls back to
+        # AZURE_TENANT_ID for same-tenant/different-SP deployments.
+        tenant_id = os.environ.get("PURVIEW_TENANT_ID") or os.environ.get("AZURE_TENANT_ID", "")
+        client = client_cls(
+            purview_account,
+            client_id=os.environ.get("PURVIEW_CLIENT_ID", ""),
+            client_secret=os.environ.get("PURVIEW_CLIENT_SECRET", ""),
+            tenant_id=tenant_id,
+        )
         col_labels = client.column_classifications(client_cls.qualified_name(source_uri))
         flagged = list(col_labels.keys())
         return {

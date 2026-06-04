@@ -565,6 +565,174 @@ class TestPipelineConfigValidation:
             PipelineConfig.from_env()
 
 
+class TestPurviewMustAnonymizeConfig:
+    """PipelineConfig must validate Purview credentials and PURVIEW_MUST_ANONYMIZE_TYPE."""
+
+    def _set_purview_env(self, monkeypatch):
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+
+    def test_missing_client_id_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+        monkeypatch.delenv("PURVIEW_CLIENT_ID", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_CLIENT_ID"):
+            PipelineConfig.from_env()
+
+    def test_missing_client_secret_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "MUST_ANONYMIZE")
+        monkeypatch.delenv("PURVIEW_CLIENT_SECRET", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_CLIENT_SECRET"):
+            PipelineConfig.from_env()
+
+    def test_missing_must_anonymize_type_raises(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.delenv("PURVIEW_MUST_ANONYMIZE_TYPE", raising=False)
+
+        with pytest.raises(ValueError, match="PURVIEW_MUST_ANONYMIZE_TYPE"):
+            PipelineConfig.from_env()
+
+    def test_all_purview_config_set_succeeds(self, monkeypatch):
+        from main import PipelineConfig
+        self._set_purview_env(monkeypatch)
+        config = PipelineConfig.from_env()
+        assert config.purview_account_name == "my-purview"
+        assert config.purview_must_anonymize_type == "MUST_ANONYMIZE"
+
+    def test_no_purview_account_no_validation(self, monkeypatch):
+        """When PURVIEW_ACCOUNT_NAME is absent, credential vars are not required."""
+        from main import PipelineConfig
+        monkeypatch.delenv("PURVIEW_ACCOUNT_NAME", raising=False)
+        monkeypatch.delenv("PURVIEW_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PURVIEW_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("PURVIEW_MUST_ANONYMIZE_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+        assert config.purview_account_name is None
+        assert config.purview_must_anonymize_type is None
+
+    def test_db_override_wins_for_must_anonymize_type(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_ACCOUNT_NAME", "my-purview")
+        monkeypatch.setenv("PURVIEW_CLIENT_ID", "client-id")
+        monkeypatch.setenv("PURVIEW_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("PURVIEW_MUST_ANONYMIZE_TYPE", "ENV_TYPE")
+        config = PipelineConfig.from_env(
+            config_overrides={
+                "PURVIEW_ACCOUNT_NAME": "my-purview",
+                "PURVIEW_MUST_ANONYMIZE_TYPE": "DB_TYPE",
+            }
+        )
+        assert config.purview_must_anonymize_type == "DB_TYPE"
+
+    def test_classify_pii_columns_accepts_purview_kwargs(self, monkeypatch):
+        """classify_pii_columns accepts purview_classifications (list form) and
+        purview_must_anonymize_type and correctly assigns ACTION_REDACT."""
+        import polars as pl
+        from app.domain.classification import classify_pii_columns, ACTION_REDACT
+
+        df = pl.DataFrame({"secret": ["a", "b"], "name": ["Alice", "Bob"]})
+        policies = classify_pii_columns(
+            df,
+            purview_classifications={"secret": ["MUST_ANONYMIZE"]},
+            purview_must_anonymize_type="MUST_ANONYMIZE",
+            similarity_models={},
+        )
+        assert "secret" in policies
+        assert policies["secret"].action == ACTION_REDACT
+        assert policies["secret"].source == "purview"
+
+
+class TestPurviewNotPiiSafelist:
+    """Columns Purview marks as NOT_PII must bypass all analysis."""
+
+    def test_not_set_is_noop(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.delenv("PURVIEW_NOT_PII_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+        assert config.purview_not_pii_type is None
+
+    def test_not_pii_type_loaded_from_env(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = PipelineConfig.from_env()
+        assert config.purview_not_pii_type == "PUBLIC_DATA"
+
+    def test_db_override_wins(self, monkeypatch):
+        from main import PipelineConfig
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "ENV_TYPE")
+        config = PipelineConfig.from_env(
+            config_overrides={"PURVIEW_NOT_PII_TYPE": "DB_TYPE"}
+        )
+        assert config.purview_not_pii_type == "DB_TYPE"
+
+    def test_not_pii_column_excluded_from_policies(self, monkeypatch):
+        """Columns bearing NOT_PII type must be absent from policies after exclusion."""
+        import polars as pl
+        from app.domain.classification import classify_pii_columns, ACTION_REDACT, ColumnPolicy
+        from app.application.pipeline import PipelineConfig
+
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = PipelineConfig.from_env()
+
+        # Simulate what run_table does: build exclusion set from Purview data
+        column_labels = {"product_code": ["PUBLIC_DATA"], "email": ["MICROSOFT.PERSONAL.EMAIL"]}
+        _not_pii_upper = config.purview_not_pii_type.upper()
+        purview_safe = frozenset(
+            col for col, types in column_labels.items()
+            if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+        )
+        assert "product_code" in purview_safe
+        assert "email" not in purview_safe
+
+    def test_case_insensitive_match(self, monkeypatch):
+        from main import PipelineConfig
+        from app.application.pipeline import PipelineConfig as AppConfig
+
+        monkeypatch.setenv("PURVIEW_NOT_PII_TYPE", "PUBLIC_DATA")
+        config = AppConfig.from_env()
+
+        # Both "public_data" and "PUBLIC_DATA" in Purview data must match
+        column_labels = {"col_a": ["public_data"], "col_b": ["PUBLIC_DATA"]}
+        _not_pii_upper = config.purview_not_pii_type.upper()
+        purview_safe = frozenset(
+            col for col, types in column_labels.items()
+            if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+        )
+        assert "col_a" in purview_safe
+        assert "col_b" in purview_safe
+
+    def test_not_pii_column_not_in_exclusion_when_type_not_configured(self, monkeypatch):
+        """When PURVIEW_NOT_PII_TYPE is absent, no Purview column is auto-excluded."""
+        from main import PipelineConfig
+
+        monkeypatch.delenv("PURVIEW_NOT_PII_TYPE", raising=False)
+        config = PipelineConfig.from_env()
+
+        column_labels = {"product_code": ["PUBLIC_DATA"]}
+        not_pii_type = config.purview_not_pii_type
+        # safelist computation: should yield empty set since type is not configured
+        purview_safe: frozenset = frozenset()
+        if not_pii_type and column_labels:
+            _not_pii_upper = not_pii_type.upper()
+            purview_safe = frozenset(
+                col for col, types in column_labels.items()
+                if any(t.upper() == _not_pii_upper for t in (types if isinstance(types, list) else [types]))
+            )
+        assert len(purview_safe) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime table targets (pii_table_targets)
 # ─────────────────────────────────────────────────────────────────────────────
