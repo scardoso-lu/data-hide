@@ -25,6 +25,17 @@ import polars as pl
 
 from .classification import _is_text_column
 from .models import EntityRegistry
+from ..infrastructure.nlp import (  # noqa: E402
+    NlpConfig as _NlpConfig,
+    NlpEngine as _NlpEngine,
+    _trim_native_heap as _trim_native_heap,  # re-export for backward compat
+    _build_recognizer_registry,
+    _install_custom_recognizers,
+    _filter_recognizer_config,
+    _recognizer_language_code,
+    SPACY_TO_PRESIDIO_ENTITY_MAPPING,
+    SPACY_LABELS_TO_IGNORE,
+)
 
 # spaCy models for each supported language.
 # Luxembourgish (lb) has no dedicated spaCy model; the German model is the
