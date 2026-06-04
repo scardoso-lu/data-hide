@@ -765,16 +765,18 @@ def _tier_a_purview(
     test path) or a list of type strings as returned by the Purview catalog
     API.  When ``purview_must_anonymize_type`` is set, any column carrying
     that type (case-insensitive) is assigned ``ACTION_REDACT`` directly,
-    taking priority over all known Microsoft classification types.
+    overriding even a pre-computed policy that arrived from the Phase 1
+    sampling pass.  Known Microsoft types respect the ``column in policies``
+    guard so that Phase 1 results are not silently overwritten.
     """
     if not purview_classifications:
         return
     must_upper = purview_must_anonymize_type.upper() if purview_must_anonymize_type else None
     for column, raw_types in purview_classifications.items():
-        if column not in df.columns or column in policies:
+        if column not in df.columns:
             continue
         types: list[str] = [raw_types] if isinstance(raw_types, str) else list(raw_types)
-        # Custom must-anonymize type wins over all known Microsoft types.
+        # Must-anonymize is authoritative: overrides any pre-computed policy.
         if must_upper and any(t.upper() == must_upper for t in types):
             policies[column] = ColumnPolicy(
                 column=column,
@@ -783,6 +785,10 @@ def _tier_a_purview(
                 source="purview",
                 score=1.0,
             )
+            continue
+        # Known Microsoft types do not override existing policies — Phase 1
+        # sampling results (name-pattern, presidio-structured, spaCy) stand.
+        if column in policies:
             continue
         for t in types:
             entity = PURVIEW_TYPE_TO_ENTITY.get(t.upper())
