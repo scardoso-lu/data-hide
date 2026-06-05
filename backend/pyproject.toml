@@ -33,7 +33,7 @@ dependencies = [
     # end (read → classify → anonymize → write).  Arrow-backed strings use
     # 3-5× less RAM than pandas object dtype for string-heavy PII tables.
     "polars>=1.0.0,<2.0.0",
-    "pyarrow>=15.0.0,<20.0.0",
+    "pyarrow>=23.0.1,<24.0.0",
 
     # pandas remains ONLY as the presidio-structured boundary: Tier B1 of the
     # column classifier converts a 500-row sample via df.to_pandas() because
